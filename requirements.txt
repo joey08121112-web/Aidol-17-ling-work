@@ -1,0 +1,8 @@
+fastapi==0.119.1
+uvicorn==0.38.0
+httpx==0.28.1
+websockets==15.0.1
+python-dotenv==1.1.1
+truststore==0.10.4
+tzdata==2026.5
+python-socks==3.1.1

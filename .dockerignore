@@ -1,0 +1,10 @@
+.git
+.env
+.env.*
+.venv
+data
+artifacts
+__pycache__
+*.pyc
+qwen_omni_demo
+web_duplex_demo
