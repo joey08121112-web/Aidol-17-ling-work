@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sqlite3
+import time
 from uuid import uuid4
 
 from .domain import Settings
@@ -42,6 +43,8 @@ class Store:
                   owner TEXT NOT NULL, due TEXT NOT NULL, source_ids TEXT NOT NULL,
                   status TEXT NOT NULL DEFAULT 'open', created_at TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS memory_created ON memories(created_at);
+                CREATE TABLE IF NOT EXISTS mobile_turns (
+                  id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT, created_at TEXT NOT NULL);
             """)
             # Preserve existing local databases; serialize schema checks and ALTERs
             # so two startup instances cannot both add the same missing column.
@@ -193,5 +196,103 @@ class Store:
 
     def clear(self):
         with self.connect() as db:
-            for table in ("memories", "transcripts", "events", "drafts", "processed", "meeting_reports", "action_tasks"):
+            for table in ("memories", "transcripts", "events", "drafts", "processed", "meeting_reports", "action_tasks", "mobile_turns"):
                 db.execute(f"DELETE FROM {table}")
+
+    def mobile_turn(self, turn_id, fingerprint, reserve=True):
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT fingerprint,result FROM mobile_turns WHERE id=?", (turn_id,)).fetchone()
+            if row:
+                if row['fingerprint'] != fingerprint or row['result'] is None:
+                    raise ValueError("该请求已提交或内容不一致，请查看历史后重新发起")
+                return json.loads(row['result'])
+            if reserve:
+                db.execute("INSERT INTO mobile_turns VALUES(?,?,NULL,?)", (turn_id, fingerprint, now()))
+
+    def finish_mobile_turn(self, turn_id, result):
+        with self.connect() as db:
+            db.execute("UPDATE mobile_turns SET result=? WHERE id=?", (json.dumps(result, ensure_ascii=False), turn_id))
+
+
+class AccountStore:
+    """Shared identity database; conversation data lives in separate UUID databases."""
+    connect = Store.connect
+
+    def __init__(self, path):
+        self.path = path
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with self.connect() as db:
+            db.executescript("""
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE IF NOT EXISTS users (
+                    id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL,
+                    password TEXT NOT NULL, recovery TEXT NOT NULL, created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS sessions (
+                    token TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires REAL NOT NULL);
+                CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
+                CREATE TABLE IF NOT EXISTS limits (
+                    key TEXT PRIMARY KEY, count INTEGER NOT NULL, expires REAL NOT NULL);
+            """)
+
+    def user(self, username):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+        return dict(row) if row else None
+
+    def register(self, username, password, recovery, max_users):
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT count(*) FROM users").fetchone()[0] >= max_users:
+                raise OverflowError("测试名额已满")
+            user = dict(id=uuid4().hex, username=username, created_at=now())
+            db.execute("INSERT INTO users VALUES(?,?,?,?,?)", (user['id'], username, password, recovery, user['created_at']))
+            return user
+
+    def issue_session(self, user_id, token, days=30, expected_password=None):
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            user = db.execute("SELECT password FROM users WHERE id=?", (user_id,)).fetchone()
+            if not user or (expected_password is not None and user[0] != expected_password):
+                return False
+            db.execute("DELETE FROM sessions WHERE expires < ?", (time.time(),))
+            db.execute("INSERT INTO sessions VALUES(?,?,?)", (token, user_id, time.time() + days * 86400))
+            # Keep a bounded number of signed-in devices per account.
+            db.execute("DELETE FROM sessions WHERE user_id=? AND token NOT IN "
+                       "(SELECT token FROM sessions WHERE user_id=? ORDER BY expires DESC LIMIT 5)", (user_id, user_id))
+            return True
+
+    def authenticate(self, token):
+        with self.connect() as db:
+            row = db.execute("SELECT users.id, username, created_at FROM users JOIN sessions ON users.id=sessions.user_id "
+                             "WHERE token=? AND expires>?", (token, time.time())).fetchone()
+        return dict(row) if row else None
+
+    def logout(self, token):
+        with self.connect() as db:
+            db.execute("DELETE FROM sessions WHERE token=?", (token,))
+
+    def rotate(self, user_id, old_hash, password, recovery=None):
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            changed = db.execute("UPDATE users SET password=?, recovery=COALESCE(?,recovery) WHERE id=? AND password=?",
+                                 (password, recovery, user_id, old_hash)).rowcount
+            if changed:
+                db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+            return bool(changed)
+
+    def delete(self, user_id):
+        with self.connect() as db:
+            db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+            db.execute("DELETE FROM users WHERE id=?", (user_id,))
+
+    def consume(self, key, maximum, seconds):
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            stamp = time.time()
+            db.execute("DELETE FROM limits WHERE expires<=?", (stamp,))
+            row = db.execute("SELECT count FROM limits WHERE key=?", (key,)).fetchone()
+            if row and row[0] >= maximum:
+                return False
+            db.execute("INSERT INTO limits VALUES(?,1,?) ON CONFLICT(key) DO UPDATE SET count=count+1", (key, stamp + seconds))
+            return True

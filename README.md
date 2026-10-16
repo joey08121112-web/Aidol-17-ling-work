@@ -1,12 +1,23 @@
 # 聆 · Aidol
 
-面向 24 小时黑客马拉松的耳机随身助手：通过 Viaim 蓝牙耳机采集和播放音频，由 Web 后端处理实时语音、工作记录、通勤提醒、生活陪伴与共享记忆。
+耳机里的随身助手：语音陪伴、工作记录、会议纪要、个人记忆和通勤提醒。当前面向同事体验的入口是 **Android 多账号服务版**：安装 APK → 注册唯一账号 → 连接蓝牙耳机 → 开始使用。
 
-**默认在每位队友自己的电脑运行。** 耳机连接自己的电脑，浏览器访问自己的 `localhost:8000`，Python 服务、`.env` 和 SQLite 各自独立；只通过 Git 的 `main` 分支协作代码。现阶段不需要公共服务器、部署平台或频繁发布。模型和高德仍是外部 API，本地运行不代表完全离线。
+用户不需要电脑后端、API Key、邮箱或短信验证码。APK 内置服务器 `https://123.207.219.174:7776`，直接使用 IP，不要求域名；服务器保存供应商密钥，各账号独立保存数据。测试者看 [Android 使用与交接](docs/android-handoff.md)，运维看 [服务器部署与回滚](docs/android-deployment.md)，开发者看 [API 契约](docs/api.md) 与 [验收记录](docs/acceptance.md)。
 
-主应用位于 `app/` 和 `web/`，使用 Python 3.11+、FastAPI、SQLite 和原生 ES Modules 前端，无需 Node 构建。`web_duplex_demo/`、`qwen_omni_demo/` 保留为供应商协议参考，不是主应用启动入口。
+服务器版交付文件为 `android-app/aidol-android.apk`（`com.aidol.app`，0.2.0，release 签名）。发布后的分发地址为 [下载 APK](http://123.207.219.174/downloads/aidol-android.apk)；上线可用性以验收记录为准。HTTP 链接仅分发安装文件，账号密码与业务 API 始终使用 HTTPS。
 
-## 先跑起来
+| 入口 | 用途 |
+| --- | --- |
+| `android-app/` + `app.main:create_hosted_app` | 当前 Android 多账号服务版；原生 Android + FastAPI + 每账号 SQLite |
+| `android-demo/aidol-android-direct-debug.apk` | 旧直连供应商 Demo，需自己填 Key；不用于多人服务器体验 |
+| `run.py` + `web/` + `create_app` | 保留的本地单用户 Web 开发入口；原生实时供应商、持续流式语音的参考与调试 |
+| `web_duplex_demo/`、`qwen_omni_demo/` | 保留的原始供应商协议参考，不是生产入口 |
+
+Android 当前支持手动录音，以及用户主动开启的前台连续轮次/生活定时录音；每次最多 60 秒，结束后识别、回复和播放，工作模式只记录。连续模式按有界轮次接续，不是实时双工；离开前台或停止后不再自动录音。会议、记忆、地图和草稿功能的迁移范围见 [功能对照](docs/android-handoff.md#功能迁移对照)。ANC、硬件按键和电量不冒充已接入。服务器部署与实物耳机验收分别记录，不能用自动测试代替实际听音。
+
+## 保留的本地 Web 开发入口
+
+以下启动、配置和能力说明仅针对原本的本地 Web 模式。每位开发者仍可运行自己的 Python 服务、`.env` 和 SQLite，通过 Git `main` 共享源代码；模型和高德请求访问外部 API。手机测试者无需按下面步骤搭建环境或索取 `.env`。
 
 三种系统首次运行都需要已安装 **Python 3.11+ 并加入 PATH**，以及联网安装 Python 依赖。队友拉取 `main` 后，将项目负责人私下提供的 `.env` 放在仓库根目录，即可复用其中已配置的服务；无需每人重新注册或配置一套新 API。已有自己的 `.env` 时先备份，再由本人决定是否替换；启动脚本不会覆盖现有文件。`.env` 永不提交 Git，也不要发到公开群或写进文档。
 
@@ -52,9 +63,9 @@ docker compose up --build -d
 docker compose logs -f aidol
 ```
 
-Compose 默认只绑定本机 `127.0.0.1:8000`，数据库存在本机 `aidol-data` 卷。日常协作直接运行 Python 脚本即可。手机跨设备访问属于后续选项，需另外解决 HTTPS；当前不要求搭建。
+本地 Compose 只绑定 `127.0.0.1:8000`，数据库存在本机 `aidol-data` 卷。Android 共享服务使用独立的托管入口和 HTTPS 部署，不对外开放这个单用户 Compose 入口。
 
-## 当前能力
+## 本地 Web 保留能力
 
 | 能力 | 实现与边界 |
 | --- | --- |
@@ -76,7 +87,7 @@ Compose 默认只绑定本机 `127.0.0.1:8000`，数据库存在本机 `aidol-da
 
 「已配置」只表示变量非空，不代表服务权限已验证。Qwen 文本触发返回音频的探测，也不等于 Viaim 真实麦克风端到端验收。
 
-## 配置矩阵
+## 本地开发配置矩阵
 
 供应商凭证由后端读取 `.env`，前端仅获得能力标记。`.env.example` 提供字段示例，不包含可用凭证；更改后重启后端。
 

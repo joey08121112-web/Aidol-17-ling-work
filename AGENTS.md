@@ -1,11 +1,15 @@
 # Aidol development guide
 
-This repository is a local-first, single-user hackathon application. Each teammate
-runs an independent backend and SQLite database; share source through `main`.
+This repository supports a hosted multi-account Android app and the original
+local-first single-user web/demo. Hosted users have separate UUID SQLite stores;
+legacy local teammates retain independent databases. Share source through `main`.
 
 ## Boundaries
 
 - `web/audio/`: hardware and browser audio; keep vendor SDK assumptions here.
+- `android-app/`: shipped Android client; never bundle provider keys or passwords.
+- `android-demo/`: standalone direct-provider hardware diagnostic APK.
+- `deploy/`: hosted systemd/nginx installation, backup and certificate maintenance.
 - `app/providers/`: vendor protocols; no application UI or business rules.
 - `app/services/`: mode decisions, memory extraction, conversation and speech sessions.
 - `app/main.py`: request validation, authentication, routes and lifecycle wiring.
@@ -20,6 +24,8 @@ runs an independent backend and SQLite database; share source through `main`.
 python -m pytest tests -q
 node --test tests/audio-worklet.test.mjs tests/audio-session.test.mjs
 python -m compileall -q app
+# With JDK 17 and Android SDK 35, in android-app/:
+./gradlew testDebugUnitTest lintDebug assembleDebug
 ```
 
 Live scripts under `scripts/probe_*.py` can consume API quota. Use them deliberately,

@@ -1,0 +1,29 @@
+[Unit]
+Description=Aidol Android API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aidol
+Group=aidol
+WorkingDirectory=/opt/aidol/current
+EnvironmentFile=/opt/aidol/shared/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+# Set these in the command so local .env paths cannot override service data paths.
+ExecStart=/usr/bin/env AIDOL_HOSTED=true AIDOL_DATA_DIR=/opt/aidol/shared/data/hosted DATABASE_PATH=/opt/aidol/shared/data/legacy.sqlite3 /opt/aidol/current/.venv/bin/python -m uvicorn app.main:create_hosted_app --factory --host 127.0.0.1 --port 8108 --workers 1 --proxy-headers --forwarded-allow-ips 127.0.0.1 --no-access-log
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=45
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/aidol/shared/data
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

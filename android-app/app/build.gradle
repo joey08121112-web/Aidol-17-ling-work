@@ -1,0 +1,40 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'com.aidol.demo'
+    compileSdk 35
+    defaultConfig {
+        applicationId 'com.aidol.app'
+        minSdk 26
+        targetSdk 35
+        versionCode 2
+        versionName '0.2.0'
+        buildConfigField 'String', 'SERVER_URL', '"' + (project.findProperty('aidolServerUrl') ?: 'https://123.207.219.174:7776') + '"'
+    }
+    buildFeatures { buildConfig true }
+    signingConfigs {
+        release {
+            if (System.getenv('AIDOL_KEYSTORE')) {
+                storeFile file(System.getenv('AIDOL_KEYSTORE'))
+                storePassword System.getenv('AIDOL_KEYSTORE_PASSWORD')
+                keyAlias 'aidol-release'
+                keyPassword System.getenv('AIDOL_KEYSTORE_PASSWORD')
+            }
+        }
+    }
+    buildTypes {
+        release {
+            signingConfig signingConfigs.release
+            minifyEnabled false
+            debuggable false
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+dependencies {
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+    testImplementation 'junit:junit:4.13.2'
+}

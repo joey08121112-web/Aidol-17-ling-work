@@ -341,4 +341,420 @@ def create_app(config=None):
     return app
 
 
-app = create_app()
+# Hosted startup does not open the developer's single-user database or web surface.
+import os as _os
+app = None if _os.getenv('AIDOL_HOSTED', '').lower() == 'true' else create_app()
+
+
+def create_hosted_app(config=None, data_directory=None):
+    """Public Android API. Never mounts the unauthenticated single-user API/web UI."""
+    import os
+    import re
+    import sqlite3
+    from contextlib import asynccontextmanager
+    from fastapi import Depends
+    from fastapi.exceptions import RequestValidationError
+    from pydantic import BaseModel, Field, field_validator
+    from starlette.concurrency import run_in_threadpool
+    from .storage import AccountStore
+    from .services.accounts import digest, password_hash, password_matches, DUMMY_PASSWORD
+    from .services.mobile import MobileRuntimes
+
+    config = config or Config()
+    directory = Path(data_directory or os.getenv('AIDOL_DATA_DIR', 'data/hosted'))
+    accounts = AccountStore(str(directory / 'accounts.sqlite3'))
+    runtimes = MobileRuntimes(config, directory / 'users')
+    speech = VolcSpeechProvider(config.speech)
+    api = FastAPI(title='Aidol Android API', version='0.2.0', docs_url=None, redoc_url=None, openapi_url=None)
+    api.state.accounts, api.state.runtimes, api.state.speech = accounts, runtimes, speech
+    active = 0
+
+    class Credentials(BaseModel):
+        username: str = Field(min_length=3, max_length=24)
+        password: str = Field(min_length=8, max_length=128)
+
+        @field_validator('username')
+        @classmethod
+        def valid_username(cls, value):
+            if not re.fullmatch(r'[a-zA-Z0-9_]{3,24}', value):
+                raise ValueError('账号仅支持 3–24 位字母、数字、下划线')
+            return value.lower()
+
+    class ChangePassword(BaseModel):
+        old_password: str = Field(min_length=1, max_length=128)
+        new_password: str = Field(min_length=8, max_length=128)
+
+    class Recovery(Credentials):
+        recovery_code: str = Field(min_length=16, max_length=128)
+
+    class ConfirmPassword(BaseModel):
+        password: str = Field(min_length=1, max_length=128)
+
+    class Turn(BaseModel):
+        text: str = Field(min_length=1, max_length=6000)
+        request_id: str = Field(pattern=r'^[a-zA-Z0-9-]{16,64}$')
+
+    @api.exception_handler(RequestValidationError)
+    async def invalid(request, error):
+        message = '请求参数格式不正确，请检查必填项和输入长度'
+        if request.url.path.startswith('/auth/'):
+            message = '请检查输入：账号为 3–24 位字母、数字或下划线；密码为 8–128 位'
+        elif request.url.path == '/v1/maps/weather':
+            message = '请先选择目的地，或填写 6 位城市行政区代码'
+        return JSONResponse({'detail': message}, 422)
+
+    @api.middleware('http')
+    async def security(request, call_next):
+        # Bound actual streamed bodies, including chunked uploads without Content-Length.
+        limit = 1920000 if request.url.path == '/v1/voice' else 65536
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > limit:
+                return JSONResponse({'detail': '录音最多 60 秒，文字请求最多 64 KB'}, 413)
+        request._body = bytes(body)
+        response = await call_next(request)
+        response.headers['Cache-Control'] = 'no-store'
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['X-Frame-Options'] = 'DENY'
+        return response
+
+    def token(request):
+        value = request.headers.get('authorization', '')
+        return value[7:] if value.startswith('Bearer ') else ''
+
+    def user(request: Request):
+        found = accounts.authenticate(digest(token(request)))
+        if not found:
+            raise HTTPException(401, '登录已失效，请重新登录')
+        return found
+
+    def throttle(request, name):
+        # Uvicorn trusts only the loopback TLS proxy; never reads untrusted XFF itself.
+        address = request.client.host if request.client else 'unknown'
+        if not accounts.consume('auth:' + digest(address), 40, 900):
+            raise HTTPException(429, '尝试过于频繁，请 15 分钟后重试')
+        if not accounts.consume('account:' + digest(name), 15, 900):
+            raise HTTPException(429, '此账号尝试过于频繁，请 15 分钟后重试')
+
+    def session(found):
+        raw = secrets.token_urlsafe(32)
+        if not accounts.issue_session(found['id'], digest(raw), expected_password=found.get('password')):
+            raise HTTPException(401, '凭据已变更，请重新登录')
+        return {'token': raw, 'expires_in': 30 * 86400,
+                'user': {key: found[key] for key in ('id', 'username', 'created_at')}}
+
+    @asynccontextmanager
+    async def runtime(current, request, billable=False):
+        nonlocal active
+        if active >= 8:
+            raise HTTPException(503, '服务器正在处理较多请求，请稍后再试')
+        active += 1
+        try:
+            async with runtimes.use(current['id']) as value:
+                # Recheck after acquiring the per-account lock (password/logout races).
+                if not accounts.authenticate(digest(token(request))):
+                    raise HTTPException(401, '登录已失效')
+                if billable and not accounts.consume('usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400):
+                    raise HTTPException(429, '今日体验额度已用完，请明天再试')
+                yield value
+        finally:
+            active -= 1
+
+    @api.get('/healthz')
+    async def hosted_health():
+        return {'ok': True, 'version': '0.2.0', 'ready': bool(config.text_key and config.text_model and config.speech.asr_ready and config.speech.tts_ready)}
+
+    @api.post('/auth/register', status_code=201)
+    def register(value: Credentials, request: Request):
+        throttle(request, value.username)
+        if os.getenv('AIDOL_REGISTRATION_OPEN', 'true').lower() != 'true':
+            raise HTTPException(403, '当前暂停注册，请联系测试负责人')
+        recovery = secrets.token_urlsafe(24)
+        try:
+            found = accounts.register(value.username, password_hash(value.password), digest(recovery), int(os.getenv('AIDOL_MAX_USERS', '500')))
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, '这个账号已被使用，换一个试试')
+        except OverflowError:
+            raise HTTPException(403, '测试名额已满')
+        return {**session(found), 'recovery_code': recovery}
+
+    @api.post('/auth/login')
+    def login(value: Credentials, request: Request):
+        throttle(request, value.username)
+        found = accounts.user(value.username)
+        valid = password_matches(value.password, found['password'] if found else DUMMY_PASSWORD)
+        if not valid or not found:
+            raise HTTPException(401, '账号或密码不正确')
+        return session(found)
+
+    @api.get('/auth/me')
+    def me(current=Depends(user)):
+        return current
+
+    @api.post('/auth/logout')
+    def logout(request: Request, current=Depends(user)):
+        accounts.logout(digest(token(request)))
+        return {'ok': True}
+
+    @api.post('/auth/recover')
+    def recover(value: Recovery, request: Request):
+        throttle(request, value.username)
+        found = accounts.user(value.username)
+        if not found or not secrets.compare_digest(digest(value.recovery_code), found['recovery']):
+            raise HTTPException(401, '账号或恢复码不正确')
+        replacement = secrets.token_urlsafe(24)
+        hashed = password_hash(value.password)
+        if not accounts.rotate(found['id'], found['password'], hashed, digest(replacement)):
+            raise HTTPException(409, '凭据已变更，请重新操作')
+        found['password'] = hashed
+        return {**session(found), 'recovery_code': replacement}
+
+    @api.put('/auth/password')
+    async def change_password(value: ChangePassword, request: Request, current=Depends(user)):
+        throttle(request, current['username'])
+        async with runtime(current, request):
+            found = accounts.user(current['username'])
+            if not await run_in_threadpool(password_matches, value.old_password, found['password']):
+                raise HTTPException(401, '原密码不正确')
+            hashed = await run_in_threadpool(password_hash, value.new_password)
+            if not accounts.rotate(found['id'], found['password'], hashed):
+                raise HTTPException(409, '凭据已变更，请重新登录')
+            found['password'] = hashed
+            return session(found)
+
+    @api.delete('/auth/account')
+    async def delete_account(value: ConfirmPassword, request: Request, current=Depends(user)):
+        throttle(request, current['username'])
+        async with runtime(current, request) as rt:
+            found = accounts.user(current['username'])
+            if not await run_in_threadpool(password_matches, value.password, found['password']):
+                raise HTTPException(401, '密码不正确')
+            rt.store.clear()
+            rt.store.save_settings(Settings(auto_mode=False, preferences=''))
+            accounts.delete(current['id'])
+        runtimes.items.pop(current['id'], None)
+        # No live connection remains: remove private SQLite files as well.
+        path = directory / 'users' / (current['id'] + '.sqlite3')
+        for suffix in ('', '-wal', '-shm'):
+            Path(str(path) + suffix).unlink(missing_ok=True)
+        return {'ok': True}
+
+    @api.get('/v1/state')
+    async def mobile_state(request: Request, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            await rt.agent.decide()
+            return {'user': current, 'settings': rt.store.settings().model_dump(),
+                    'capabilities': config.capabilities(), 'agent': rt.agent.snapshot(),
+                    'transcripts': list(reversed(rt.store.list('transcripts', 100))),
+                    'memories': rt.store.list('memories', 300), 'tasks': rt.store.list('action_tasks', 300),
+                    'drafts': rt.store.list('drafts', 30),
+                    'meeting_report': rt.store.meeting_report()}
+
+    @api.put('/v1/settings')
+    async def mobile_settings(value: Settings, request: Request, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            # Android v1 is foreground-only; do not advertise background listening.
+            value.life_poll_enabled = False
+            value.provider = 'cascade'
+            old = rt.store.settings()
+            if any(getattr(old, key) != getattr(value, key) for key in
+                   ('destination_lon', 'destination_lat', 'destination_name', 'transport', 'transit_city')):
+                rt.agent.route, rt.agent.last_route, rt.agent.last_notice = None, 0, 0
+            rt.store.save_settings(value)
+            await rt.agent.decide()
+            return value
+
+    async def process(rt, current, request_id, fingerprint, text=None, pcm=None):
+        try:
+            cached = rt.store.mobile_turn(request_id, fingerprint, reserve=False)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc))
+        if cached is not None:
+            return cached
+        if not accounts.consume('usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400):
+            raise HTTPException(429, '今日体验额度已用完，请明天再试')
+        rt.store.mobile_turn(request_id, fingerprint)
+        if pcm is not None:
+            async def chunks():
+                for offset in range(0, len(pcm), 3200):
+                    yield pcm[offset:offset + 3200]
+                    await asyncio.sleep(.02)
+            text = ''
+            try:
+                async with asyncio.timeout(65):
+                    async for result in speech.stream_asr(chunks()):
+                        if result.text:
+                            text = result.text
+            except (SpeechProviderError, TimeoutError):
+                raise HTTPException(502, '识别暂不可用，请稍后重试')
+            if not text.strip():
+                result = {'text': '', 'response': '没有听清，请靠近麦克风再试一次', 'speak': False}
+                rt.store.finish_mobile_turn(request_id, result)
+                return result
+        result = await rt.turn(text[:6000], 'asr' if pcm is not None else 'text')
+        rt.store.finish_mobile_turn(request_id, result)
+        return result
+
+    @api.post('/v1/chat')
+    async def mobile_chat(value: Turn, request: Request, current=Depends(user)):
+        if not value.text.strip():
+            raise HTTPException(422, '请输入内容')
+        async with runtime(current, request) as rt:
+            return await process(rt, current, value.request_id, 'text:' + digest(value.text), text=value.text)
+
+    @api.post('/v1/voice')
+    async def mobile_voice(request: Request, request_id: str = Query(pattern=r'^[a-zA-Z0-9-]{16,64}$'), current=Depends(user)):
+        if not config.speech.asr_ready:
+            raise HTTPException(503, '服务器尚未配置语音识别')
+        if request.headers.get('content-type', '').split(';')[0] != 'audio/pcm':
+            raise HTTPException(415, '需要 16kHz 单声道 PCM16')
+        pcm = await request.body()
+        if len(pcm) < 3200 or len(pcm) % 2:
+            raise HTTPException(422, '录音太短或不完整，请重新录音')
+        async with runtime(current, request) as rt:
+            return await process(rt, current, request_id, 'pcm:' + hashlib.sha256(pcm).hexdigest(), pcm=pcm)
+
+    @api.post('/v1/speech')
+    async def mobile_speech(value: SpeechInput, request: Request, current=Depends(user)):
+        if not config.speech.tts_ready:
+            raise HTTPException(503, '服务器尚未配置语音合成')
+        async with runtime(current, request, True):
+            try:
+                wav = await speech.synthesize_wav(value.text)
+                return Response(wav, media_type='audio/wav')
+            except (SpeechProviderError, TimeoutError):
+                raise HTTPException(502, '语音播放暂不可用，文字回复已保留')
+
+    @api.post('/v1/memories')
+    async def mobile_memory(value: MemoryInput, request: Request, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            return rt.store.add('memories', **value.model_dump(), source='user')
+
+    @api.post('/v1/memories/from-transcript/{transcript_id}')
+    async def mobile_remember(transcript_id: str, request: Request, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            row = rt.store.remember_transcript(transcript_id)
+            if row is None:
+                raise HTTPException(404, '原始对话不存在')
+            return row
+
+    @api.get('/v1/memories/{memory_id}/source')
+    async def mobile_source(memory_id: str, request: Request, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            row = rt.store.memory_source(memory_id)
+            if row is None:
+                raise HTTPException(404, '这条记忆没有可追溯的原始转写')
+            return row
+
+    @api.delete('/v1/memories/{memory_id}')
+    async def mobile_delete_memory(memory_id: str, request: Request, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            if not rt.store.delete_memory(memory_id):
+                raise HTTPException(404, '记忆不存在')
+            return {'ok': True}
+
+    @api.put('/v1/memories/{memory_id}')
+    async def mobile_edit_memory(memory_id: str, value: MemoryUpdate, request: Request, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            if not rt.store.update_memory(memory_id, value.content, value.kind, value.pinned):
+                raise HTTPException(404, '记忆不存在')
+            return {'ok': True}
+
+    @api.post('/v1/recall')
+    async def mobile_recall(value: RecallRequest, request: Request, current=Depends(user)):
+        if not value.question.strip():
+            raise HTTPException(422, '请输入你想回忆的问题')
+        async with runtime(current, request, True) as rt:
+            tasks = [{'id': 'task:' + row['id'], 'kind': 'task', 'source': 'action_task', 'created_at': row['created_at'],
+                      'content': f"待办：{row['content']}；负责人：{row['owner'] or '未明确'}；截止：{row['due'] or '未明确'}；完成状态：{'已完成' if row['status'] == 'done' else '未完成'}"}
+                     for row in rt.store.list('action_tasks', 300)]
+            return await RecallService(config).answer(value.question, tasks + rt.store.list('memories', 500), rt.store.list('transcripts', 500))
+
+    @api.get('/v1/maps/search')
+    async def mobile_places(request: Request, q: str = Query(min_length=1, max_length=100), city: str = Query(default='', max_length=80), current=Depends(user)):
+        async with runtime(current, request, True) as rt:
+            try:
+                return await rt.agent.maps.search(q, city)
+            except ValueError:
+                raise HTTPException(422, '地点关键词无效')
+            except Exception:
+                raise HTTPException(502, '地点查询暂不可用，请稍后再试')
+
+    @api.post('/v1/location')
+    async def mobile_location(value: LocationInput, request: Request, current=Depends(user)):
+        async with runtime(current, request, True) as rt:
+            return await rt.agent.update_location(value)
+
+    @api.post('/v1/maps/nearby')
+    async def mobile_nearby(value: NearbyInput, request: Request, current=Depends(user)):
+        async with runtime(current, request, True) as rt:
+            try:
+                return await rt.agent.maps.nearby(value, value.keyword)
+            except Exception:
+                raise HTTPException(502, '周边查询暂不可用，请稍后再试')
+
+    @api.get('/v1/maps/weather')
+    async def mobile_weather(request: Request, city: str = Query(default='', pattern=r'^([0-9]{6})?$'), current=Depends(user)):
+        async with runtime(current, request, True) as rt:
+            if not city and rt.store.settings().destination_lon is None:
+                raise HTTPException(422, '请先选择目的地，再查询当地天气')
+            try:
+                if city:
+                    return await rt.agent.maps.weather(city)
+                settings = rt.store.settings()
+                return await rt.agent.maps.weather_at(settings.destination_lon, settings.destination_lat)
+            except Exception:
+                raise HTTPException(502, '天气查询暂不可用，请稍后再试')
+
+    @api.post('/v1/drafts/{draft_id}/{action}')
+    async def mobile_draft(draft_id: str, action: str, request: Request, current=Depends(user)):
+        if action not in {'copied', 'dismissed'}:
+            raise HTTPException(400, '仅支持复制或忽略')
+        async with runtime(current, request) as rt:
+            if not rt.store.draft_status(draft_id, action):
+                raise HTTPException(404, '草稿不存在或已处理')
+            return {'ok': True, 'status': action, 'sent': False}
+
+    @api.post('/v1/meetings')
+    async def mobile_meeting(value: MeetingRequest, request: Request, current=Depends(user)):
+        async with runtime(current, request, True) as rt:
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=value.hours)).isoformat()
+            rows = [r for r in rt.store.list('transcripts', 1000) if r['mode'] == 'work' and r['speaker'] != 'assistant' and r['created_at'] >= cutoff][:80]
+            if not rows:
+                raise HTTPException(422, '请先在工作模式记录会议，再生成纪要')
+            signature = digest(json.dumps(rows, sort_keys=True, ensure_ascii=False))
+            old = rt.store.meeting_report(signature)
+            if old:
+                return old
+            report = await MeetingInsights(config).generate(rows)
+            report.update(sources=list(reversed(rows)), hours=value.hours, includes_demo=False)
+            return rt.store.save_meeting_report(signature, report)
+
+    @api.patch('/v1/tasks/{task_id}')
+    async def mobile_task(task_id: str, value: TaskStatusInput, request: Request, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            if not rt.store.action_task_status(task_id, value.status):
+                raise HTTPException(404, '待办不存在')
+            return {'ok': True}
+
+    @api.get('/v1/export')
+    async def mobile_export(request: Request, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            return {'user': current, 'settings': rt.store.settings().model_dump(), 'memories': rt.store.list('memories', 10000),
+                    'version': 3, 'drafts': rt.store.list('drafts', 10000),
+                    'transcripts': rt.store.list('transcripts', 10000), 'reports': rt.store.all_meeting_reports(), 'tasks': rt.store.list('action_tasks', 10000)}
+
+    @api.delete('/v1/data')
+    async def mobile_clear(value: ConfirmPassword, request: Request, current=Depends(user)):
+        throttle(request, current['username'])
+        async with runtime(current, request) as rt:
+            found = accounts.user(current['username'])
+            if not await run_in_threadpool(password_matches, value.password, found['password']):
+                raise HTTPException(401, '密码不正确')
+            rt.store.clear()
+            rt.agent.conversation.history = []
+            rt.agent.location, rt.agent.route = None, None
+            return {'ok': True}
+
+    return api

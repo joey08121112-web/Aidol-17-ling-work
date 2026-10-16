@@ -108,6 +108,17 @@ class MapService:
                 "wind_power": self._text(current.get("windpower")), "report_time": self._text(current.get("reporttime")),
                 "note": "高德最近发布的实况天气；温度单位摄氏度，湿度单位百分比"}
 
+    async def weather_at(self, longitude, latitude):
+        """Resolve a selected GCJ-02 destination when POI search omits adcode."""
+        if not self.config.amap_key:
+            return {"available": False, "reason": "尚未配置高德 Key"}
+        async with httpx.AsyncClient(timeout=10, proxy=self.config.proxy) as client:
+            body = await self._get(client, "geocode/regeo", {"location": f"{longitude},{latitude}", "extensions": "base"})
+        code = self._text(body.get("regeocode", {}).get("addressComponent", {}).get("adcode"))
+        if len(code) != 6 or not code.isascii() or not code.isdigit():
+            return {"available": False, "reason": "暂时无法识别目的地天气区域，请更换目的地重试"}
+        return await self.weather(code)
+
     async def _convert(self, client, location):
         converted = await self._get(client, "assistant/coordinate/convert", {
             "locations": f"{location.longitude},{location.latitude}", "coordsys": "gps"})
