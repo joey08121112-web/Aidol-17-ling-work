@@ -99,7 +99,8 @@ public final class HeadsetController implements FusionDevice, AutoCloseable {
     private volatile Snapshot snapshot;
     private volatile String connectedMac;
     private boolean initialized, initializing, closed, inCall, releasing;
-    private long releaseOperation;
+    /** Written on main, read by the background release thread only. */
+    private volatile long releaseOperation;
     private long connectionGeneration, connectionStarted, readyElapsed;
     private String targetMac, model = "未知", lastCode = "none", phase = "idle";
     private Integer leftBattery, rightBattery, caseBattery;
@@ -594,24 +595,55 @@ public final class HeadsetController implements FusionDevice, AutoCloseable {
         final long operation = ++releaseOperation;
         publish(terminalState == State.ERROR ? State.ERROR : State.DISCONNECTING,
                 terminalState == State.ERROR ? message : "正在断开耳机");
-        try { HeadsetManager.stopFusionRecord(); HeadsetManager.disconnectDevice(); }
-        catch (RuntimeException | LinkageError ignored) { lastCode = "disconnect_error"; }
-        awaitTransportRelease(operation, SystemClock.elapsedRealtime() + 5_500, terminalState, message);
+        Thread release = new Thread(() -> releaseTransport(operation, SystemClock.elapsedRealtime() + 5_500, terminalState, message),
+                "aidol-headset-release");
+        release.setDaemon(true);
+        release.start();
     }
-    private void awaitTransportRelease(long operation, long deadline, State terminalState, String message) {
-        if (operation != releaseOperation) return;
-        try {
-            if (HeadsetManager.transportsReleased()) {
-                HeadsetManager.registerDialogListener(null); HeadsetManager.destroy();
-                initialized = false; releasing = false; inCall = false;
-                releaseSdkOwner(); publish(terminalState, message); afterTransportRelease(); return;
-            }
-        } catch (RuntimeException | LinkageError ignored) { lastCode = "release_error"; }
-        if (SystemClock.elapsedRealtime() >= deadline) {
-            // Do not make another input source appear safe while native transport cleanup is unknown.
-            publish(State.ERROR, "耳机连接释放未确认，请重启应用后重新连接"); return;
+    /** Native transport cleanup runs off main; only its decided outcome returns to the main thread. */
+    private void releaseTransport(long operation, long deadline, State terminalState, String message) {
+        String code = null;
+        try { HeadsetManager.stopFusionRecord(); HeadsetManager.disconnectDevice(); }
+        catch (RuntimeException | LinkageError ignored) { code = "disconnect_error"; }
+        HeadsetController.ReleaseWatch.Decision decision;
+        while (true) {
+            boolean released = false;
+            try { released = HeadsetManager.transportsReleased(); }
+            catch (RuntimeException | LinkageError ignored) { if (code == null) code = "release_error"; }
+            decision = ReleaseWatch.decide(operation != releaseOperation, released, SystemClock.elapsedRealtime(), deadline);
+            if (decision != ReleaseWatch.Decision.RETRY) break;
+            try { Thread.sleep(ReleaseWatch.POLL_MILLIS); } catch (InterruptedException stopped) { return; }
         }
-        main.postDelayed(() -> awaitTransportRelease(operation, deadline, terminalState, message), 50);
+        if (decision == ReleaseWatch.Decision.STALE) return;
+        boolean destroyed = false;
+        if (decision == ReleaseWatch.Decision.RELEASED) {
+            try { HeadsetManager.registerDialogListener(null); HeadsetManager.destroy(); destroyed = true; }
+            catch (RuntimeException | LinkageError ignored) { /* Falls through to the unconfirmed error below. */ }
+        }
+        final String diagnostics = code;
+        final boolean cleanupConfirmed = destroyed;
+        main.post(() -> {
+            if (operation != releaseOperation) return;
+            if (diagnostics != null) lastCode = diagnostics;
+            if (!cleanupConfirmed) {
+                // Do not make another input source appear safe while native transport cleanup is unknown.
+                publish(State.ERROR, "耳机连接释放未确认，请重启应用后重新连接"); return;
+            }
+            initialized = false; releasing = false; inCall = false;
+            releaseSdkOwner(); publish(terminalState, message); afterTransportRelease();
+        });
+    }
+
+    /** Pure step decision for the native release poll, so the spin itself never needs the main thread. */
+    static final class ReleaseWatch {
+        enum Decision { RELEASED, RETRY, STALE, TIMEOUT }
+        static final long POLL_MILLIS = 50;
+        static Decision decide(boolean superseded, boolean released, long nowElapsed, long deadlineElapsed) {
+            if (superseded) return Decision.STALE;
+            if (released) return Decision.RELEASED;
+            if (nowElapsed >= deadlineElapsed) return Decision.TIMEOUT;
+            return Decision.RETRY;
+        }
     }
     private void releaseSdkOwner() {
         SystemCaptureLease.release(captureLease);
