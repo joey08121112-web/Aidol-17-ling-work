@@ -525,3 +525,17 @@ Android 已增加前台手动、连续轮次及生活定时采集。后两者需
 Android `testDebugUnitTest lintDebug assembleDebug` 成功：159项单测，零失败/错误；compileall及本轮diff检查通过。USB真机在更新前查询到精确/粗略定位均为未授权；覆盖安装返回Success，保留应用数据。Debug APK已复制到 `android-app/aidol-android.apk`，SHA256为 `4e68bbb0f5418764ae903deb1b62347dfb6c529dd9289c8a5bfda384b6f40201`。
 
 已按用户指示重启本地8108服务并恢复USB reverse，健康检查ready=true，手机App请求 `/v1/state` 返回200。启动新版App后确认前台为Android `GrantPermissionsActivity`，等待用户自行选择授权；本轮未代用户授予权限，也未把权限框出现当作定位上传或实际耳机天气回复验收。
+
+## 2026-10-17 main 同步、服务器部署与签名 APK
+
+北京时间约 19:25–19:32，按用户要求将当前 Android、后端及文档更新提交到 main（功能提交 `29b5148`），并发布服务器后端及静态官网。追加 `0aab4aa` 固定 nginx `.conf` 的 LF 换行，避免 Windows 导出发布包后官网安装脚本的标记校验失败。服务器运行源码与发布包的 37 个后端/官网文件逐一 SHA-256 比对通过。
+
+用户另行要求上传本地 `.env`：已备份服务器原配置为 `/opt/aidol/shared/.env.before-local-env-20261017-29b5148`，将本地文件私密上传为 `/opt/aidol/shared/.env`，逐字节 SHA-256 比对一致，权限 `root:aidol 640`。没有把配置内容、密钥或本地数据库提交到 Git；systemd 继续固定托管数据目录。服务器配置检查显示 Qwen、ASR、TTS、文字模型、地图、搜索和会议能力已配置，不代表真实供应商请求已验收。
+
+- 后端：`/opt/aidol/releases/20261017T112526Z-3174462`；发布前备份 5 个 SQLite 数据库，保留上一版本；aidol/nginx 均 active，HTTPS `/healthz` 为 `ok=true, ready=true, work_meetings=true`。
+- 官网：`/opt/aidol/website/releases/20261017T112812Z-LRdJ3w`；公网首页及全部 8 个静态文件 HEAD 200、大小正确，服务器静态文件与发布包哈希一致。本轮没有修改网页布局，没有重做视觉/交互验收。
+- APK：使用已有 release 密钥构建 `com.aidol.app` 0.2.0，签名证书 SHA-256 仍为 `e71b49a9c64613905a301334bb6c207cefc72f7aff91f20eb722c2062eab0da2`。本地 `android-app/aidol-android.apk` 及服务器下载文件大小 10,952,707 bytes，SHA-256 `e51e80bddc32cd0bdc501a4a9a57860f76d762186c837871d6c0a1370d6d287c`；旧 APK 已备份。80/6655 两个公网下载入口的 Range GET 均 206，头部字节及总大小与本地匹配；未声称本轮已完整公网下载 APK。新安装默认 USB 本地后端，使用托管服务须在连接设置选择“远端服务器”。
+- 本地回归：后端全量 463 passed（122.17 秒，1 条依赖弃用警告），compileall 通过；修正了遗漏新增 healthz 会议字段的旧断言。Android 159 项单元测试零失败/错误，lintDebug、assembleDebug、assembleRelease 均成功，发布签名验证通过。
+- 公网账号验收：`deploy/smoke-test.py` 8 项通过，覆盖证书、鉴权、账号唯一性、账号数据隔离、退出、改密、恢复、导出/清理及注销；只使用合成账号且已删除，无 AI 供应商请求。
+
+本轮未安装到手机、未运行付费供应商探测、未新增物理耳机听音/触控/定位验收。历史硬件结果不作为本次服务器发布后的完整链路验证。
