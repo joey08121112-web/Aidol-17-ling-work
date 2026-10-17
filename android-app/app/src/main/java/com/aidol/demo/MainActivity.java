@@ -37,6 +37,7 @@ import org.json.JSONObject;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -185,6 +186,10 @@ public final class MainActivity extends Activity {
     private TextView modeHint;
     private String liveTranscript = "";
     private String liveReplyText = "";
+    private final ConversationFeed conversationFeed = new ConversationFeed();
+    private LinearLayout liveTurn, conversationStarters;
+    private TextView liveUserBubble, liveAssistantBubble;
+    private boolean followingConversation = true, conversationScrollQueued;
     private boolean repeatArmed, permissionPending, turnSucceeded;
     private long repeatAt;
     private final Runnable repeatTick = new Runnable() {
@@ -222,6 +227,8 @@ public final class MainActivity extends Activity {
         turnDetails = null;
         voiceButton = null; cancelButton = null; orb = null; chatInput = null;
         callCaption = null; liveWords = null; content = null;
+        liveTurn = null; liveUserBubble = null; liveAssistantBubble = null; conversationStarters = null;
+        conversationScrollQueued = false;
         headsetStatus = null;
         voiceHint = null;
         developmentSummary = null;
@@ -327,6 +334,9 @@ public final class MainActivity extends Activity {
         scroll = new ScrollView(this); scroll.setFillViewport(true); scroll.setClipToPadding(false); scroll.setVerticalScrollBarEnabled(false);
         root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
         page = column(); page.setPadding(dp(24), dp(12), dp(24), dp(32)); scroll.addView(page);
+        scroll.setOnScrollChangeListener((v, x, y, oldX, oldY) -> {
+            if (tab == 0 && v == scroll) followingConversation = ConversationFeed.shouldFollow(y, page.getHeight(), scroll.getHeight());
+        });
         composer = column(); composer.setPadding(dp(20), dp(8), dp(20), dp(8)); root.addView(composer);
         composer.setVisibility(tab == 0 ? View.VISIBLE : View.GONE);
         View divider = new View(this); divider.setBackgroundColor(SOFT); root.addView(divider, new LinearLayout.LayoutParams(-1, dp(1)));
@@ -356,7 +366,7 @@ public final class MainActivity extends Activity {
         clearHeadsetGesture();
         boolean keepCall = sessionUsesCapture && session != null || repeatArmed;
         if (session != null && !keepCall) cancelSession("已结束当前操作");
-        if (!keepCall) stopRepeat(); tab = next; hideKeyboard(); showApp();
+        if (!keepCall) stopRepeat(); tab = next; if (next == 0) followingConversation = true; hideKeyboard(); showApp();
     }
 
     private void conversation() {
@@ -384,7 +394,7 @@ public final class MainActivity extends Activity {
         cancelButton.setVisibility(session == null && !repeatArmed ? View.GONE : View.VISIBLE);
         callCaption = label(hero, InteractionCopy.ready(listenMode), 12, MUTED); callCaption.setGravity(Gravity.CENTER);
         liveWords = label(hero, "试着说：上次答应客户的事是什么？", 13, MUTED);
-        liveWords.setGravity(Gravity.CENTER); liveWords.setMinHeight(dp(48)); liveWords.setMaxLines(4);
+        liveWords.setGravity(Gravity.CENTER); liveWords.setMinHeight(dp(48)); liveWords.setSingleLine(true); liveWords.setEllipsize(TextUtils.TruncateAt.END);
         if (session != null) {
             liveWords.setText(recording ? liveTranscript : liveReplyText);
             voiceButton.setText(listenMode == VoiceInteraction.NOTES ? "结束并保存记录" : "结束会话");
@@ -413,8 +423,8 @@ public final class MainActivity extends Activity {
         content = column(); page.addView(content);
         JSONArray history = array(state, "transcripts");
         if (history.length() == 0 && lastAnswer.isEmpty()) {
-            gap(content, 12);
-            LinearLayout starters = row(); content.addView(starters);
+            conversationStarters = column(); content.addView(conversationStarters); gap(conversationStarters, 12);
+            LinearLayout starters = row(); conversationStarters.addView(starters);
             segment(starters, "聊聊今天", false, () -> fillPrompt("想和你聊聊今天发生的事。"));
             segment(starters, "记住偏好", false, () -> fillPrompt("请帮我记住："));
             segment(starters, "理清思路", false, () -> fillPrompt("有件事，想请你帮我理清思路。"));
@@ -427,9 +437,9 @@ public final class MainActivity extends Activity {
                 remember.setOnClickListener(v -> { if (canAct()) mutate("POST", "/v1/memories/from-transcript/" + line.optString("id"), json()); });
             }
         }
-        if (!settings().optBoolean("retain_transcripts", true) && !lastAnswer.isEmpty()) {
-            chatBubble(content, false, lastUser, "本次对话"); chatBubble(content, true, lastAnswer, "本次对话");
-        }
+        if (!settings().optBoolean("retain_transcripts", true))
+            for (ConversationFeed.Line line : conversationFeed.unsaved()) chatBubble(content, line.assistant, line.text, line.time);
+        renderLiveTurn();
         turnDetails = column(); page.addView(turnDetails); renderTurnDetails();
         LinearLayout inputRow = row(); inputRow.setGravity(Gravity.CENTER_VERTICAL); composer.addView(inputRow);
         chatInput = input("说点什么…", false, 6000); chatInput.setMinLines(1); chatInput.setMaxLines(4); chatInput.setText(chatDraft);
@@ -438,14 +448,15 @@ public final class MainActivity extends Activity {
         TextView send = action(inputRow, "↑", () -> {
             String text = value(chatInput); if (text.isEmpty()) return;
             if (session != null && session.isDuplexCall()) {
-                session.sendDuplexText(text); hideKeyboard(); chatInput.setText(""); chatDraft = ""; return;
+                session.sendDuplexText(text); conversationFeed.transcript(text); renderLiveTurn(); hideKeyboard(); chatInput.setText(""); chatDraft = ""; return;
             }
             if (!canAct()) return;
             hideKeyboard(); chatInput.setText(""); chatDraft = ""; startSession(text);
         }); send.setTextSize(25); send.setTextColor(BG); send.setBackground(ripple(ACCENT, 18, ACCENT)); send.setContentDescription("发送文字消息");
+        if (session != null) followConversation();
     }
 
-    private void chatBubble(LinearLayout parent, boolean assistant, String text, String time) {
+    private TextView chatBubble(LinearLayout parent, boolean assistant, String text, String time) {
         LinearLayout bubble = card(parent); bubble.setBackground(shape(assistant ? CARD : 0xffeef5ff, 22, assistant ? CARD : 0xffeef5ff));
         LinearLayout.LayoutParams bubbleParams = (LinearLayout.LayoutParams) bubble.getLayoutParams();
         if (assistant) bubbleParams.rightMargin = dp(20); else bubbleParams.leftMargin = dp(24);
@@ -456,6 +467,50 @@ public final class MainActivity extends Activity {
             small(actions, "播放", () -> { if (canAct()) { newSession(); sessionIsReplay = true; session.speak(text); } });
             small(actions, "复制", () -> copy("Aidol 回复", text));
         }
+        return copyable;
+    }
+
+    private void removeLiveTurn() {
+        if (liveTurn != null && content != null) content.removeView(liveTurn);
+        liveTurn = null; liveUserBubble = null; liveAssistantBubble = null;
+    }
+    private void clearLiveTurn() { conversationFeed.resetPending(); removeLiveTurn(); }
+    private void hideConversationStarters() {
+        if (conversationStarters != null && content != null) content.removeView(conversationStarters);
+        conversationStarters = null;
+    }
+    private void renderLiveTurn() {
+        if (content == null || tab != 0) return;
+        if (conversationFeed.user().isEmpty() && conversationFeed.reply().isEmpty()) { removeLiveTurn(); return; }
+        hideConversationStarters();
+        if (liveTurn == null) { liveTurn = column(); content.addView(liveTurn); }
+        if (!conversationFeed.user().isEmpty()) {
+            if (liveUserBubble == null) {
+                liveUserBubble = chatBubble(liveTurn, false, "", "识别中");
+                View bubble = (View) liveUserBubble.getParent(); liveTurn.removeView(bubble); liveTurn.addView(bubble, 0);
+            }
+            liveUserBubble.setText(conversationFeed.user());
+        } else if (liveUserBubble != null) { liveTurn.removeView((View) liveUserBubble.getParent()); liveUserBubble = null; }
+        if (!conversationFeed.reply().isEmpty()) {
+            if (liveAssistantBubble == null) liveAssistantBubble = chatBubble(liveTurn, true, "", "回答中");
+            liveAssistantBubble.setText(conversationFeed.reply());
+        } else if (liveAssistantBubble != null) { liveTurn.removeView((View) liveAssistantBubble.getParent()); liveAssistantBubble = null; }
+        followConversation();
+    }
+    private void followConversation() {
+        if (!followingConversation || conversationScrollQueued || content == null || tab != 0) return;
+        ScrollView target = scroll; conversationScrollQueued = true;
+        target.getViewTreeObserver().addOnPreDrawListener(new android.view.ViewTreeObserver.OnPreDrawListener() {
+            @Override public boolean onPreDraw() {
+                target.getViewTreeObserver().removeOnPreDrawListener(this);
+                if (scroll == target) {
+                    conversationScrollQueued = false;
+                    if (tab == 0 && followingConversation) target.scrollTo(0, Math.max(0, page.getHeight() - target.getHeight()));
+                }
+                return true;
+            }
+        });
+        target.invalidate();
     }
 
     private void renderTurnDetails() {
@@ -537,19 +592,22 @@ public final class MainActivity extends Activity {
         else if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; }
         turnHasResult = true; uncertainTurnId = "";
         lastUser = value.optString("text"); lastAnswer = value.optString("response");
-        if (settings().optBoolean("retain_transcripts", true) && !lastUser.isEmpty()) {
+        String time = java.time.OffsetDateTime.now().toString();
+        boolean retain = settings().optBoolean("retain_transcripts", true);
+        List<ConversationFeed.Line> lines = conversationFeed.finish(lastUser, lastAnswer, time, retain);
+        removeLiveTurn();
+        if (retain && !lastUser.isEmpty()) {
             JSONArray previous = array(state, "transcripts"), recent = new JSONArray();
             for (int i = Math.max(0, previous.length() - 28); i < previous.length(); i++) recent.put(previous.opt(i));
-            recent.put(json("speaker", "user", "text", lastUser, "created_at", "刚刚"));
-            if (!lastAnswer.isEmpty()) recent.put(json("speaker", "assistant", "text", lastAnswer, "created_at", "刚刚"));
+            for (ConversationFeed.Line line : lines) recent.put(json("speaker", line.assistant ? "assistant" : "user", "text", line.text, "created_at", line.time));
             put(state, "transcripts", recent);
         }
         if (liveWords != null && !lastAnswer.isEmpty()) liveWords.setText(lastAnswer);
         lastCitations = array(value, "citations"); lastTools = array(value, "tool_results");
         if (!isDestroyed() && content != null) {
-            chatBubble(content, false, lastUser, "刚刚");
-            if (!lastAnswer.isEmpty()) chatBubble(content, true, lastAnswer, "刚刚");
-            if (!repeatArmed) scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
+            hideConversationStarters();
+            for (ConversationFeed.Line line : lines) chatBubble(content, line.assistant, line.text, line.time);
+            followConversation();
         }
         renderTurnDetails();
     }
@@ -560,6 +618,7 @@ public final class MainActivity extends Activity {
         JSONObject clean = json("settings", settings(), "agent", json("mode", mode()));
         for (String key : new String[]{"user", "capabilities"}) if (state.has(key)) put(clean, key, state.opt(key));
         state = clean;
+        conversationFeed.clear(); removeLiveTurn(); liveTranscript = ""; liveReplyText = "";
         lastTools = new JSONArray(); lastCitations = new JSONArray(); lastAnswer = ""; lastUser = ""; exportData = null;
         uncertainTurnId = ""; lastBusinessRequestId = "";
         if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; }
@@ -1418,7 +1477,7 @@ public final class MainActivity extends Activity {
             VoiceInteraction.endpoint(listenMode, settings().optBoolean("vad_enabled", true)), settings().optDouble("vad_threshold", .025))
             .callExperience(VoiceInteraction.directed(listenMode), !continuingCall,
                 qwen || state.optJSONObject("capabilities") != null && state.optJSONObject("capabilities").optBoolean("voice_reply_stream")); session.start();
-    } else { lastUser = text;
+    } else { lastUser = text; conversationFeed.transcript(text); renderLiveTurn();
         session.streaming(false, state.optJSONObject("capabilities") != null && state.optJSONObject("capabilities").optBoolean("speech_stream"));
         session.startText(text); } }
     private void newSession() { newSession(null); }
@@ -1429,6 +1488,7 @@ public final class MainActivity extends Activity {
         final int submittedInteraction = listenMode;
         sessionUsesCapture = false; sessionIsReplay = operationCue; sessionOperationNotice = operationNotice;
         turnSucceeded = operationCue; turnHasResult = false; recording = false;
+        clearLiveTurn(); followingConversation = true;
         liveTranscript = ""; liveReplyText = ""; if (liveWords != null && !continuingCall) liveWords.setText("");
         lastNotice = operationCue ? operationNotice + "；正在播放操作提示" : continuingCall ? "我在，直接说就好" : "正在接通 AI…";
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
@@ -1440,7 +1500,7 @@ public final class MainActivity extends Activity {
                 if (!currentSession(generation)) return;
                 if (!operationCue && !turnHasResult && session != null && session.requestId().equals(lastBusinessRequestId)) uncertainTurnId = lastBusinessRequestId;
                 turnSucceeded = false; stopRepeat(); lastNotice = operationCue ? operationNotice + "；操作提示未播放，请检查耳机连接" : text;
-                diagnosticError = text; renderDiagnostics(); renderTurnDetails(); updateStatus();
+                clearLiveTurn(); diagnosticError = text; renderDiagnostics(); renderTurnDetails(); updateStatus();
             }
             @Override public void input(String text) { if (!currentSession(generation)) return; diagnosticInput = text; renderDiagnostics(); }
             @Override public void output(String text) { if (!currentSession(generation)) return; diagnosticOutput = text; renderDiagnostics(); }
@@ -1472,8 +1532,8 @@ public final class MainActivity extends Activity {
                 acceptBusinessResult(value);
                 if (value.optBoolean("voice_error")) { turnSucceeded = false; stopRepeat(); }
             }
-            @Override public void transcript(String text) { if (!currentSession(generation)) return; liveTranscript = text; if (liveWords != null) liveWords.setText(text); }
-            @Override public void reply(String text) { if (!currentSession(generation)) return; liveReplyText = text; recording = false; if (liveWords != null) liveWords.setText(text); if (voiceButton != null) voiceButton.setText("结束会话"); if (callCaption != null) callCaption.setText("正在回答 · 说“小万”可打断 · 单击结束通话"); }
+            @Override public void transcript(String text) { if (!currentSession(generation)) return; liveTranscript = text; if (liveWords != null) liveWords.setText(text); if (!operationCue && submittedInteraction != VoiceInteraction.NOTES && conversationFeed.transcript(text)) renderLiveTurn(); }
+            @Override public void reply(String text) { if (!currentSession(generation)) return; liveReplyText = text; recording = false; if (liveWords != null) liveWords.setText(text); if (!operationCue && conversationFeed.reply(text)) renderLiveTurn(); if (voiceButton != null) voiceButton.setText("结束会话"); if (callCaption != null) callCaption.setText("正在回答 · 说“小万”可打断 · 单击结束通话"); }
             @Override public void processing() { if (!currentSession(generation)) return; recording = false; if (voiceButton != null) voiceButton.setText(submittedInteraction == VoiceInteraction.NOTES ? "正在保存…" : "结束会话"); if (callCaption != null) callCaption.setText(submittedInteraction == VoiceInteraction.NOTES ? "正在保存工作记录" : "正在思考 · 单击结束会话"); }
             @Override public void idle() { if (!currentSession(generation)) return; turnSucceeded = listenMode == VoiceInteraction.CALL; if (!turnSucceeded) stopRepeat(); uncertainTurnId = ""; }
             @Override public void recording() { if (!currentSession(generation)) return; recording = true; if (voiceButton != null) voiceButton.setText(listenMode == VoiceInteraction.NOTES ? "结束并保存记录" : "结束会话"); if (callCaption != null) callCaption.setText(InteractionCopy.recording(listenMode, settings().optBoolean("vad_enabled", true))); setStatusText("正在听你说…"); }
@@ -1482,6 +1542,7 @@ public final class MainActivity extends Activity {
                 if (!currentSession(generation)) return;
                 if (session != null && session.isDuplexCall()) stopRepeat();
                 if (turnSucceeded) headsetPolicy.turnFinished(generation);
+                clearLiveTurn();
                 ++sessionGeneration;
                 if (voiceService != null) voiceService.release(session, repeatArmed && listenMode == VoiceInteraction.CALL && turnSucceeded);
                 session = null; recording = false; sessionOperationNotice = null;
@@ -1538,6 +1599,7 @@ public final class MainActivity extends Activity {
         deferredMode = null; deferredOpenConversation = false;
         String appliedNotice = sessionOperationNotice; sessionOperationNotice = null;
         HostedSession old = session; session = null; recording = false; turnSucceeded = false;
+        clearLiveTurn();
         if (voiceService != null) voiceService.release(old);
         if (old != null) old.cancel();
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
