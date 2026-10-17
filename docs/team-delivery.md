@@ -8,8 +8,8 @@ App 已内置切模式、开始和结束的固定中文操作提示；运行时�
 
 ## 需要发给同事的文件
 
-1. Git 仓库地址及本轮提交号，或 `artifacts/aidol-m0-m1-handoff.zip` 源码快照。快照含官方资料；Git 不含生成 APK 或 SDK AAR。
-2. 官方 `耳机SDK Android 文档.docx` 和原始 `demo_6_7.zip`。不要只发 AAR 而遗漏文档。
+1. Git 仓库地址及本轮提交号，或 `artifacts/aidol-m0-m1-handoff.zip` 源码快照。Git 不含生成 APK。
+2. 厂商资料已随 Git 存放在 `vendor/rise/6.7/`：官方 `耳机SDK Android 文档.docx` 和包含原版 AAR 的 `demo_6_7.zip`。ZIP 已移除示例签名私钥和密码，详见该目录 README；新电脑无需另行索取。
 3. 如需共用供应商配置，单独私密发送 `artifacts/aidol-team-env.private.zip`。它包含真实后端凭证，ZIP 本身未加密，不能放入 Git、公开群、Issue、官网或普通源码交接包。同事使用会消耗同一供应商账号额度；也可以让同事使用自己的凭证。
 
 私密包从当前 `.env` 按字段白名单生成，只保留文本模型、ASR、TTS、地图配置及本地默认值。它不复制 SSH 密码、Android 签名密钥、手机账号密码、数据库、旧 Demo Key 或本机代理地址。创建命令不输出任何凭证值：
@@ -42,13 +42,13 @@ sh ./start-android-backend.sh
 
 ```powershell
 # Windows
-powershell -File scripts/import-rise-sdk.ps1 -DemoZip '<demo_6_7.zip路径>'
+powershell -File scripts/import-rise-sdk.ps1 -DemoZip vendor/rise/6.7/demo_6_7.zip
 .\connect-android-usb.ps1 -Serial '<手机序列号>' -Adb '<SDK目录>\platform-tools\adb.exe'
 ```
 
 ```sh
 # macOS
-bash scripts/import-rise-sdk.sh '<demo_6_7.zip路径>'
+bash scripts/import-rise-sdk.sh vendor/rise/6.7/demo_6_7.zip
 chmod +x android-app/gradlew
 sh ./connect-android-usb.sh --serial '<手机序列号>' --adb "$ANDROID_HOME/platform-tools/adb"
 ```

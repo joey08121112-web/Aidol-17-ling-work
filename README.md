@@ -33,7 +33,7 @@
 
 USB 授权后建立 `adb -s <serial> reverse tcp:8108 tcp:8108`，Android Studio 打开 `android-app/` 并在手机 Run。debug 的“连接设置”分别选择音频来源和后端：唯一音频 Rise SDK 麦克风，本地电脑服务 / 远端服务器。本地固定 `http://127.0.0.1:8108`，不提供模拟器入口；本地与远端账号、会话和数据互不复制。
 
-完整步骤和无 Key 测试范围见 [USB 真机与本地后端测试](docs/android-local-testing.md)。Rise 开发还需按 [M0/M1 交接](docs/android-m0-m1-handoff.md) 提供官方 Word、`demo_6_7.zip` 和固定版本 AAR；这些厂商资料并不是已移除的项目 Demo。换电脑时需包含当前未提交源码，不能只发送旧 HEAD。
+完整步骤和无 Key 测试范围见 [USB 真机与本地后端测试](docs/android-local-testing.md)。Rise 官方 Word、Demo 源码和固定版本 AAR 已随 Git 存放在 [vendor/rise/6.7](vendor/rise/6.7/README.md)，新电脑先从该目录的 ZIP 导入 SDK；Demo 已去除示例签名私钥和密码。这些厂商资料并不是已移除的项目 Demo。换电脑时需包含当前未提交源码，不能只发送旧 HEAD。
 
 本机已观察到 Rise VI-A10 的 SDK READY、电量和佩戴上报；手机 USB 业务请求、短语音、真实输入来源及人耳听音仍待完整验收，macOS 组合单独待验。测试结果不能由编译成功或供应商返回音频替代。
 

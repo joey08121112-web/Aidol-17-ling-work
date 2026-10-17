@@ -38,7 +38,7 @@
 ## 换电脑必须携带的内容
 
 1. 当前源码提交或完整快照；交付前核对 `git status`，额外未提交和未跟踪实现也必须纳入。开发初期的 `5fa8a55` 基线不足以复现本次工作。
-2. 官方 `耳机SDK Android 文档.docx` 和完整原始 `demo_6_7.zip`。本机来源 `D:/Backup/Downloads/` 不会随 Git 同步。
+2. 官方 `耳机SDK Android 文档.docx` 和 `demo_6_7.zip` 已纳入 `vendor/rise/6.7/`，随 Git 同步。Demo ZIP 只去除了示例签名私钥、密码及其签名配置，官方 AAR 保持原样，详见该目录 README；无需访问旧电脑的下载目录。
 3. AAR SHA-256 固定为 `e074506fd3a46346272fdd2ab632a59b4cef2597f4cb37fd160737eb536e2b2c`。使用仓库导入脚本提取到被忽略的 `android-app/app/libs/`，Gradle 构建再次校验。
 4. [USB/Windows/macOS 指南](android-local-testing.md)、[硬件契约](hardware-integration.md)、[API](api.md)、[验收记录](acceptance.md)。
 
