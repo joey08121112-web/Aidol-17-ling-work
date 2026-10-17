@@ -170,8 +170,12 @@ public final class MainActivity extends Activity {
     private TextView workClock, meetingTitle, meetingMeta;
     private LinearLayout workCaptionBox, conversationCaptionBox;
     // Live captions of the meeting being recorded: final sentences in ink, the interim text in grey.
-    private final java.util.ArrayList<SpeakerParagraphs.Sentence> workCaptionSentences = new java.util.ArrayList<>();
-    private String workCaptionPartial = "", workCaptionMeetingId = "", workCaptionStartedAt = "";
+    // CaptionList keeps the sentence record once; the two boxes render it in different windows.
+    private final CaptionList workCaptionList = new CaptionList(80);
+    private final CaptionList conversationCaptionList = new CaptionList(200);
+    private final CaptionBox workCaptionViews = new CaptionBox();
+    private final CaptionBox conversationCaptionViews = new CaptionBox();
+    private String workCaptionMeetingId = "", workCaptionStartedAt = "";
     private String workMeetingAudioText = "";
     private android.app.Dialog meetingPage;
     private ScrollView meetingScroll;
@@ -248,6 +252,7 @@ public final class MainActivity extends Activity {
         turnDetails = null;
         voiceButton = null; cancelButton = null; orb = null; chatInput = null;
         callCaption = null; liveWords = null; content = null; workCaptionBox = null; conversationCaptionBox = null;
+        workCaptionViews.box = null; conversationCaptionViews.box = null;
         liveTurn = null; liveUserBubble = null; liveAssistantBubble = null; conversationStarters = null;
         conversationScrollQueued = false;
         headsetStatus = null;
@@ -356,7 +361,10 @@ public final class MainActivity extends Activity {
         root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
         page = column(); page.setPadding(dp(24), dp(12), dp(24), dp(32)); scroll.addView(page);
         scroll.setOnScrollChangeListener((v, x, y, oldX, oldY) -> {
-            if (tab == 0 && v == scroll) followingConversation = ConversationFeed.shouldFollow(y, page.getHeight(), scroll.getHeight());
+            if (tab == 0 && v == scroll) {
+                followingConversation = ConversationFeed.shouldFollow(y, page.getHeight(), scroll.getHeight());
+                if (oldY > 0 && y == 0) loadEarlierCaptions();
+            }
         });
         composer = column(); composer.setPadding(dp(20), dp(8), dp(20), dp(8)); root.addView(composer);
         composer.setVisibility(tab == 0 ? View.VISIBLE : View.GONE);
@@ -490,14 +498,14 @@ public final class MainActivity extends Activity {
         boolean live = session != null && sessionUsesCapture && "work".equals(mode());
         JSONArray meetings = array(state, "work_meetings");
         JSONObject latest = meetings.length() > 0 ? meetings.optJSONObject(0) : null;
-        boolean showLatest = !live && workCaptionSentences.isEmpty() && latest != null;
+        boolean showLatest = !live && conversationCaptionList.totalSentences() == 0 && latest != null;
         TextView heading = label(page, "文字记录", 20, INK); heading.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         java.time.ZoneId zone = java.time.ZoneId.systemDefault();
         String started = showLatest ? latest.optString("started_at") : workCaptionStartedAt;
         String ended = showLatest ? latest.optString("ended_at") : "";
         String title = showLatest && !latest.isNull("title") ? fallback(latest.optString("title"), "会议记录") : live ? "本次会议（记录中）" : "本次会议";
         java.util.LinkedHashSet<String> speakers = new java.util.LinkedHashSet<>();
-        for (SpeakerParagraphs.Sentence sentence : workCaptionSentences) if (!sentence.speaker.isEmpty()) speakers.add(SpeakerParagraphs.name(sentence.speaker));
+        for (SpeakerParagraphs.Sentence sentence : conversationCaptionList.sentences()) if (!sentence.speaker.isEmpty()) speakers.add(SpeakerParagraphs.name(sentence.speaker));
         LinearLayout meta = metaBlock(page);
         label(meta, "录音主题：" + title, 14, MUTED);
         if (!started.isEmpty()) label(meta, "录音时间：" + TimeFormat.chineseDay(started, zone) + " " + TimeFormat.hourMinute(started, zone)
@@ -527,7 +535,7 @@ public final class MainActivity extends Activity {
         }
         conversationCaptionBox = column(); conversationCaptionBox.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         page.addView(conversationCaptionBox);
-        renderWorkCaption();
+        renderCaptionSnapshot(conversationCaptionViews, conversationCaptionList, conversationCaptionBox);
         if (!live && !workCaptionMeetingId.isEmpty())
             button(page, "查看本场纪要、章节与回放", false, () -> openWorkMeeting(workCaptionMeetingId));
     }
@@ -1358,42 +1366,132 @@ public final class MainActivity extends Activity {
         }
     }
 
-    /** Live captions in the reference layout, on the work page (recent part) and the 对话 page (all). */
-    private void renderWorkCaption() {
-        if (workCaptionBox != null) {
-            renderCaptions(workCaptionBox, 80);
-            if (workCaptionBox.getParent() instanceof ScrollView) {
-                ScrollView inner = (ScrollView) workCaptionBox.getParent();
-                inner.post(() -> inner.fullScroll(View.FOCUS_DOWN));
-            }
-        }
-        if (conversationCaptionBox != null) { renderCaptions(conversationCaptionBox, Integer.MAX_VALUE); followConversation(); }
+    /** Live captions in the reference layout: the work page keeps a recent window, the 对话 page the long record. */
+    private void renderCaptionSnapshot(CaptionBox views, CaptionList list, LinearLayout box) {
+        views.attach(box);
+        applyCaptionDiff(views, list, list.snapshot());
     }
-    private void renderCaptions(LinearLayout box, int maxSentences) {
-        box.removeAllViews();
-        java.util.List<SpeakerParagraphs.Sentence> recent = workCaptionSentences.subList(
-            Math.max(0, workCaptionSentences.size() - maxSentences), workCaptionSentences.size());
-        java.util.List<SpeakerParagraphs.Paragraph> paragraphs = SpeakerParagraphs.build(recent);
-        if (paragraphs.isEmpty() && workCaptionPartial.isEmpty()) {
-            label(box, session != null && sessionUsesCapture && "work".equals(mode())
-                ? "正在聆听，开始说话后这里会实时显示说话人和文字…" : "开始会议记录后，这里会实时显示“说话人 1 / 说话人 2”、时间和文字。", 14, MUTED);
-            return;
+    private void scrollWorkCaptionToEnd() {
+        if (workCaptionBox != null && workCaptionBox.getParent() instanceof ScrollView) {
+            ScrollView inner = (ScrollView) workCaptionBox.getParent();
+            inner.post(() -> inner.fullScroll(View.FOCUS_DOWN));
         }
-        TextView last = null;
-        for (SpeakerParagraphs.Paragraph paragraph : paragraphs) {
-            StringBuilder text = new StringBuilder();
-            for (SpeakerParagraphs.Sentence sentence : paragraph.sentences) text.append(sentence.text);
-            last = transcriptParagraph(box, paragraph.header(), text);
+    }
+    /** Applies one caption diff: final sentences become appended views, the partial rewrites one TextView. */
+    private void applyCaptionDiff(CaptionBox views, CaptionList list, CaptionList.Diff diff) {
+        LinearLayout box = views.box;
+        if (box == null) return;
+        boolean structural = diff.dropLeading > 0 || !diff.appended.isEmpty() || !diff.appendToLast.isEmpty();
+        if (diff.rebuild) {
+            box.removeAllViews();
+            views.heads.clear(); views.bodies.clear(); views.placeholder = null; views.standaloneBody = null;
+            for (CaptionList.Block block : diff.blocks) addCaptionParagraph(views, box, block.header, block.text);
+            views.lastCommitted = diff.lastText;
+        } else {
+            if (structural) {
+                removeStandalonePartial(views, box);
+                if (views.placeholder != null) { box.removeView(views.placeholder); views.placeholder = null; }
+            }
+            for (int i = 0; i < diff.dropLeading; i++) {
+                box.removeView(views.heads.remove(0));
+                box.removeView(views.bodies.remove(0));
+            }
+            for (CaptionList.Block block : diff.appended) addCaptionParagraph(views, box, block.header, block.text);
+            if (structural) views.lastCommitted = diff.lastText;
+            if (!diff.appendToLast.isEmpty() && !views.bodies.isEmpty())
+                views.bodies.get(views.bodies.size() - 1).setText(diff.lastText);
         }
-        if (!workCaptionPartial.isEmpty()) {
-            // Interim words stay grey at the end of the last paragraph until the server confirms them.
-            if (last == null) last = transcriptParagraph(box, "正在识别", new StringBuilder());
-            android.text.SpannableStringBuilder grey = new android.text.SpannableStringBuilder(last.getText());
-            int start = grey.length(); grey.append(workCaptionPartial);
+        applyCaptionPartial(views, box, diff);
+        syncCaptionPlaceholder(views, box, diff);
+        syncEarlierHint(views, list, box);
+    }
+    private void addCaptionParagraph(CaptionBox views, LinearLayout box, String header, String text) {
+        int before = box.getChildCount();
+        TextView body = transcriptParagraph(box, header, text);
+        views.heads.add((TextView) box.getChildAt(before));
+        views.bodies.add(body);
+    }
+    /** Interim words stay grey at the end of the last paragraph until the server confirms them. */
+    private void applyCaptionPartial(CaptionBox views, LinearLayout box, CaptionList.Diff diff) {
+        if (!views.bodies.isEmpty()) {
+            TextView last = views.bodies.get(views.bodies.size() - 1);
+            if (diff.partial.isEmpty()) { if (!diff.rebuild) last.setText(views.lastCommitted); return; }
+            android.text.SpannableStringBuilder grey = new android.text.SpannableStringBuilder(views.lastCommitted);
+            int start = grey.length(); grey.append(diff.partial);
             grey.setSpan(new android.text.style.ForegroundColorSpan(MUTED), start, grey.length(), 0);
             last.setText(grey);
+            return;
+        }
+        if (views.standaloneBody != null) {
+            if (diff.partial.isEmpty()) removeStandalonePartial(views, box);
+            else views.standaloneBody.setText(greyWhole(diff.partial));
+        } else if (!diff.partial.isEmpty()) {
+            TextView head = label(box, "正在识别", 13, MUTED); head.setPadding(0, dp(14), 0, dp(2));
+            views.standaloneBody = label(box, "", 17, INK);
+            views.standaloneBody.setLineSpacing(dp(6), 1.05f); views.standaloneBody.setPadding(0, 0, 0, dp(6));
+            views.standaloneBody.setText(greyWhole(diff.partial));
         }
     }
+    private CharSequence greyWhole(String text) {
+        android.text.SpannableStringBuilder grey = new android.text.SpannableStringBuilder(text);
+        grey.setSpan(new android.text.style.ForegroundColorSpan(MUTED), 0, grey.length(), 0);
+        return grey;
+    }
+    private void removeStandalonePartial(CaptionBox views, LinearLayout box) {
+        if (views.standaloneBody == null) return;
+        int index = box.indexOfChild(views.standaloneBody);
+        if (index > 0) box.removeViewAt(index - 1);  // Its header was added immediately before the body.
+        box.removeView(views.standaloneBody);
+        views.standaloneBody = null;
+    }
+    private void syncCaptionPlaceholder(CaptionBox views, LinearLayout box, CaptionList.Diff diff) {
+        if (!views.bodies.isEmpty() || views.standaloneBody != null || !diff.partial.isEmpty()) {
+            if (views.placeholder != null && !diff.rebuild) { box.removeView(views.placeholder); views.placeholder = null; }
+            return;
+        }
+        if (views.placeholder == null) {
+            views.placeholder = label(box, "", 14, MUTED);
+        }
+        views.placeholder.setText(session != null && sessionUsesCapture && "work".equals(mode())
+            ? "正在聆听，开始说话后这里会实时显示说话人和文字…" : "开始会议记录后，这里会实时显示“说话人 1 / 说话人 2”、时间和文字。");
+    }
+    /** The 对话 page caps the rendered record; a hint at the top offers the hidden earlier sentences. */
+    private void syncEarlierHint(CaptionBox views, CaptionList list, LinearLayout box) {
+        boolean wanted = views == conversationCaptionViews && list.hasEarlier() && box.getParent() != null;
+        if (!wanted) { if (views.earlierHint != null) views.earlierHint.setVisibility(View.GONE); return; }
+        if (views.earlierHint == null) {
+            views.earlierHint = label(box, "", 12, ACCENT);
+            views.earlierHint.setPadding(0, dp(6), 0, dp(6));
+            views.earlierHint.setOnClickListener(v -> loadEarlierCaptions());
+            box.removeView(views.earlierHint); box.addView(views.earlierHint, 0);
+        }
+        views.earlierHint.setVisibility(View.VISIBLE);
+        views.earlierHint.setText("上面还有 " + list.earlierSentences() + " 句更早内容，回到顶部或点这里加载");
+    }
+    /** The reader came back to the top: grow the window by one page and keep their reading position. */
+    private void loadEarlierCaptions() {
+        if (conversationCaptionViews.box == null || !conversationCaptionList.hasEarlier()) return;
+        ScrollView scroller = scroll;
+        LinearLayout box = conversationCaptionViews.box;
+        int previousHeight = box.getHeight(), previousScroll = scroller == null ? 0 : scroller.getScrollY();
+        applyCaptionDiff(conversationCaptionViews, conversationCaptionList, conversationCaptionList.loadEarlier());
+        if (scroller != null) box.post(() -> {
+            if (scroll == scroller) scroller.scrollTo(0, Math.max(0, previousScroll + box.getHeight() - previousHeight));
+        });
+    }
+    /** View bookkeeping for one caption box: paragraph views plus placeholder, history hint and interim line. */
+    private static final class CaptionBox {
+        LinearLayout box;
+        final java.util.ArrayList<TextView> heads = new java.util.ArrayList<>();
+        final java.util.ArrayList<TextView> bodies = new java.util.ArrayList<>();
+        TextView placeholder, earlierHint, standaloneBody;
+        String lastCommitted = "";
+        void attach(LinearLayout fresh) {
+            box = fresh; heads.clear(); bodies.clear();
+            placeholder = null; earlierHint = null; standaloneBody = null; lastCommitted = "";
+        }
+    }
+
     /** Reference layout: small grey "说话人 1  00:00:41" header above a readable paragraph. */
     private TextView transcriptParagraph(LinearLayout parent, String header, CharSequence text) {
         TextView head = label(parent, header, 13, MUTED); head.setPadding(0, dp(14), 0, dp(2));
@@ -1445,7 +1543,7 @@ public final class MainActivity extends Activity {
             workCaptionBox = column(); workCaptionBox.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
             captionScroll.addView(workCaptionBox);
             captions.addView(captionScroll, new LinearLayout.LayoutParams(-1, dp(320)));
-            renderWorkCaption();
+            renderCaptionSnapshot(workCaptionViews, workCaptionList, workCaptionBox);
         } else workCaptionBox = null;
         label(intro, "结束后自动保存原文，再由 AI 整理摘要、决策与待办", 11, MUTED).setGravity(Gravity.CENTER);
         int retention = settings().optInt("work_audio_retention_days", 30);
@@ -2108,22 +2206,31 @@ public final class MainActivity extends Activity {
             }
             @Override public void captionFinals(JSONArray sentences) {
                 if (!currentSession(generation)) return;
+                java.util.List<SpeakerParagraphs.Sentence> added = new java.util.ArrayList<>();
                 for (int i = 0; i < sentences.length(); i++) {
                     JSONObject sentence = sentences.optJSONObject(i);
                     if (sentence == null || sentence.optString("text").isEmpty()) continue;
-                    workCaptionSentences.add(new SpeakerParagraphs.Sentence(sentence.optString("id"), sentence.optString("speaker"),
+                    added.add(new SpeakerParagraphs.Sentence(sentence.optString("id"), sentence.optString("speaker"),
                         sentence.optLong("start_ms"), sentence.optString("text")));
                 }
-                renderWorkCaption();
+                if (added.isEmpty()) return;
+                applyCaptionDiff(workCaptionViews, workCaptionList, workCaptionList.append(added));
+                scrollWorkCaptionToEnd();
+                applyCaptionDiff(conversationCaptionViews, conversationCaptionList, conversationCaptionList.append(added));
+                followConversation();
             }
             @Override public void captionPartial(String text) {
                 if (!currentSession(generation)) return;
-                workCaptionPartial = text == null ? "" : text; renderWorkCaption();
+                String interim = text == null ? "" : text;
+                applyCaptionDiff(workCaptionViews, workCaptionList, workCaptionList.partial(interim));
+                scrollWorkCaptionToEnd();
+                applyCaptionDiff(conversationCaptionViews, conversationCaptionList, conversationCaptionList.partial(interim));
+                followConversation();
             }
             @Override public void meeting(JSONObject value) {
                 if (!currentSession(generation)) return;
                 if (!value.optString("id").equals(workCaptionMeetingId)) {
-                    workCaptionMeetingId = value.optString("id"); workCaptionSentences.clear(); workCaptionPartial = "";
+                    workCaptionMeetingId = value.optString("id"); workCaptionList.reset(); conversationCaptionList.reset();
                     workCaptionStartedAt = value.optString("started_at"); showApp();
                 }
                 JSONArray previous = array(state, "work_meetings"), updated = new JSONArray();
@@ -2720,4 +2827,142 @@ public final class MainActivity extends Activity {
             else if (icon == 3) { path.reset(); path.moveTo(12, 22); path.cubicTo(8, 16, 4, 12, 4, 8); path.cubicTo(4, -1, 20, -1, 20, 8); path.cubicTo(20, 12, 16, 16, 12, 22); c.drawPath(path, p); c.drawCircle(12, 8, 3, p); }
             else { c.drawCircle(12, 7, 4, p); c.drawArc(4, 13, 20, 28, 180, 180, false, p); } c.restore(); }
     }
+}
+
+/**
+ * Caption document shared by the work page (recent window) and the 对话 page (long window with
+ * load-earlier): every final sentence is kept, the visible window slides on paragraph boundaries,
+ * and domain events turn into view-level diffs so live caption updates never rebuild the list.
+ */
+final class CaptionList {
+    /** One rendered paragraph: reference-layout header plus the committed text of its sentences. */
+    static final class Block {
+        final String header, text;
+        Block(String header, String text) { this.header = header; this.text = text; }
+    }
+
+    /** View-level changes since the previous diff. Rebuild (reset, bulk insert, window growth) is
+     *  reserved for cold paths; live appends and partials are described incrementally. */
+    static final class Diff {
+        final boolean rebuild;
+        final java.util.List<Block> blocks;   // visible blocks, valid when rebuilding
+        final int dropLeading;                // paragraphs the sliding window removed from the top
+        final java.util.List<Block> appended; // new paragraphs at the end
+        final String appendToLast;            // text added to the last paragraph by same-speaker continuation
+        final String lastText;                // committed text of the last paragraph after this diff
+        final String partial;                 // interim words to show greyed after lastText
+        final boolean partialParagraph;       // partial with no committed paragraph: render it standalone
+        Diff(boolean rebuild, java.util.List<Block> blocks, int dropLeading, java.util.List<Block> appended,
+             String appendToLast, String lastText, String partial, boolean partialParagraph) {
+            this.rebuild = rebuild; this.blocks = blocks; this.dropLeading = dropLeading; this.appended = appended;
+            this.appendToLast = appendToLast; this.lastText = lastText; this.partial = partial;
+            this.partialParagraph = partialParagraph;
+        }
+    }
+
+    private final java.util.List<SpeakerParagraphs.Sentence> all = new java.util.ArrayList<>();
+    // Visible blocks: spans index into all as [start, end); headers/texts/speakers describe each block.
+    private final java.util.List<int[]> spans = new java.util.ArrayList<>();
+    private final java.util.List<String> headers = new java.util.ArrayList<>();
+    private final java.util.List<String> texts = new java.util.ArrayList<>();
+    private final java.util.List<String> speakers = new java.util.ArrayList<>();
+    private final int window;
+    private int from;  // first visible sentence index; always on a block boundary
+    private String partial = "";
+
+    CaptionList(int window) { this.window = Math.max(1, window); }
+
+    int totalSentences() { return all.size(); }
+    int visibleSentences() { return all.size() - from; }
+    int earlierSentences() { return from; }
+    boolean hasEarlier() { return from > 0; }
+    java.util.List<SpeakerParagraphs.Sentence> sentences() { return java.util.Collections.unmodifiableList(all); }
+
+    Diff reset() {
+        all.clear(); spans.clear(); headers.clear(); texts.clear(); speakers.clear();
+        partial = ""; from = 0;
+        return snapshot();
+    }
+
+    /** Full re-render of what is visible: a fresh box or a grown window. */
+    Diff snapshot() {
+        java.util.List<Block> blocks = new java.util.ArrayList<>();
+        for (int i = 0; i < headers.size(); i++) blocks.add(new Block(headers.get(i), texts.get(i)));
+        return new Diff(true, blocks, 0, java.util.List.of(), "", lastCommitted(), partial, texts.isEmpty() && !partial.isEmpty());
+    }
+
+    /** Newly finalized sentences: extends the last paragraph or appends new ones. */
+    Diff append(java.util.List<SpeakerParagraphs.Sentence> added) {
+        int firstNewBlock = headers.size();
+        StringBuilder joined = new StringBuilder();
+        boolean touched = false;
+        for (SpeakerParagraphs.Sentence sentence : added) {
+            if (sentence.text.isEmpty()) continue;
+            touched = true;
+            all.add(sentence);
+            int last = texts.size() - 1;
+            if (last >= 0 && speakers.get(last).equals(sentence.speaker)
+                && texts.get(last).length() + sentence.text.length() <= SpeakerParagraphs.MAX_CHARS) {
+                // Only continuation into a paragraph from before this batch counts as appendToLast;
+                // text added to a paragraph created within the batch arrives inside its block.
+                if (last < firstNewBlock) joined.append(sentence.text);
+                texts.set(last, texts.get(last) + sentence.text);
+                spans.get(last)[1]++;
+            } else {
+                spans.add(new int[]{all.size() - 1, all.size()});
+                speakers.add(sentence.speaker);
+                headers.add(new SpeakerParagraphs.Paragraph(sentence.speaker, sentence.startMs).header());
+                texts.add(sentence.text);
+            }
+        }
+        if (!touched) return incremental(0, java.util.List.of(), "");
+        java.util.List<Block> appendedBlocks = new java.util.ArrayList<>();
+        for (int i = firstNewBlock; i < headers.size(); i++) appendedBlocks.add(new Block(headers.get(i), texts.get(i)));
+        int dropped = slide();
+        // The window slid across paragraphs this batch just described (a bulk insert): one rebuild says it all.
+        if (dropped > firstNewBlock || (dropped == firstNewBlock && joined.length() > 0)) return snapshot();
+        return incremental(dropped, appendedBlocks, joined.toString());
+    }
+
+    /** Interim recognition text; rewrites only the tail of the last rendered paragraph. */
+    Diff partial(String text) {
+        partial = text == null ? "" : text;
+        return incremental(0, java.util.List.of(), "");
+    }
+
+    /** Show one more window of history (the reader came back to the top); returns a full snapshot. */
+    Diff loadEarlier() {
+        from = Math.max(0, from - window);
+        // Sliding dropped the earlier blocks from the visible structure: recompute them wholesale.
+        spans.clear(); headers.clear(); texts.clear(); speakers.clear();
+        int index = from;
+        for (SpeakerParagraphs.Paragraph paragraph : SpeakerParagraphs.build(all.subList(from, all.size()))) {
+            StringBuilder text = new StringBuilder();
+            for (SpeakerParagraphs.Sentence sentence : paragraph.sentences) text.append(sentence.text);
+            spans.add(new int[]{index, index + paragraph.sentences.size()});
+            index += paragraph.sentences.size();
+            speakers.add(paragraph.speaker);
+            headers.add(paragraph.header());
+            texts.add(text.toString());
+        }
+        return snapshot();
+    }
+
+    /** Advance from on block boundaries so at most `window` sentences stay visible; never empties the list. */
+    private int slide() {
+        if (headers.isEmpty() || all.size() - from <= window) return 0;
+        int target = all.size() - window, dropped = 0;
+        while (headers.size() > 1 && spans.get(0)[0] < target) {
+            spans.remove(0); headers.remove(0); texts.remove(0); speakers.remove(0); dropped++;
+        }
+        from = spans.get(0)[0];
+        return dropped;
+    }
+
+    private Diff incremental(int dropLeading, java.util.List<Block> appended, String appendToLast) {
+        return new Diff(false, java.util.List.of(), dropLeading, appended, appendToLast,
+            lastCommitted(), partial, texts.isEmpty() && !partial.isEmpty());
+    }
+
+    private String lastCommitted() { return texts.isEmpty() ? "" : texts.get(texts.size() - 1); }
 }
