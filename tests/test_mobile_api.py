@@ -553,11 +553,11 @@ def test_maps_adapter_contract_and_sanitized_failures(mobile, monkeypatch):
         calls.append((query, city))
         return {"available": True, "places": [{"name": "人民广场", "longitude": 121.5, "latitude": 31.2}]}
 
-    async def nearby(self, location, keyword):
+    async def nearby(self, location, keyword, radius=3000, metro_only=False):
         assert location.longitude == 121.5 and keyword == "咖啡"
         return {"available": True, "places": []}
 
-    async def weather(self, city):
+    async def weather(self, city, forecast=False):
         assert city == "310000"
         return {"available": True, "weather": "晴"}
 

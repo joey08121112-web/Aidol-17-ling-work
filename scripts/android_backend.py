@@ -40,7 +40,7 @@ def main(argv=None):
 
     print("Real AI/ASR/TTS requires backend provider credentials in .env. Press Ctrl+C to stop.", flush=True)
     options = dict(factory=True, host="127.0.0.1", port=8108, workers=1,
-                   proxy_headers=False, ws_max_size=65536, reload=args.reload)
+                   proxy_headers=False, ws_max_size=65536, ws_max_queue=8, reload=args.reload)
     if args.reload:
         print("Development reload enabled: editing backend source interrupts active requests.", flush=True)
         options["reload_dirs"] = [str(project_root / "app")]

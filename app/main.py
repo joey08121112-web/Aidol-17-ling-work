@@ -9,8 +9,8 @@ import hashlib
 import time
 from datetime import datetime, timezone, timedelta
 
-from fastapi import FastAPI, HTTPException, Request, Query
-from fastapi.responses import JSONResponse, Response
+from fastapi import FastAPI, HTTPException, Request, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .config import Config
 from .domain import Settings, LocationInput, MemoryInput, SpeechInput, NearbyInput
@@ -18,6 +18,8 @@ from .domain import MeetingRequest, RecallRequest, TaskStatusInput, MemoryUpdate
 from .providers.volc_speech import VolcSpeechProvider, SpeechProviderError
 from .services.insights import MeetingInsights, meeting_coverage
 from .services.recall import RecallService
+from .services.voice_stream import transcribe_live
+from .providers.bocha import BochaSearch
 
 
 def create_hosted_app(config=None, data_directory=None):
@@ -154,6 +156,8 @@ def create_hosted_app(config=None, data_directory=None):
                     raise HTTPException(401, '登录已失效')
                 if billable and not accounts.consume('usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400):
                     raise HTTPException(429, '今日体验额度已用完，请明天再试')
+                value.agent.tool_charge = lambda: accounts.consume(
+                    'usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400)
                 yield value
         finally:
             active -= 1
@@ -336,6 +340,63 @@ def create_hosted_app(config=None, data_directory=None):
             fingerprint = 'pcm:' + hashlib.sha256(pcm).hexdigest() + (':direct_question' if interaction_source == 'direct_question' else '')
             return await process(rt, current, request_id, fingerprint, pcm=pcm, interaction_source=interaction_source)
 
+    @api.websocket('/v1/voice/stream')
+    async def mobile_voice_stream(socket: WebSocket):
+        # Header auth only: never put account tokens into URLs/access logs.
+        current = accounts.authenticate(digest(token(socket)))
+        if not current:
+            await socket.close(code=4401)
+            return
+        await socket.accept()
+        request_id = socket.query_params.get('request_id', '')
+        interaction = socket.query_params.get('interaction_source', 'ambient_capture')
+        reserved = False
+        rt = None
+        try:
+            if not re.fullmatch(r'[a-zA-Z0-9-]{16,64}', request_id) or interaction not in {'direct_question', 'ambient_capture'}:
+                raise HTTPException(422, '语音会话参数不正确')
+            if not config.speech.asr_ready:
+                raise HTTPException(503, '服务器尚未配置语音识别')
+            async with runtime(current, socket) as rt:
+                # A streaming ID is single-use. Recovery reads /v1/turns; no replay
+                # can swap in different audio or charge twice for an uncertain turn.
+                if rt.store.mobile_turn_status(request_id) is not None:
+                    raise HTTPException(409, '该语音会话已提交，请查询本轮状态和历史记录')
+                if not accounts.consume('usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400):
+                    raise HTTPException(429, '今日体验额度已用完，请明天再试')
+                rt.store.mobile_turn(request_id, 'stream:' + interaction)
+                rt.store.mobile_turn_stage(request_id, 'streaming')
+                reserved = True
+                await socket.send_json({'type': 'ready', 'sample_rate': 16000})
+                with measured(request_id, 'live_asr'):
+                    text = await transcribe_live(socket, speech)
+                if not accounts.authenticate(digest(token(socket))):
+                    raise HTTPException(401, '登录已失效')
+                if not text.strip():
+                    result = {'text': '', 'response': '没有听清，请再试一次', 'speak': False}
+                else:
+                    rt.store.mobile_turn_stage(request_id, 'business')
+                    with measured(request_id, 'business'):
+                        result = await rt.turn(text, 'asr', interaction)
+                rt.store.finish_mobile_turn(request_id, result)
+                await socket.send_json({'type': 'result', 'result': result})
+        except WebSocketDisconnect:
+            pass
+        except (HTTPException, ValueError, SpeechProviderError, TimeoutError) as error:
+            status = error.status_code if isinstance(error, HTTPException) else 502
+            detail = error.detail if isinstance(error, HTTPException) else '实时识别中断，请检查网络并查询本轮状态后重试'
+            try:
+                await socket.send_json({'type': 'error', 'status': status, 'detail': detail})
+            except (WebSocketDisconnect, RuntimeError):
+                pass
+        finally:
+            if reserved:
+                rt.store.fail_mobile_turn(request_id)  # completed responses stay completed
+            try:
+                await socket.close()
+            except (WebSocketDisconnect, RuntimeError):
+                pass
+
     @api.get('/v1/turns/{request_id}')
     async def mobile_turn_status(request_id: str, request: Request, current=Depends(user)):
         # Read-only recovery remains available during a long ASR/model operation.
@@ -367,6 +428,75 @@ def create_hosted_app(config=None, data_directory=None):
                     return Response(wav, media_type='audio/wav')
                 except (SpeechProviderError, TimeoutError):
                     raise HTTPException(502, '语音播放暂不可用，文字回复已保留')
+
+    @api.post('/v1/speech/stream')
+    async def mobile_speech_stream(value: SpeechInput, request: Request, current=Depends(user)):
+        # Length-prefixed PCM with a zero-length success trailer: a truncated
+        # provider/network response must never be mistaken for a complete reply.
+        import struct
+        from contextlib import aclosing
+        if not config.speech.tts_ready:
+            raise HTTPException(503, '服务器尚未配置语音合成')
+        async def generate():
+            async with runtime(current, request, True):
+                size = 0
+                async with aclosing(speech.stream_tts(value.text)) as chunks:
+                    async for chunk in chunks:
+                        if not chunk:
+                            continue
+                        size += len(chunk)
+                        if len(chunk) % 2 or size > 6 * 1024 * 1024:
+                            raise SpeechProviderError('语音数据超出上限或格式无效')
+                        for offset in range(0, len(chunk), 24000):
+                            part = chunk[offset:offset + 24000]
+                            yield struct.pack('>I', len(part)) + part
+                if not size:
+                    raise SpeechProviderError('语音服务未返回音频')
+                yield struct.pack('>I', 0)
+        stream = generate()
+        try:
+            first = await anext(stream)
+        except (SpeechProviderError, TimeoutError):
+            await stream.aclose()
+            raise HTTPException(502, '语音合成暂不可用，文字回复已保留')
+        async def response_stream():
+            try:
+                yield first
+                async for frame in stream:
+                    yield frame
+            except (SpeechProviderError, TimeoutError):
+                # Deliberately omit success trailer; client reports partial playback.
+                return
+            finally:
+                await stream.aclose()
+        return StreamingResponse(response_stream(), media_type='application/x-aidol-pcm',
+                                 headers={'X-Aidol-Audio-Rate': '24000'})
+
+    @api.get('/v1/search')
+    async def mobile_search(request: Request, q: str = Query(min_length=1, max_length=500),
+                            freshness: str = Query(default='noLimit', max_length=24), current=Depends(user)):
+        async with runtime(current, request, True):
+            try:
+                return await BochaSearch(config).search(q, freshness)
+            except ValueError as error:
+                raise HTTPException(502, str(error))
+
+    @api.get('/v1/maps/geocode')
+    async def mobile_geocode(request: Request, address: str = Query(min_length=1, max_length=100),
+                             city: str = Query(default='', max_length=80), current=Depends(user)):
+        async with runtime(current, request, True) as rt:
+            try:
+                return await rt.agent.maps.geocode(address, city)
+            except ValueError as error:
+                raise HTTPException(502, str(error))
+
+    @api.post('/v1/maps/reverse')
+    async def mobile_reverse(value: LocationInput, request: Request, current=Depends(user)):
+        async with runtime(current, request, True) as rt:
+            try:
+                return await rt.agent.maps.reverse(value)
+            except ValueError as error:
+                raise HTTPException(502, str(error))
 
     @api.post('/v1/memories')
     async def mobile_memory(value: MemoryInput, request: Request, current=Depends(user)):
@@ -437,20 +567,20 @@ def create_hosted_app(config=None, data_directory=None):
     async def mobile_nearby(value: NearbyInput, request: Request, current=Depends(user)):
         async with runtime(current, request, True) as rt:
             try:
-                return await rt.agent.maps.nearby(value, value.keyword)
+                return await rt.agent.maps.nearby(value, value.keyword, value.radius, value.metro_only)
             except Exception:
                 raise HTTPException(502, '周边查询暂不可用，请稍后再试')
 
     @api.get('/v1/maps/weather')
-    async def mobile_weather(request: Request, city: str = Query(default='', pattern=r'^([0-9]{6})?$'), current=Depends(user)):
+    async def mobile_weather(request: Request, city: str = Query(default='', pattern=r'^([0-9]{6})?$'), forecast: bool = False, current=Depends(user)):
         async with runtime(current, request, True) as rt:
             if not city and rt.store.settings().destination_lon is None:
                 raise HTTPException(422, '请先选择目的地，再查询当地天气')
             try:
                 if city:
-                    return await rt.agent.maps.weather(city)
+                    return await rt.agent.maps.weather(city, forecast)
                 settings = rt.store.settings()
-                return await rt.agent.maps.weather_at(settings.destination_lon, settings.destination_lat)
+                return await rt.agent.maps.weather_at(settings.destination_lon, settings.destination_lat, forecast)
             except Exception:
                 raise HTTPException(502, '天气查询暂不可用，请稍后再试')
 

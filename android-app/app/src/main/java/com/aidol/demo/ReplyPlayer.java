@@ -13,6 +13,8 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.ByteArrayInputStream;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 
@@ -48,6 +50,10 @@ public final class ReplyPlayer {
     public void play(byte[] pcm, Consumer<String> log, Consumer<String> output) throws Exception {
         if (pcm.length == 0 || (pcm.length & 1) != 0 || pcm.length > 6 * 1024 * 1024)
             throw new IOException("回复音频为空或格式不正确");
+        playStream(new ByteArrayInputStream(pcm), log, output);
+    }
+
+    public void playStream(InputStream stream, Consumer<String> log, Consumer<String> output) throws Exception {
         AudioDeviceInfo target = null;
         if (mode.requiresVerifiedHeadsetOutput()) {
             long routeDeadline = SystemClock.elapsedRealtime() + 4000;
@@ -125,18 +131,27 @@ public final class ReplyPlayer {
             if (manager.getStreamVolume(AudioManager.STREAM_MUSIC) == 0) {
                 log.accept("媒体音量为 0，请按音量加键");
             }
-            long writeDeadline = SystemClock.elapsedRealtime() + 5000;
-            for (int offset = 0; !cancelled && offset < pcm.length;) {
-                if (!acceptable(track.getRoutedDevice())) throw new IOException("播放路由离开蓝牙耳机，已停止");
-                int count = track.write(pcm, offset, Math.min(4096, pcm.length - offset), AudioTrack.WRITE_NON_BLOCKING);
-                if (count < 0) throw new IOException("回复音频写入失败：" + count);
-                if (count == 0) {
-                    if (SystemClock.elapsedRealtime() >= writeDeadline) throw new IOException("回复音频写入超时");
-                    Thread.sleep(20);
-                } else { offset += count; writeDeadline = SystemClock.elapsedRealtime() + 5000; }
+            byte[] pcm = new byte[4096];
+            int total = 0;
+            while (!cancelled) {
+                int length = stream.read(pcm);
+                if (length < 0) break;
+                total += length;
+                if ((length & 1) != 0 || total > 6 * 1024 * 1024) throw new IOException("语音格式无效或超过上限");
+                long writeDeadline = SystemClock.elapsedRealtime() + 5000;
+                for (int offset = 0; !cancelled && offset < length;) {
+                    if (!acceptable(track.getRoutedDevice())) throw new IOException("播放路由离开蓝牙耳机，已停止");
+                    int count = track.write(pcm, offset, length - offset, AudioTrack.WRITE_NON_BLOCKING);
+                    if (count < 0) throw new IOException("回复音频写入失败：" + count);
+                    if (count == 0) {
+                        if (SystemClock.elapsedRealtime() >= writeDeadline) throw new IOException("回复音频写入超时");
+                        Thread.sleep(20);
+                    } else { offset += count; writeDeadline = SystemClock.elapsedRealtime() + 5000; }
+                }
             }
-            long deadline = SystemClock.elapsedRealtime() + pcm.length / 48 + 5000;
-            long expectedFrames = (pcm.length + silence.length) / 2L;
+            if (!cancelled && total == 0) throw new IOException("语音为空");
+            long deadline = SystemClock.elapsedRealtime() + total / 48 + 5000;
+            long expectedFrames = (total + silence.length) / 2L;
             while (!cancelled && Integer.toUnsignedLong(track.getPlaybackHeadPosition()) < expectedFrames) {
                 if (SystemClock.elapsedRealtime() >= deadline) throw new IOException("语音播放超时，请检查音量和媒体输出");
                 if (!acceptable(track.getRoutedDevice())) throw new IOException("播放路由离开蓝牙耳机，已停止");

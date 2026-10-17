@@ -7,6 +7,7 @@ import math
 from datetime import datetime, timezone
 
 import httpx
+from ..providers.amap import amap_get
 
 
 class MapService:
@@ -19,8 +20,8 @@ class MapService:
         if settings.destination_lon is None or settings.destination_lat is None:
             return {"available": False, "reason": "请先在设置中填写目的地 GCJ-02 经纬度"}
         transport = getattr(settings, "transport", "driving")
-        if transport not in {"driving", "walking", "transit"}:
-            raise ValueError("出行方式必须为 driving、walking 或 transit")
+        if transport not in {"driving", "walking", "transit", "bicycling"}:
+            raise ValueError("出行方式必须为 driving、walking、transit 或 bicycling")
         async with httpx.AsyncClient(timeout=10, proxy=self.config.proxy) as client:
             # navigator.geolocation gives WGS-84; AMap route APIs require GCJ-02.
             origin = await self._convert(client, location)
@@ -37,14 +38,14 @@ class MapService:
                 if transport == "driving":
                     params.update({"extensions": "base", "strategy": "0"})
                 route = await self._get(client, "direction/" + transport, params)
-        paths = route.get("route", {}).get("transits" if transport == "transit" else "paths", [])
+        paths = route.get("data" if transport == "bicycling" else "route", {}).get("transits" if transport == "transit" else "paths", [])
         if not paths:
             return {"available": False, "reason": "高德未返回可用路线"}
         selected = paths[0]
         duration, distance = self._number(selected.get("duration")), self._number(selected.get("distance"))
         if duration is None or distance is None:
             return {"available": False, "reason": "高德路线缺少有效的时间或距离"}
-        notes = {"driving": "驾车路线估算；不代表实时公交或地铁车辆位置",
+        notes = {"bicycling": "骑行路线估算；请遵守当地道路通行规则", "driving": "驾车路线估算；不代表实时公交或地铁车辆位置",
                  "walking": "步行路线估算；实际时间受路况和步速影响",
                  "transit": "公共交通线路规划与计划时刻；不代表车辆实时位置或实际到站时间"}
         result = {"available": True, "source": "amap_" + transport, "transport": transport,
@@ -75,8 +76,10 @@ class MapService:
             body = await self._get(client, "place/text", params)
         return self._poi_result(body, "amap_poi")
 
-    async def nearby(self, location, keyword="美食"):
+    async def nearby(self, location, keyword="美食", radius=3000, metro_only=False):
         """Find real POIs within 3 km of a browser/device WGS-84 location."""
+        if not 100 <= radius <= 50000:
+            raise ValueError("搜索半径需为 100–50000 米")
         if len(keyword) > 100:
             raise ValueError("周边搜索关键词不得超过 100 个字符")
         if not self.config.amap_key:
@@ -84,13 +87,14 @@ class MapService:
         async with httpx.AsyncClient(timeout=10, proxy=self.config.proxy) as client:
             origin = await self._convert(client, location)
             body = await self._get(client, "place/around", {"location": origin,
-                "keywords": keyword.strip() or "美食", "radius": "3000", "sortrule": "distance",
+                "keywords": "" if metro_only else keyword.strip() or "美食", "radius": str(radius), "sortrule": "distance",
+                **({"types": "150500"} if metro_only else {}),
                 "offset": "10", "page": "1", "extensions": "base"})
         result = self._poi_result(body, "amap_nearby")
-        result["radius_meters"] = 3000
+        result["radius_meters"] = radius
         return result
 
-    async def weather(self, city):
+    async def weather(self, city, forecast=False):
         """Read current reported weather for a six-digit AMap city/district adcode."""
         city = str(city).strip()
         if len(city) != 6 or not city.isascii() or not city.isdigit():
@@ -98,7 +102,9 @@ class MapService:
         if not self.config.amap_key:
             return {"available": False, "reason": "尚未配置高德 Key"}
         async with httpx.AsyncClient(timeout=10, proxy=self.config.proxy) as client:
-            body = await self._get(client, "weather/weatherInfo", {"city": city, "extensions": "base"})
+            body = await self._get(client, "weather/weatherInfo", {"city": city, "extensions": "all" if forecast else "base"})
+        if forecast:
+            return self._forecast(body)
         lives = body.get("lives", [])
         if not lives or not isinstance(lives[0], dict):
             return {"available": False, "reason": "高德未返回该城市的天气"}
@@ -110,7 +116,7 @@ class MapService:
                 "wind_power": self._text(current.get("windpower")), "report_time": self._text(current.get("reporttime")),
                 "note": "高德最近发布的实况天气；温度单位摄氏度，湿度单位百分比"}
 
-    async def weather_at(self, longitude, latitude):
+    async def weather_at(self, longitude, latitude, forecast=False):
         """Resolve a selected GCJ-02 destination when POI search omits adcode."""
         if not self.config.amap_key:
             return {"available": False, "reason": "尚未配置高德 Key"}
@@ -119,7 +125,52 @@ class MapService:
         code = self._text(body.get("regeocode", {}).get("addressComponent", {}).get("adcode"))
         if len(code) != 6 or not code.isascii() or not code.isdigit():
             return {"available": False, "reason": "暂时无法识别目的地天气区域，请更换目的地重试"}
-        return await self.weather(code)
+        return await self.weather(code, forecast)
+
+    async def geocode(self, address, city=""):
+        if not address.strip() or len(address) > 100 or len(city) > 80:
+            raise ValueError("地址需为 1–100 字，城市最多 80 字")
+        if not self.config.amap_key:
+            return {"available": False, "places": [], "reason": "尚未配置高德 Key"}
+        async with httpx.AsyncClient(timeout=10, proxy=self.config.proxy) as client:
+            body = await self._get(client, "geocode/geo", {"address": address, "city": city})
+        places = []
+        for item in (body.get("geocodes") or [])[:10]:
+            if not isinstance(item, dict):
+                continue
+            coords = self._coordinates(item.get("location"))
+            if coords:
+                places.append({"address": self._text(item.get("formatted_address")),
+                    "longitude": coords[0], "latitude": coords[1], "adcode": self._text(item.get("adcode")),
+                    "city": self._text(item.get("city")) or self._text(item.get("province"))})
+        return {"available": True, "source": "amap_geocode", "coordinate_system": "GCJ-02",
+                "places": places, "reason": "" if places else "未找到该地址"}
+
+    async def reverse(self, location):
+        if not self.config.amap_key:
+            return {"available": False, "reason": "尚未配置高德 Key"}
+        async with httpx.AsyncClient(timeout=10, proxy=self.config.proxy) as client:
+            origin = await self._convert(client, location)
+            body = await self._get(client, "geocode/regeo", {"location": origin, "extensions": "base"})
+        address = body.get("regeocode") or {}
+        component = address.get("addressComponent") or {}
+        return {"available": bool(address.get("formatted_address")), "source": "amap_regeo",
+            "address": self._text(address.get("formatted_address")),
+            "city": self._text(component.get("city")) or self._text(component.get("province")),
+            "district": self._text(component.get("district")), "adcode": self._text(component.get("adcode")),
+            "reason": "" if address.get("formatted_address") else "无法识别当前位置"}
+
+    @classmethod
+    def _forecast(cls, body):
+        # AMap's actual field is plural 'forecasts' (the demo used 'forecast').
+        forecasts = body.get("forecasts") or []
+        block = forecasts[0] if forecasts and isinstance(forecasts[0], dict) else {}
+        casts = [{key: cls._text(row.get(key)) for key in
+            ("date", "week", "dayweather", "nightweather", "daytemp", "nighttemp", "daywind", "daypower")}
+            for row in (block.get("casts") or [])[:4] if isinstance(row, dict)]
+        return {"available": bool(casts), "source": "amap_forecast", "city": cls._text(block.get("city")),
+            "adcode": cls._text(block.get("adcode")), "report_time": cls._text(block.get("reporttime")),
+            "forecast": casts, "note": "高德天气预报；请按预报日期查看，非实况", "reason": "" if casts else "暂无天气预报"}
 
     async def _convert(self, client, location):
         converted = await self._get(client, "assistant/coordinate/convert", {
@@ -204,7 +255,10 @@ class MapService:
                               "stop_count": cls._number(line.get("via_num")),
                               "duration_seconds": cls._number(line.get("duration")),
                               "first_departure": cls._text(line.get("start_time")),
-                              "last_departure": cls._text(line.get("end_time"))})
+                              "last_departure": cls._text(line.get("end_time")),
+                              "stations": list(dict.fromkeys([x for x in [start] +
+                                  [cls._text(stop.get("name")) for stop in (line.get("via_stops") or [])[:80]
+                                   if isinstance(stop, dict)] + [end] if x]))})
             railway = segment.get("railway", {})
             if railway and isinstance(railway, dict):
                 name = cls._text(railway.get("name")) or cls._text(railway.get("trip"))
@@ -212,16 +266,4 @@ class MapService:
         return steps
 
     async def _get(self, client, path, params):
-        try:
-            result = await client.get("https://restapi.amap.com/v3/" + path,
-                                      params={"key": self.config.amap_key, **params})
-            result.raise_for_status()
-            body = result.json()
-        except (httpx.HTTPError, ValueError):
-            # HTTPStatusError includes a URL with key=...; never expose it upstream.
-            raise ValueError("高德服务暂不可用，请稍后重试") from None
-        if not isinstance(body, dict):
-            raise ValueError("高德返回了无效数据")
-        if body.get("status") != "1":
-            raise ValueError("高德请求失败，请检查 Key 权限、配额和参数")
-        return body
+        return await amap_get(client, self.config.amap_key, path, params)

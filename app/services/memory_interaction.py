@@ -40,6 +40,12 @@ class MemoryInteraction:
             return "forget"
         if _CORRECT.match(text):
             return "correct"
+        # "告诉我今天的天气/现在几点" is a public lookup, not a request to
+        # recall private history merely because it contains 我/今天. Explicit
+        # historical references still take priority over place/weather words.
+        if (re.search(r"天气|气温|下雨|预报|附近|周边|导航|路线|路况|公交|地铁|骑行|新闻|联网|网上|网页|几点|星期几|几号|日期|现在.*时间", text)
+                and not re.search(r"上次|之前|刚才|记忆|记得|记录|答应|承诺|待办|会议|约定|出门前|过敏|那次|那家|更早|曾经|原话|喜欢|偏好|说过|去过|买过|住过", text)):
+            return None
         if (_FOLLOWUP.search(text)
                 or (is_non_assertion(text) and re.search(r"我|上次|之前|刚才|记忆|记得|记录|答应|承诺|待办|会议|决定|出门前|今晚|今天|过敏", text))
                 or re.search(r"查(?:一下|找)?(?:记忆|记录)|找回|回忆|还有.*(?:事|做)|(?:未完成|待办).*(?:事项|任务)|(?:记得|记着).*(?:吗|么)", text)):

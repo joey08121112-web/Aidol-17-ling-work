@@ -52,6 +52,8 @@ public final class HostedSession {
     private final Object captureStartLock = new Object();
     private volatile CaptureTurn turn = new CaptureTurn(60);
     private volatile Call pending;
+    private volatile VoiceUpload upload;
+    private boolean liveUpload, liveSpeech;
     private volatile String failure;
     private String promptNotice = "";
     private volatile boolean captureActive;
@@ -60,9 +62,9 @@ public final class HostedSession {
     private long lastMeter;
     private int recordSeconds = 60;
     private String interactionSource = "direct_question";
-    private boolean autoEnd, heardSpeech;
+    private boolean autoEnd;
+    private SpeechEndpoint endpoint = new SpeechEndpoint(.025);
     private double voiceThreshold = .025;
-    private long voicedBytes, silenceBytes;
     private final Runnable limit = this::stopRecording;
     private final Runnable startupTimeout = () -> failCapture("麦克风启动超时，请恢复或重连设备后重试");
     private final Runnable stopTimeout = () -> failCapture("录音停止未确认，已丢弃本轮，请恢复或重连耳机");
@@ -94,7 +96,12 @@ public final class HostedSession {
     public HostedSession configure(int seconds, boolean vad, double threshold) {
         if (launched.get()) throw new IllegalStateException("会话已开始");
         recordSeconds = Math.max(5, Math.min(60, seconds)); turn = new CaptureTurn(recordSeconds);
-        autoEnd = vad; voiceThreshold = Math.max(.005, Math.min(.2, threshold)); return this;
+        autoEnd = vad; voiceThreshold = Math.max(.005, Math.min(.2, threshold));
+        endpoint = new SpeechEndpoint(voiceThreshold); return this;
+    }
+    public HostedSession streaming(boolean voice, boolean speech) {
+        if (launched.get()) throw new IllegalStateException("会话已开始");
+        liveUpload = voice; liveSpeech = speech; return this;
     }
     public String sessionId() { return sessionId; }
     boolean usesSystemCommunicationRoute() { return mode == AudioMode.BLUETOOTH && captureActive; }
@@ -133,6 +140,12 @@ public final class HostedSession {
             if (playback != null) { play(playback); return; }
             JSONObject result;
             if (text == null) {
+                if (liveUpload) {
+                    upload = new VoiceUpload(partial -> status("正在听：" + partial));
+                    upload.connect(api, requestId, interactionSource);
+                    if (cancelled.get()) upload.cancel();
+                    upload.awaitReady(); check();
+                }
                 prompts.start(() -> {
                     playCue(LocalCue.START);
                     // Allow the short media tail to clear before opening either microphone.
@@ -145,6 +158,10 @@ public final class HostedSession {
                 byte[] pcm = prompts.finish(() -> {
                     byte[] snapshot = turn.finish();
                     captureActive = false; releaseCaptureFocus(); diagnostic("结束并排空");
+                    if (snapshot.length < 3200) throw new IOException("录音太短，请重新录音");
+                    // Flush ASR as soon as the hardware drain is confirmed;
+                    // the short END cue can play while the backend finalizes.
+                    if (upload != null) upload.finish();
                     return snapshot;
                 }, () -> playCue(LocalCue.END), cueFailure -> {
                     promptNotice = "结束提示音未播放";
@@ -153,7 +170,9 @@ public final class HostedSession {
                 });
                 if (pcm.length < 3200) throw new IOException("录音太短，请重新录音");
                 status("正在识别并整理回复…"); diagnostic("上传 bytes=" + pcm.length);
-                result = new JSONObject(new String(request("/v1/voice?request_id=" + requestId + "&interaction_source=" + interactionSource,
+                if (upload != null) {
+                    result = upload.awaitResult();
+                } else result = new JSONObject(new String(request("/v1/voice?request_id=" + requestId + "&interaction_source=" + interactionSource,
                     pcm, "audio/pcm"), StandardCharsets.UTF_8));
             } else {
                 status("正在思考…");
@@ -183,6 +202,7 @@ public final class HostedSession {
         } finally {
             captureActive = false; clearCaptureTimers();
             capture.close(); releaseCaptureFocus(); cancelPlayer();
+            if (upload != null) upload.cancel();
             if (pending != null) pending.cancel();
             if (turn.phase() != CaptureTurn.Phase.ENDED && turn.phase() != CaptureTurn.Phase.FAILED) turn.cancel();
             // Cancellation invalidates queued done too; UI clears its active generation on cancel.
@@ -225,14 +245,13 @@ public final class HostedSession {
         long now = SystemClock.elapsedRealtime();
         try {
             if (!turn.append(bytes, now)) return;
+            if (upload != null) upload.audio(bytes);
             if (firstPcm.compareAndSet(false, true)) diagnostic("首个 PCM");
             double level = AudioFrames.rms(bytes);
             boolean silenceEnd = false;
             synchronized (vadLock) {
                 if (autoEnd) {
-                    if (level >= voiceThreshold) { voicedBytes += bytes.length; silenceBytes = 0; heardSpeech = voicedBytes >= 6400; }
-                    else if (heardSpeech) silenceBytes += bytes.length;
-                    silenceEnd = heardSpeech && turn.size() >= 22400 && silenceBytes >= 38400;
+                    silenceEnd = endpoint.accept(bytes);
                 }
                 if (now - lastMeter > 300) {
                     lastMeter = now; long size = turn.size(); post(() -> listener.meter(size, level));
@@ -269,6 +288,7 @@ public final class HostedSession {
             }
         }
         clearCaptureTimers();
+        if (upload != null) upload.cancel();
         capture.close(); releaseCaptureFocus(); end.countDown(); diagnostic("录音失败");
     }
     private void requestCaptureFocus() throws IOException {
@@ -298,6 +318,7 @@ public final class HostedSession {
     private void play(String text) throws Exception {
         String stage = "语音合成请求";
         try {
+            if (liveSpeech) { playStreaming(text); return; }
             status("正在准备语音…"); diagnostic("TTS 请求");
             byte[] wav = request("/v1/speech", new JSONObject().put("text", text.substring(0, Math.min(text.length(), 1500)))
                 .toString().getBytes(StandardCharsets.UTF_8), "application/json");
@@ -309,6 +330,29 @@ public final class HostedSession {
             check();
             if (e instanceof ApiClient.ApiException && ((ApiClient.ApiException) e).status == 401) api.vault.clear();
             throw new IOException("播放失败：" + stage + " · " + (e.getMessage() == null ? "请检查音频输出后重试" : e.getMessage()), e);
+        }
+    }
+    private void playStreaming(String text) throws Exception {
+        status("正在准备语音…");
+        Call call = api.call("POST", "/v1/speech/stream", new JSONObject().put("text", text.substring(0, Math.min(text.length(), 1500)))
+            .toString().getBytes(StandardCharsets.UTF_8), "application/json", requestId);
+        pending = call;
+        if (cancelled.get()) { call.cancel(); check(); }
+        try (okhttp3.Response response = call.execute()) {
+            if (!response.isSuccessful()) throw new ApiClient.ApiException(response.code(), "语音服务暂不可用，文字回复已保留");
+            if (response.body() == null || !"24000".equals(response.header("X-Aidol-Audio-Rate")))
+                throw new IOException("语音服务返回格式无效");
+            ReplyPlayer segment = new ReplyPlayer(context, mode, outputIdentity);
+            player = segment;
+            try (PlaybackLease ignored = PlaybackLease.acquire(cancelled::get, 4000);
+                 PcmFrameInputStream stream = new PcmFrameInputStream(response.body().byteStream())) {
+                check();
+                segment.playStream(stream, this::status, description -> post(() -> listener.output(description)));
+                check();
+            } finally {
+                segment.cancel();
+                if (player == segment) player = null;
+            }
         }
     }
     private void playCue(LocalCue cue) throws Exception {
@@ -357,6 +401,7 @@ public final class HostedSession {
     public void cancel() {
         if (!cancelled.compareAndSet(false, true)) return;
         events.invalidate(); captureActive = false; turn.cancel(); clearCaptureTimers(); end.countDown();
+        if (upload != null) upload.cancel();
         if (pending != null) pending.cancel(); cancelPlayer();
         capture.close();
         releaseCaptureFocus();

@@ -123,7 +123,7 @@ public final class MainActivity extends Activity {
     private boolean busy, recording, visible;
     private int tab, authMode;
     private String memoryFilter = "", lastNotice = "", lastAnswer = "", lastUser = "";
-    private JSONArray lastCitations = new JSONArray();
+    private JSONArray lastCitations = new JSONArray(), lastTools = new JSONArray();
     private LinearLayout turnDetails;
     private AlertDialog sourceDialog;
     private String lastBusinessRequestId = "", uncertainTurnId = "";
@@ -395,7 +395,41 @@ public final class MainActivity extends Activity {
         turnDetails.removeAllViews();
         if (lastCitations.length() > 0) button(turnDetails, "查看最近回答依据（" + lastCitations.length() + " 条）", false,
             () -> showSources("回答依据", lastCitations));
+        if (lastTools.length() > 0) button(turnDetails, "查看本轮查询来源", false, this::showToolResults);
         if (!uncertainTurnId.isEmpty()) button(turnDetails, "查询上次请求处理结果", false, this::recoverTurnResult);
+    }
+
+    private void showToolResults() {
+        LinearLayout body = dialogBody();
+        for (int i = 0; i < lastTools.length(); i++) {
+            JSONObject receipt = lastTools.optJSONObject(i);
+            if (receipt == null) continue;
+            JSONObject result = receipt.optJSONObject("result");
+            if (result == null) continue;
+            String source = result.optString("source", "查询结果");
+            label(body, source.startsWith("amap") ? "高德地图" : source.equals("bocha") ? "博查网页搜索" : "查询结果", 16, INK);
+            if (!result.optBoolean("available")) { label(body, result.optString("reason", "本次查询未完成"), 14, MUTED); continue; }
+            JSONArray rows = array(result, "results");
+            if (rows.length() == 0) {
+                String summary = result.optString("address", result.optString("datetime", result.optString("note", "")));
+                if (result.has("temperature")) summary = result.optString("city") + " " + result.optString("weather") + " " + result.optString("temperature") + "°C";
+                if (result.has("eta_seconds")) summary += "\n预计 " + Math.max(1, result.optInt("eta_seconds") / 60) + " 分钟，" + result.optInt("distance_meters") + " 米";
+                if (result.has("report_time")) summary += "\n发布时间：" + result.optString("report_time");
+                label(body, summary, 14, INK);
+                JSONArray pois = array(result, "pois");
+                for (int j = 0; j < pois.length(); j++) { JSONObject poi = pois.optJSONObject(j); if (poi != null) label(body, poi.optString("name") + " · " + poi.optString("address"), 14, INK); }
+                continue;
+            }
+            for (int j = 0; j < rows.length(); j++) {
+                JSONObject row = rows.optJSONObject(j); if (row == null) continue;
+                label(body, row.optString("title"), 15, INK);
+                label(body, row.optString("summary") + "\n" + row.optString("published"), 13, MUTED);
+                String link = row.optString("url"); Uri uri = Uri.parse(link);
+                if (("https".equals(uri.getScheme()) || "http".equals(uri.getScheme())) && uri.getHost() != null)
+                    button(body, "打开来源网页", false, () -> { try { startActivity(new Intent(Intent.ACTION_VIEW, uri)); } catch (RuntimeException error) { toast("未找到可打开网页的应用"); } });
+            }
+        }
+        scrollDialog("本轮查询来源", body);
     }
 
     private void recoverTurnResult() {
@@ -423,7 +457,7 @@ public final class MainActivity extends Activity {
         else if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; }
         turnHasResult = true; uncertainTurnId = "";
         lastUser = value.optString("text"); lastAnswer = value.optString("response");
-        lastCitations = array(value, "citations");
+        lastCitations = array(value, "citations"); lastTools = array(value, "tool_results");
         if (!isDestroyed() && content != null) {
             chatBubble(content, false, lastUser, "刚刚");
             if (!lastAnswer.isEmpty()) chatBubble(content, true, lastAnswer, "刚刚");
@@ -437,7 +471,7 @@ public final class MainActivity extends Activity {
         JSONObject clean = json("settings", settings(), "agent", json("mode", mode()));
         for (String key : new String[]{"user", "capabilities"}) if (state.has(key)) put(clean, key, state.opt(key));
         state = clean;
-        lastCitations = new JSONArray(); lastAnswer = ""; lastUser = ""; exportData = null;
+        lastTools = new JSONArray(); lastCitations = new JSONArray(); lastAnswer = ""; lastUser = ""; exportData = null;
         uncertainTurnId = ""; lastBusinessRequestId = "";
         if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; }
         if (content != null) content.removeAllViews();
@@ -562,7 +596,7 @@ public final class MainActivity extends Activity {
             request(() -> api.json("GET", "/v1/maps/search?q=" + Uri.encode(value(query)) + "&city=" + Uri.encode(value(city)), null), this::poiResults);
         });
         LinearLayout methods = row(); destination.addView(methods); gap(destination, 5);
-        String[] methodsKeys = {"driving", "walking", "transit"}, methodsNames = {"驾车", "步行", "公共交通"};
+        String[] methodsKeys = {"driving", "walking", "transit", "bicycling"}, methodsNames = {"驾车", "步行", "公共交通", "骑行"};
         for (int i = 0; i < methodsKeys.length; i++) { String key = methodsKeys[i]; segment(methods, methodsNames[i], key.equals(settings().optString("transport", "driving")), () -> {
             if (!canAct()) return; JSONObject payload = cloneJson(settings()); put(payload, "transport", key); mutate("PUT", "/v1/settings", payload);
         }); }
@@ -586,6 +620,25 @@ public final class MainActivity extends Activity {
             if (location == null) { toast("请先点击“定位并更新路线”"); return; }
             JSONObject payload = cloneJson(location); put(payload, "keyword", fallback(value(keyword), "美食"));
             request(() -> api.json("POST", "/v1/maps/nearby", payload), this::poiResults);
+        });
+        button(around, "附近地铁站", false, () -> {
+            if (!canAct()) return;
+            JSONObject nearbyAgent = state.optJSONObject("agent"), location = nearbyAgent == null ? null : nearbyAgent.optJSONObject("location");
+            if (location == null) { toast("请先点击定位并更新路线"); return; }
+            JSONObject payload = cloneJson(location); put(payload, "metro_only", true); put(payload, "radius", 2000);
+            request(() -> api.json("POST", "/v1/maps/nearby", payload), this::poiResults);
+        });
+        button(around, "目的地天气预报", false, () -> {
+            if (!canAct()) return;
+            if (settings().isNull("destination_lon")) { toast("请先选择目的地"); return; }
+            request(() -> api.json("GET", "/v1/maps/weather?forecast=true", null), weather -> {
+                if (!weather.optBoolean("available")) { showError(weather.optString("reason", "暂无预报")); return; }
+                LinearLayout body = dialogBody(); JSONArray days = array(weather, "forecast");
+                for (int i = 0; i < days.length(); i++) { JSONObject day = days.optJSONObject(i); if (day != null)
+                    label(body, day.optString("date") + "  " + day.optString("dayweather") + " / " + day.optString("nightweather") + "\n" + day.optString("nighttemp") + "–" + day.optString("daytemp") + "°C", 15, INK); }
+                label(body, "高德预报 · " + weather.optString("report_time"), 12, MUTED);
+                scrollDialog(weather.optString("city") + "天气预报", body);
+            });
         });
         button(around, "查看目的地天气", false, () -> {
             if (!canAct()) return; String code = getPreferences(MODE_PRIVATE).getString(weatherPreferenceKey(), "");
@@ -950,9 +1003,13 @@ public final class MainActivity extends Activity {
         return missing;
     }
     private void startSession(String text) { if (text != null) stopRepeat(); newSession(); lastBusinessRequestId = session.requestId(); uncertainTurnId = ""; renderTurnDetails(); sessionUsesCapture = text == null; if (text == null) {
+        session.streaming(state.optJSONObject("capabilities") != null && state.optJSONObject("capabilities").optBoolean("voice_stream"),
+            state.optJSONObject("capabilities") != null && state.optJSONObject("capabilities").optBoolean("speech_stream"));
         session.interactionSource(listenMode == 0).configure(listenMode == 2 ? settings().optInt("listen_seconds", 30) : 60,
-            listenMode != 0 && !"work".equals(mode()), settings().optDouble("vad_threshold", .025)); session.start();
-    } else { lastUser = text; session.startText(text); } }
+            settings().optBoolean("vad_enabled", true) && !"work".equals(mode()), settings().optDouble("vad_threshold", .025)); session.start();
+    } else { lastUser = text;
+        session.streaming(false, state.optJSONObject("capabilities") != null && state.optJSONObject("capabilities").optBoolean("speech_stream"));
+        session.startText(text); } }
     private void newSession() { newSession(null); }
     private void newSession(String operationNotice) {
         final boolean operationCue = operationNotice != null;

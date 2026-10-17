@@ -16,7 +16,7 @@
 
 现有发布包为 `com.aidol.app` 0.2.0，使用系统蓝牙和远端 HTTPS。当前源码已加入 debug 可选的 Rise SDK 6.7 接入，源码更新不代表公网 APK 已更新。安装、账号恢复和功能范围见 [Android 使用说明](docs/android-handoff.md)；公网可用性及硬件实测结果以 [验收记录](docs/acceptance.md) 为准。
 
-当前语音是前台短录音：每轮最多 60 秒，结束后识别、回复和播放；工作模式只记录。连续轮次和生活定时录音需要用户主动开启并保持前台，停止或离开前台后不再接续。实时双工、锁屏持续采音、ANC、按键、闪录和盒子能力属于后续范围。
+当前源码每轮语音最多60秒，支持边录边传、识别中间文字和流式TTS；工作环境记录保持安静，主动提问可以答复。连续轮次和生活定时录音需要用户主动开启并保持前台，停止或离开前台后不再接续。实时双工、锁屏持续采音、ANC、按键、闪录和盒子能力属于后续范围。
 
 ## 本地开发：安卓真机 + 电脑后端
 
@@ -44,7 +44,8 @@ USB 授权后建立 `adb -s <serial> reverse tcp:8108 tcp:8108`，Android Studio
 | `TEXT_API_KEY` / `TEXT_BASE_URL` / `TEXT_MODEL` | 文字对话、记忆提取、纪要及证据筛选 |
 | `SPEECH_VOLC_*` | 账号语音接口使用 ASR 2.0 stream；flash 仅供独立探测脚本诊断 |
 | `TTS_VOLC_*` | 独立语音合成；资源和音色必须匹配 |
-| `AMAP_API_KEY` | 地点、路线、周边和天气 |
+| `AMAP_API_KEY` | 地点、地址解析、驾车/步行/公交/骑行、地铁站、实况/预报 |
+| `BOCHA_API_KEY` | 公开网页搜索与来源摘要 |
 | `UPSTREAM_PROXY` / `PROVIDER_PROXY` | 后端上游代理，可选 |
 | `AIDOL_REGISTRATION_OPEN` / `AIDOL_MAX_USERS` / `AIDOL_DAILY_REQUESTS` | 注册开关、账号容量及业务操作配额 |
 
@@ -53,6 +54,8 @@ USB 授权后建立 `adb -s <serial> reverse tcp:8108 tcp:8108`，Android Studio
 后端只提供 `/healthz`、`/auth/*`、`/v1/*`，使用 `app.main:create_hosted_app`。部署保持单进程单 worker，HTTPS 代理后的服务只监听回环地址。部署、备份和回滚见 [后端部署](docs/android-deployment.md)。本地 Docker Compose 同样运行账号后端，端口只映射 `127.0.0.1:8108`；容器数据卷与直接启动的本地目录分别保存。
 
 官网 `website/` 独立静态发布，当前地址为 [Aidol 官网](http://123.207.219.174:6655/)，只展示公开内容并分发 APK，不处理账号密码。发布与回滚见 [官网部署](docs/website-deployment.md)。
+
+同事 Demo 的适配内容、流式协议和拉取后的启用步骤见 [语音、地图与搜索整合](docs/colleague-integration.md)。
 
 ## 验证与交接
 

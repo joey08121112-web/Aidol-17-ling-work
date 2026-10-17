@@ -13,12 +13,15 @@ class Config:
     text_url: str = field(default_factory=lambda: os.getenv("TEXT_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3"))
     text_model: str = field(default_factory=lambda: os.getenv("TEXT_MODEL", ""))
     amap_key: str = field(default_factory=lambda: os.getenv("AMAP_API_KEY", ""))
+    bocha_key: str = field(default_factory=lambda: os.getenv("BOCHA_API_KEY", ""), repr=False)
     proxy: str | None = field(default_factory=lambda: os.getenv("UPSTREAM_PROXY") or None)
     speech: VolcSpeechConfig = field(default_factory=VolcSpeechConfig.from_env)
     asr_mode: str = field(default_factory=lambda: os.getenv("SPEECH_ASR_MODE", "stream"))
 
     def capabilities(self):
         return {"text_llm": bool(self.text_key and self.text_model), "amap": bool(self.amap_key),
+                "web_search": bool(self.bocha_key), "voice_stream": self.speech.asr_ready,
+                "speech_stream": self.speech.tts_ready,
                 "asr": self.speech.asr_ready, "tts": self.speech.tts_ready, "asr_mode": self.asr_mode,
                 "text_model": self.text_model, "thinking": False,
                 "anc_control": False, "messaging": "draft_only", "audio": "pcm16/16000 → pcm16/24000"}

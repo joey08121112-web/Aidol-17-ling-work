@@ -141,3 +141,45 @@ async def test_route_missing_duration_has_no_fabricated_eta(map_mock):
     responses.extend([{"locations": "121.505,31.202"}, {"route": {"paths": [{"duration": [], "distance": "200"}]}}])
     result = await service.route(LocationInput(longitude=121.5, latitude=31.2), destination("walking"))
     assert not result["available"] and "eta_seconds" not in result
+
+
+@pytest.mark.asyncio
+async def test_bicycling_uses_v4_errcode_and_data(map_mock):
+    service, responses, requests = map_mock
+    responses.extend([{"locations": "121.505,31.202"}, httpx.Response(200, json={"errcode": 0,
+        "data": {"paths": [{"duration": "300", "distance": "1000", "steps": [{"instruction": "向北骑行"}]}]}})])
+    result = await service.route(LocationInput(longitude=121.5, latitude=31.2), destination("bicycling"))
+    assert result["available"] and result["eta_seconds"] == 300
+    assert requests[1].url.path == "/v4/direction/bicycling"
+
+
+@pytest.mark.asyncio
+async def test_weather_forecasts_plural_and_dates(map_mock):
+    service, responses, requests = map_mock
+    responses.append({"forecasts": [{"city": "北京市", "reporttime": "2026-10-17 11:00:00", "casts": [
+        {"date": "2026-10-18", "dayweather": "晴", "nightweather": "多云", "daytemp": "20", "nighttemp": "10"}]}]})
+    result = await service.weather("110000", True)
+    assert result["available"] and result["forecast"][0]["date"] == "2026-10-18"
+    assert requests[0].url.params["extensions"] == "all"
+
+
+@pytest.mark.asyncio
+async def test_metro_search_uses_single_type_and_configured_radius(map_mock):
+    service, responses, requests = map_mock
+    responses.extend([{"locations": "121.505,31.202"}, {"pois": []}])
+    await service.nearby(LocationInput(longitude=121.5, latitude=31.2), radius=2000, metro_only=True)
+    assert requests[1].url.params["types"] == "150500"
+    assert requests[1].url.params["radius"] == "2000" and requests[1].url.params["keywords"] == ""
+
+
+@pytest.mark.asyncio
+async def test_geocode_and_reverse_coordinates(map_mock):
+    service, responses, requests = map_mock
+    responses.extend([{"geocodes": [{"formatted_address": "上海市", "city": [], "province": "上海市",
+        "adcode": "310000", "location": "121.5,31.2"}]}, {"locations": "121.505,31.202"},
+        {"regeocode": {"formatted_address": "上海市人民广场", "addressComponent": {"city": [], "province": "上海市", "adcode": "310101"}}}])
+    geocoded = await service.geocode("上海市")
+    assert geocoded["places"][0]["city"] == "上海市" and geocoded["coordinate_system"] == "GCJ-02"
+    result = await service.reverse(LocationInput(longitude=121.5, latitude=31.2))
+    assert result["available"] and result["adcode"] == "310101"
+    assert requests[-1].url.params["location"] == "121.505,31.202"

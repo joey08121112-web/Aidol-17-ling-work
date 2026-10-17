@@ -23,7 +23,7 @@ class Settings(BaseModel):
     vad_threshold: float = Field(default=0.025, ge=0.005, le=0.2)
     preferences: str = Field(default="清淡饮食，喜欢安静的咖啡馆和轻松的笑话。", max_length=2000)
     destination_name: str = Field(default="公司", max_length=100)
-    transport: str = Field(default="driving", pattern="^(driving|walking|transit)$")
+    transport: str = Field(default="driving", pattern="^(driving|walking|transit|bicycling)$")
     transit_city: str = Field(default="上海", min_length=1, max_length=80)
     destination_lon: float | None = Field(default=None, ge=-180, le=180)
     destination_lat: float | None = Field(default=None, ge=-90, le=90)
@@ -83,6 +83,8 @@ class SpeechInput(BaseModel):
 
 class NearbyInput(LocationInput):
     keyword: str = Field(default="美食", min_length=1, max_length=80)
+    radius: int = Field(default=3000, ge=100, le=50000)
+    metro_only: bool = False
 
 
 class MeetingRequest(BaseModel):

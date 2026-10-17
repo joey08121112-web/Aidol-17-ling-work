@@ -21,7 +21,7 @@ def test_default_launcher_cannot_reenable_single_user_service(monkeypatch, trust
     run.main()
     assert calls == [("app.main:create_hosted_app", {
         "factory": True, "host": "127.0.0.1", "port": 8108,
-        "workers": 1, "proxy_headers": bool(trusted_proxy),
+        "workers": 1, "ws_max_size": 65536, "ws_max_queue": 8, "proxy_headers": bool(trusted_proxy),
         "forwarded_allow_ips": trusted_proxy or "",
     })]
 

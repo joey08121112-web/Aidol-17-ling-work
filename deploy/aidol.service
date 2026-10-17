@@ -12,7 +12,7 @@ EnvironmentFile=/opt/aidol/shared/.env
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 # Set these in the command so local .env paths cannot override service data paths.
-ExecStart=/usr/bin/env AIDOL_DATA_DIR=/opt/aidol/shared/data/hosted /opt/aidol/current/.venv/bin/python -m uvicorn app.main:create_hosted_app --factory --host 127.0.0.1 --port 8108 --workers 1 --proxy-headers --forwarded-allow-ips 127.0.0.1 --no-access-log
+ExecStart=/usr/bin/env AIDOL_DATA_DIR=/opt/aidol/shared/data/hosted /opt/aidol/current/.venv/bin/python -m uvicorn app.main:create_hosted_app --factory --host 127.0.0.1 --port 8108 --workers 1 --ws-max-size 65536 --ws-max-queue 8 --proxy-headers --forwarded-allow-ips 127.0.0.1 --no-access-log
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=45

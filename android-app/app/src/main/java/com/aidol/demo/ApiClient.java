@@ -13,6 +13,8 @@ import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.RequestBody;
 import okhttp3.Response;
+import okhttp3.WebSocket;
+import okhttp3.WebSocketListener;
 import org.json.JSONObject;
 
 /** Immutable endpoint per client; retries of billable requests are explicit. */
@@ -37,6 +39,9 @@ public final class ApiClient {
             if (freshConnections) request = request.newBuilder().header("Connection", "close").build();
             boolean readOnly = request.method().equals("GET") || request.method().equals("HEAD");
             return (readOnly ? safeReads : mutations).newCall(request);
+        }
+        WebSocket socket(Request request, WebSocketListener listener) {
+            return mutations.newWebSocket(request, listener);
         }
         void closeForTest() {
             mutations.connectionPool().evictAll();
@@ -75,6 +80,10 @@ public final class ApiClient {
     }
     public byte[] bytes(String method, String path, byte[] body, String contentType) throws Exception {
         return execute(call(method, path, body, contentType));
+    }
+    WebSocket voiceSocket(String path, WebSocketListener listener) {
+        return transport.socket(new Request.Builder().url(serverUrl + path)
+            .header("Authorization", "Bearer " + vault.token()).build(), listener);
     }
     public byte[] execute(Call call) throws Exception {
         // Only method/path/status: never log credentials, query strings or bodies.

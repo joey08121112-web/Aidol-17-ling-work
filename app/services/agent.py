@@ -9,6 +9,7 @@ from .memory import MemoryService
 from .maps import MapService
 from .conversation import ConversationService
 from .memory_interaction import MemoryInteraction
+from .assistant_tools import AssistantTools
 
 
 class Agent:
@@ -102,6 +103,8 @@ class Agent:
             else:
                 if directed:
                     self.memory_interaction.reset()
+                toolkit = AssistantTools(self) if directed else None
+                self.conversation.tool_runner = toolkit
                 async def response_task():
                     if directed or (self.mode != Mode.work and (item.source == "text" or respond)):
                         return await self.conversation.reply(item.text, self.instructions(directed=directed))
@@ -120,6 +123,8 @@ class Agent:
                 result = {"mode": self.mode, "memories": saved, "response": response,
                           "extraction": extraction, "explicit_reply": directed,
                           "interaction": "text_llm" if model_response else "rules"}
+                if toolkit and toolkit.receipts:
+                    result["tool_results"] = toolkit.receipts
             for memory in saved:
                 await self.bus.emit("memory.created", memory, persist=False)
             await self.bus.emit("agent.processed", {"mode": self.mode, "extraction": result["extraction"],

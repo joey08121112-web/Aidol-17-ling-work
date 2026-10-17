@@ -2,7 +2,7 @@
 
 ## 服务入口
 
-APK 内置基址 `https://123.207.219.174:7776`，由 `create_hosted_app` 提供。本地开发使用同一工厂与接口，基址 `http://127.0.0.1:8108`，手机通过 USB reverse 访问；账号与数据独立于远端。所有 JSON 为 UTF-8；供应商凭证不下发。除健康检查、注册、登录、恢复密码外，均需要 `Authorization: Bearer <登录返回的 token>`。响应设置 `Cache-Control: no-store`、`X-Content-Type-Options: nosniff` 和 `X-Frame-Options: DENY`。公开服务不提供 `/docs`、`/openapi.json`、旧 `/api/*`、Web 页面、SSE 或音频 WebSocket。
+APK 内置基址 `https://123.207.219.174:7776`，由 `create_hosted_app` 提供。本地开发使用同一工厂与接口，基址 `http://127.0.0.1:8108`，手机通过 USB reverse 访问；账号与数据独立于远端。所有 JSON 为 UTF-8；供应商凭证不下发。除健康检查、注册、登录、恢复密码外，均需要 `Authorization: Bearer <登录返回的 token>`。响应设置 `Cache-Control: no-store`、`X-Content-Type-Options: nosniff` 和 `X-Frame-Options: DENY`。公开服务不提供 `/docs`、`/openapi.json`、旧 `/api/*`、Web 页面、SSE 或旧 `/ws/audio`。新增鉴权音频 WebSocket 见下方实时语音协议。
 
 ### 账号与会话
 
@@ -51,7 +51,7 @@ APK 内置基址 `https://123.207.219.174:7776`，由 `create_hosted_app` 提供
 
 `PUT /v1/settings` 是完整替换：先取 state.settings 再合并修改。字段取值范围沿用下方“设置”，Android 强制值优先；新账号默认手动生活模式，偏好为空。关闭 `retain_transcripts` 阻止新增转写历史，但不清除旧数据，也不阻止抽取记忆或幂等结果保存；完整清除使用 `/v1/data`。
 
-服务端 `life_poll_enabled=false` 禁止服务器触发后台采集，不妨碍 Android 在当前前台页面、用户本次主动开启后按 `life_poll_seconds`（60–3600，默认 300）及 `listen_seconds`（5–60，默认 30）调度有界录音。连续模式也是一轮识别/回复/播放完成后开启下一轮；各轮单独提交 HTTP，不是 WebSocket 连续双工。停止、页面失去前台或错误会停止自动接续。用户另外开启本次锁屏耳机会话后，可在宿主仍存活期间继续手动短语音；它不授权后台连续或定时开麦。
+服务端 `life_poll_enabled=false` 禁止服务器触发后台采集，不妨碍 Android 在当前前台页面、用户本次主动开启后按 `life_poll_seconds`（60–3600，默认 300）及 `listen_seconds`（5–60，默认 30）调度有界录音。连续模式也是一轮识别/回复/播放完成后开启下一轮；各轮单独使用 HTTP 或新的有界 WebSocket 上传，不是持续全双工。停止、页面失去前台或错误会停止自动接续。用户另外开启本次锁屏耳机会话后，可在宿主仍存活期间继续手动短语音；它不授权后台连续或定时开麦。
 
 `interaction_source` 仅允许 `direct_question`（用户定向提问/命令）与 `ambient_capture`（环境记录），省略时兼容旧版为后者。新版 Android 的单轮触控、手动文字使用前者，连续/定时采集使用后者。工作模式环境记录保持安静，不执行原文中的删除等命令；显式提问允许简短答复。三种模式共用同一个账号编排器及记忆上下文。
 
@@ -127,7 +127,7 @@ M1 Android 复用 HTTP 短语音，无新增实时接口。含异步停止尾帧
 | 轮询间隔 / 监听时长 | `60..3600` 秒 / `5..60` 秒 |
 | `vad_threshold` | `0.005..0.2`，客户端 RMS 触发阈值 |
 | 目的地 | 经度 `-180..180`，纬度 `-90..90`，必须同时填写或同时为空，使用 GCJ-02 |
-| `transport` / `transit_city` | `driving/walking/transit`；公交规划目的城市，默认上海 |
+| `transport` / `transit_city` | `driving/walking/transit/bicycling`；公交规划目的城市，默认上海 |
 | 提醒分钟 | `1..60` |
 | `retain_transcripts` | 仅控制原始转写保存，不关闭记忆提取 |
 
@@ -152,3 +152,33 @@ M1 Android 复用 HTTP 短语音，无新增实时接口。含异步停止尾帧
 ## 当前范围
 
 应用只提供本文件列出的账号与业务 REST API。旧单用户浏览器接口和供应商 Demo 已移除。M2 连续语音需要另行定义账号鉴权、停止、并发及持久化语义；产品规划中的候选地址不属于已实现接口。
+
+
+## 2026-10-17 实时传输与只读工具增量
+
+`GET /v1/state` 的 capabilities 新增 `voice_stream`、`speech_stream`、`web_search`，表示配置可用，不代替实际供应商权限检测。Android 按能力使用新接口，旧接口保留。
+
+### 有界语音上传
+
+`WS /v1/voice/stream?request_id=<16–64位字母数字连字符>&interaction_source=direct_question|ambient_capture`，Bearer 仅放 HTTP 握手头；禁止把 token 放 URL。鉴权失败关闭码 4401，其他受控错误接受连接后返回 `{type:"error",status,detail}` 并关闭。
+
+服务端返回 `{type:"ready",sample_rate:16000}` 后，客户端发送 16kHz 单声道 little-endian PCM16 二进制帧，每帧 2–32000 字节且为偶数，总量最多 1920000 字节。设备确认停止排空后发送唯一文本帧 `{"type":"end"}`，总音频至少 3200 字节；不会根据识别中间结果执行业务。中间结果为 `{type:"transcript.partial",text}`，最终为 `{type:"result",result:<与/v1/voice相同结构>}`。输入等待最多 75 秒，包含上游识别的总期限 90 秒；队列最多 32 帧，拥塞超过 3 秒即失败。业务阶段重新检查登录状态。
+
+流式 request_id 为账号内单次使用，包括失败的流式 ID。重复连接返回 409，不重放、不二次扣识别额度。用 `/v1/turns/{id}` 恢复状态；`streaming` 表示尚未进入业务，`business` 表示可能已产生记录。`retryable=false`，重新发起需新 ID；先核对是否进入业务或已有完成结果。断连发生在 end 前不执行业务；end 后若结果丢失需查询状态，不能假设取消已撤销保存。原始录音不写库。
+
+### 流式播放
+
+`POST /v1/speech/stream` 请求仍为 `{text}`（1–1500 字），需要登录、配额并占账号业务锁。响应 `application/x-aidol-pcm`，头 `X-Aidol-Audio-Rate: 24000`。每帧是四字节无符号大端长度，再接 24kHz 单声道 little-endian PCM16；长度为偶数且不超过 24000，总音频最多 6MiB。四字节零长度帧表示正常完成；缺少终止帧是中断，不能报告完整播放。首帧之前的供应商错误为 502，之后的错误终止流且不发成功帧。Android 使用原有焦点/真实耳机路由核验，只在核验成功后输出语音。
+
+### 新工具与地图字段
+
+- `GET /v1/search?q=...&freshness=noLimit`：q 1–500 字，freshness 为 noLimit/oneDay/oneWeek/oneMonth/oneYear 或有效 ISO 日期、`开始日期..结束日期`；返回 `available/source/query/results/reason`。每条结果含 title/url/summary/site/published；供应商错误不回显凭证或响应正文。
+- `GET /v1/maps/geocode?address=...&city=...`：地址 1–100 字，城市最多 80；返回 GCJ-02 places（address/longitude/latitude/adcode/city）。
+- `POST /v1/maps/reverse`：WGS-84 LocationInput，先转换再逆解析，返回 address/city/district/adcode。
+- `/v1/maps/nearby` 新增 radius（100–50000，默认3000）、metro_only（默认false）；地铁站类型固定150500。
+- `/v1/maps/weather` 新增 forecast=true；返回 forecast 数组（date/week/dayweather/nightweather/daytemp/nighttemp/daywind/daypower）和 report_time/city/note。
+- settings.transport 支持 bicycling，调用高德v4并核对errcode；其他路线沿用v3。公共交通 steps 新增 stations 列表，只来自选中路线，不合并备选线路；均为规划而非车辆实时位置。
+
+主动对话在同一 Agent 内执行最多三轮、六次工具调用；只读工具包括公开搜索、地点/地址/周边、天气、路线与时钟，整段工具对话流程限45秒。每个非时钟工具调用额外占一次账号业务额度，现有一轮对话和TTS额度保持原口径。无配置/失败/额度不足均返回明确不可用结果。路线只能使用本轮地点搜索的 ID 或本人已保存目的地，不接受模型提供的任意坐标；定位须来自用户最近五分钟的主动GPS更新且精度≤200米。
+
+返回的 `tool_results:[{tool,result}]` 与对话结果一起进入账号幂等回执，用于手机展示查询来源；外部结果不当作命令，不作为用户私人事实写入记忆。公开查询中的“我/今天”不再单独触发私人记忆召回，明确历史/约定问题仍优先使用记忆。环境录音不启用工具。未接入任意MCP、本机文件操作、网页抓取、真实消息发送或自动导航。
