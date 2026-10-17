@@ -101,7 +101,7 @@ async def test_llm_empty_items_is_respected_and_does_not_invent_memory(config, s
 
 @pytest.mark.asyncio
 async def test_location_requests_route_and_creates_only_one_draft(agent, store, monkeypatch):
-    store.save_settings(Settings(auto_mode=False, mode="commute"))
+    store.save_settings(Settings(auto_mode=False, mode="commute", destination_lon=121.6, destination_lat=31.3))
     monkeypatch.setattr("app.services.agent.time.monotonic", lambda: 1000)
     calls = []
 

@@ -154,7 +154,10 @@ class MapService:
             body = await self._get(client, "geocode/regeo", {"location": origin, "extensions": "base"})
         address = body.get("regeocode") or {}
         component = address.get("addressComponent") or {}
+        # GCJ-02 coordinates let the client save "current position" as home/work directly.
+        coords = self._coordinates(origin) or (None, None)
         return {"available": bool(address.get("formatted_address")), "source": "amap_regeo",
+            "coordinate_system": "GCJ-02", "longitude": coords[0], "latitude": coords[1],
             "address": self._text(address.get("formatted_address")),
             "city": self._text(component.get("city")) or self._text(component.get("province")),
             "district": self._text(component.get("district")), "adcode": self._text(component.get("adcode")),

@@ -24,6 +24,7 @@ from .services.voice_stream import CompletionBarrier, transcribe_live, reply_liv
 from .services.qwen_voice import reply_qwen, realtime_instructions
 from .services.duplex_voice import duplex_call
 from .services.assistant_tools import AssistantTools
+from .services.commute import ROUTE_FIELDS, commute_destination
 from .providers.bocha import BochaSearch
 
 
@@ -280,9 +281,8 @@ def create_hosted_app(config=None, data_directory=None):
             value.life_poll_enabled = False
             value.provider = 'cascade'
             old = rt.store.settings()
-            if any(getattr(old, key) != getattr(value, key) for key in
-                   ('destination_lon', 'destination_lat', 'destination_name', 'transport', 'transit_city')):
-                rt.agent.route, rt.agent.last_route, rt.agent.last_notice = None, 0, 0
+            if any(getattr(old, key) != getattr(value, key) for key in ROUTE_FIELDS):
+                rt.agent.route, rt.agent.commute, rt.agent.last_route, rt.agent.last_notice = None, None, 0, 0
             rt.store.save_settings(value)
             await rt.agent.decide()
             return value
@@ -765,13 +765,15 @@ def create_hosted_app(config=None, data_directory=None):
     @api.get('/v1/maps/weather')
     async def mobile_weather(request: Request, city: str = Query(default='', pattern=r'^([0-9]{6})?$'), forecast: bool = False, current=Depends(user)):
         async with runtime(current, request, True) as rt:
-            if not city and rt.store.settings().destination_lon is None:
-                raise HTTPException(422, '请先选择目的地，再查询当地天气')
+            fix = rt.agent.location
+            destination = None if city else commute_destination(
+                rt.store.settings(), (fix['longitude'], fix['latitude']) if fix else None)
+            if destination is not None and not destination['target']:
+                raise HTTPException(422, destination['reason'] + '，再查询当地天气')
             try:
                 if city:
                     return await rt.agent.maps.weather(city, forecast)
-                settings = rt.store.settings()
-                return await rt.agent.maps.weather_at(settings.destination_lon, settings.destination_lat, forecast)
+                return await rt.agent.maps.weather_at(destination['longitude'], destination['latitude'], forecast)
             except Exception:
                 raise HTTPException(502, '天气查询暂不可用，请稍后再试')
 
@@ -937,7 +939,7 @@ def create_hosted_app(config=None, data_directory=None):
             rt.store.clear()
             rt.agent.conversation.history = []
             rt.agent.memory_interaction.reset()
-            rt.agent.location, rt.agent.route = None, None
+            rt.agent.location, rt.agent.route, rt.agent.commute = None, None, None
             return {'ok': True}
 
     return api

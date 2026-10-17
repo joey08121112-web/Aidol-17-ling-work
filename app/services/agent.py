@@ -10,6 +10,7 @@ from .maps import MapService
 from .conversation import ConversationService
 from .memory_interaction import MemoryInteraction
 from .assistant_tools import AssistantTools
+from .commute import ROUTE_FIELDS, commute_destination, with_destination
 from .voice_intent import mode_command
 
 
@@ -24,6 +25,7 @@ class Agent:
         self.reason = "等待场景输入"
         self.location = None
         self.route = None
+        self.commute = None
         self.last_motion = 0.0
         self.last_route = 0.0
         self.last_notice = 0.0
@@ -32,7 +34,7 @@ class Agent:
 
     def snapshot(self):
         return {"mode": self.mode, "reason": self.reason, "location": self.location,
-                "route": self.route}
+                "route": self.route, "commute": self.commute}
 
     async def decide(self, text=""):
         settings = self.store.settings()
@@ -162,7 +164,9 @@ class Agent:
                     response = ("当前没有可用的对话模型。你可以明确问回已保存的记忆。" if directed else
                                 f"已记录{len(saved)}条有效信息，保持安静，不打断会议。")
                 elif not response and self.mode == Mode.commute:
-                    response = "当前无法生成通勤建议。你可以问我已保存的行程记忆；实时路线与到站时间需查询确认。"
+                    response = (f"按导航估算，约{max(1, round(self.route['eta_seconds'] / 60))}分钟到达{self.route['destination']}，路况变化可能影响时间。"
+                                if self.route and self.route.get("available") else
+                                "对话模型暂时不可用，还没有拿到路线估算；定位更新后我会继续为你计算到达时间。")
                 result = {"mode": self.mode, "memories": saved, "response": response,
                           "extraction": extraction, "explicit_reply": directed,
                           "interaction": "qwen_realtime" if response_provider is not None else "text_llm" if model_response else "rules"}
@@ -204,12 +208,13 @@ class Agent:
             return "到站提醒已生成，可在通知卡片中查看草稿。"
         self.last_notice = time.monotonic()
         settings = self.store.settings()
-        text = f"{settings.contact}，我正在前往{settings.destination_name}的路上，具体到达时间确认后再告诉您。"
+        place = (self.commute or {}).get("name") or settings.destination_name
+        text = f"{settings.contact}，我正在前往{place}的路上，具体到达时间确认后再告诉您。"
         if (self.route and self.route.get("available") and self.location
                 and self.location.get("accuracy", 100000) <= 200
                 and 0 <= time.monotonic() - self.last_route < 120):
             minutes = max(1, round(self.route["eta_seconds"] / 60))
-            text = f"{settings.contact}，导航估计我约{minutes}分钟后到达{settings.destination_name}，路况变化可能影响时间。"
+            text = f"{settings.contact}，导航估计我约{minutes}分钟后到达{place}，路况变化可能影响时间。"
         draft = self.store.add("drafts", contact=settings.contact, text=text, status="pending")
         message = f"{reason}。需要提前给{settings.contact}发消息吗？我准备了草稿，确认后可复制发送。"
         await self.bus.emit("notification.proposed", {"message": message, "draft": draft, "origin": origin})
@@ -224,19 +229,22 @@ class Agent:
             self.last_route = time.monotonic()
             observed = self.location
             requested_settings = self.store.settings()
-            route_fields = ("destination_lon", "destination_lat", "destination_name", "transport", "transit_city")
+            commute = commute_destination(requested_settings, (location.longitude, location.latitude))
             try:
-                route = await self.maps.route(location, requested_settings)
+                route = (await self.maps.route(location, with_destination(requested_settings, commute))
+                         if commute["target"] else {"available": False, "reason": commute["reason"]})
             except Exception:
                 route = {"available": False, "reason": "高德服务不可用，请检查网络、Key 与配额"}
+            if route.get("available"):
+                route["target"] = commute["target"]
             current_settings = self.store.settings()
             # A slow map response must not restore an old destination after a
             # settings change, newer GPS observation, or clearing local data.
             if self.location is not observed or any(
-                    getattr(requested_settings, key) != getattr(current_settings, key) for key in route_fields):
+                    getattr(requested_settings, key) != getattr(current_settings, key) for key in ROUTE_FIELDS):
                 self.last_route = 0
                 return self.snapshot()
-            self.route = route
+            self.route, self.commute = route, commute
             if self.mode == Mode.commute and self.route.get("available") and self.route["eta_seconds"] <= current_settings.arrival_notice_minutes * 60:
                 await self.propose_arrival("导航估算即将抵达", origin="location")
         await self.bus.emit("location.updated", {"location": self.location, "route": self.route}, persist=False)

@@ -48,7 +48,7 @@ APK 默认本地基址 `http://127.0.0.1:8108`，可切换内置远端 `https://
 
 | 方法/路径 | 请求与响应 |
 | --- | --- |
-| `GET /v1/state` | 返回 `user/settings/capabilities/agent/transcripts/memories/tasks/drafts/meeting_report`；刷新时重新判断当前模式 |
+| `GET /v1/state` | 返回 `user/settings/capabilities/agent/transcripts/memories/tasks/drafts/meeting_report`；刷新时重新判断当前模式。`agent.commute` 为最近一次定位解析的通勤去向（`target=home/work/custom`、`name`、`basis=near_home/near_work/time_of_day/only_saved_place`；无可用去向时 `target=null` 并给出 `reason`），`agent.route.target` 与之对应 |
 | `PUT /v1/settings` | 完整 `Settings` JSON；返回保存后的设置。固定 `provider=cascade`、`life_poll_enabled=false`；目的地/交通参数变化清除旧路线与提醒节流 |
 | `POST /v1/chat` | `{text,request_id,interaction_source?}`；text 1–6000 有效字符；返回 `text/mode/memories/response/extraction/interaction/speak/notice`，记忆操作另含 `citations/recall/deletion` 等回执 |
 | `POST /v1/voice?request_id=...&interaction_source=direct_question` | `Content-Type: audio/pcm`，16 kHz 单声道小端 PCM16 原始字节；不带 WAV 头；返回与 chat 相同结构，未识别时返回空 text、解释 response、`speak=false` |
@@ -133,7 +133,16 @@ M1 Android 复用 HTTP 短语音，无新增实时接口。含异步停止尾帧
   "transit_city": "上海",
   "destination_lon": null,
   "destination_lat": null,
-  "contact": "老板",
+  "commute_target": "auto",
+  "home_name": "家",
+  "home_city": "",
+  "home_lon": null,
+  "home_lat": null,
+  "work_name": "公司",
+  "work_city": "",
+  "work_lon": null,
+  "work_lat": null,
+  "contact": "同事",
   "arrival_notice_minutes": 5,
   "retain_transcripts": true
 }
@@ -148,6 +157,8 @@ M1 Android 复用 HTTP 短语音，无新增实时接口。含异步停止尾帧
 | 轮询间隔 / 监听时长 | `60..3600` 秒 / `5..60` 秒 |
 | `vad_threshold` | `0.005..0.2`，客户端 RMS 触发阈值 |
 | 目的地 | 经度 `-180..180`，纬度 `-90..90`，必须同时填写或同时为空，使用 GCJ-02 |
+| 家 / 公司 | `home_*`、`work_*`，坐标规则同目的地；`*_city` 为空时沿用 `transit_city` |
+| `commute_target` | `auto/home/work/custom`。`auto`：当前位置距家 1 公里内去公司、距公司 1 公里内回家，都不在附近时按工作时段中点前去公司、之后回家；家和公司都未设置时沿用 `destination_*`。`custom` 固定使用 `destination_*` |
 | `transport` / `transit_city` | `driving/walking/transit/bicycling`；公交规划目的城市，默认上海 |
 | 提醒分钟 | `1..60` |
 | `retain_transcripts` | 仅控制原始转写保存，不关闭记忆提取 |
@@ -197,12 +208,12 @@ M1 Android 复用 HTTP 短语音，无新增实时接口。含异步停止尾帧
 
 - `GET /v1/search?q=...&freshness=noLimit`：q 1–500 字，freshness 为 noLimit/oneDay/oneWeek/oneMonth/oneYear 或有效 ISO 日期、`开始日期..结束日期`；返回 `available/source/query/results/reason`。每条结果含 title/url/summary/site/published；供应商错误不回显凭证或响应正文。
 - `GET /v1/maps/geocode?address=...&city=...`：地址 1–100 字，城市最多 80；返回 GCJ-02 places（address/longitude/latitude/adcode/city）。
-- `POST /v1/maps/reverse`：WGS-84 LocationInput，先转换再逆解析，返回 address/city/district/adcode。
+- `POST /v1/maps/reverse`：WGS-84 LocationInput，先转换再逆解析，返回 address/city/district/adcode，以及转换后的 GCJ-02 `longitude/latitude`（`coordinate_system="GCJ-02"`），可直接写入 `home_*`/`work_*` 实现"用当前位置设为家/公司"。
 - `/v1/maps/nearby` 新增 radius（100–50000，默认3000）、metro_only（默认false）；地铁站类型固定150500。
 - `/v1/maps/weather` 新增 forecast=true；返回 forecast 数组（date/week/dayweather/nightweather/daytemp/nighttemp/daywind/daypower）和 report_time/city/note。
 - settings.transport 支持 bicycling，调用高德v4并核对errcode；其他路线沿用v3。公共交通 steps 新增 stations 列表，只来自选中路线，不合并备选线路；均为规划而非车辆实时位置。
 
-主动对话在同一 Agent 内执行最多三轮、六次工具调用；只读工具包括公开搜索、地点/地址/周边、天气、路线与时钟，整段工具对话流程限45秒。每个非时钟工具调用额外占一次账号业务额度，现有一轮对话和TTS额度保持原口径。无配置/失败/额度不足均返回明确不可用结果。路线只能使用本轮地点搜索的 ID 或本人已保存目的地，不接受模型提供的任意坐标；定位须来自用户最近五分钟的主动GPS更新且精度≤200米。
+主动对话在同一 Agent 内执行最多三轮、六次工具调用；只读工具包括公开搜索、地点/地址/周边、天气、路线与时钟，整段工具对话流程限45秒。每个非时钟工具调用额外占一次账号业务额度，现有一轮对话和TTS额度保持原口径。无配置/失败/额度不足均返回明确不可用结果。路线只能使用本轮地点搜索的 ID 或本人已保存的家/公司/目的地（`plan_route.target` 为 `auto/home/work`），不接受模型提供的任意坐标；定位须来自用户最近五分钟的主动GPS更新且精度≤200米。
 
 返回的 `tool_results:[{tool,result}]` 与对话结果一起进入账号幂等回执，用于手机展示查询来源；外部结果不当作命令，不作为用户私人事实写入记忆。公开查询中的“我/今天”不再单独触发私人记忆召回，明确历史/约定问题仍优先使用记忆。环境录音不启用工具。未接入任意MCP、本机文件操作、网页抓取、真实消息发送或自动导航。
 
