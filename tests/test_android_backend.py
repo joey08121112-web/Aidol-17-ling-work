@@ -82,7 +82,8 @@ def test_local_android_ignores_legacy_and_deployment_paths(config, tmp_path, mon
     from app.main import create_hosted_app
 
     with TestClient(create_hosted_app(config)) as client:
-        assert client.get("/healthz").json() == {"ok": True, "version": "0.2.0", "ready": False}
+        assert client.get("/healthz").json() == {
+            "ok": True, "version": "0.2.0", "work_meetings": True, "ready": False}
         headers = []
         for username in ("alice", "bob"):
             response = client.post("/auth/register", json={"username": username, "password": "local-test-123"})

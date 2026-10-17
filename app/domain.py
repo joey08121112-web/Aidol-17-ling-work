@@ -9,7 +9,6 @@ class Mode(str, Enum):
 
 
 class Settings(BaseModel):
-    name: str = Field(default="小聆", min_length=1, max_length=40)
     auto_mode: bool = True
     mode: Mode = Mode.life
     provider: str = Field(default="cascade", pattern="^(auto|doubao|qwen|cascade|demo)$")

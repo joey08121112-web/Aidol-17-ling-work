@@ -101,14 +101,14 @@ def test_export_contains_reports_tasks_and_clear_removes_all(client, runtime, mo
     store.add("drafts", contact="小林", text="稍后到达")
     assert store.claim("test-event")
     exported = client.get("/v1/export").json()
-    assert exported["version"] == 3
+    assert exported["version"] == 4
     assert len(exported["reports"]) == len(exported["tasks"]) == 1
     assert exported["tasks"][0]["report_id"] == exported["reports"][0]["id"]
     assert exported["memories"] and exported["transcripts"] and exported["drafts"]
 
     assert client.request("DELETE", "/v1/data", json={"password": "test-password-123"}).status_code == 200
     exported = client.get("/v1/export").json()
-    for key in ("reports", "tasks", "memories", "transcripts", "drafts"):
+    for key in ("reports", "tasks", "memories", "transcripts", "drafts", "work_meetings"):
         assert exported[key] == []
     assert exported["settings"]["mode"] == "work"
     assert client.get("/v1/state").json()["meeting_report"] is None

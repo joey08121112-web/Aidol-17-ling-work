@@ -26,8 +26,37 @@ public final class ReplyPlayer {
     private volatile boolean cancelled;
     private volatile String interruption;
     private volatile AudioTrack activeTrack;
+    private AudioTrack preparedTrack;
 
-    public ReplyPlayer(Context context) { this(context, AudioMode.BLUETOOTH); }
+    /** Allocate only: standby never plays audio, takes focus or opens a microphone. */
+    void prepare() throws IOException {
+        synchronized (this) { if (cancelled || preparedTrack != null) return; }
+        AudioTrack allocated = createTrack();
+        synchronized (this) {
+            if (cancelled || preparedTrack != null) allocated.release();
+            else preparedTrack = allocated;
+        }
+    }
+    private AudioTrack createTrack() throws IOException {
+        int minimum = AudioTrack.getMinBufferSize(24000, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
+        if (minimum <= 0) throw new IOException("设备不支持 24kHz 语音播放");
+        AudioTrack track = new AudioTrack.Builder().setAudioAttributes(new AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
+            .setAudioFormat(new AudioFormat.Builder().setSampleRate(24000).setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
+            .setBufferSizeInBytes(Math.max(minimum * 2, 9600)).setTransferMode(AudioTrack.MODE_STREAM).build();
+        if (track.getState() != AudioTrack.STATE_INITIALIZED) {
+            track.release(); throw new IOException("音频播放器初始化失败");
+        }
+        return track;
+    }
+    private AudioTrack takeTrack() throws IOException {
+        AudioTrack track;
+        synchronized (this) { track = preparedTrack; preparedTrack = null; }
+        return track == null ? createTrack() : track;
+    }
+
+    public ReplyPlayer(Context context) { this(context, AudioMode.RISE_SDK); }
     public ReplyPlayer(Context context, AudioMode mode) {
         this(context, mode, device -> false);
     }
@@ -96,15 +125,12 @@ public final class ReplyPlayer {
         try {
             interrupted();
             if (cancelled) { return; }
-            int minimum = AudioTrack.getMinBufferSize(24000, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
-            if (minimum <= 0) throw new IOException("设备不支持 24kHz 语音播放");
-            // Streaming mode supports cancelling long replies with a small buffer.
-            track = new AudioTrack.Builder().setAudioAttributes(attributes)
-                .setAudioFormat(new AudioFormat.Builder().setSampleRate(24000).setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
-                .setBufferSizeInBytes(Math.max(minimum * 2, 9600)).setTransferMode(AudioTrack.MODE_STREAM).build();
+            track = takeTrack();
             activeTrack = track;
             if (track.getState() != AudioTrack.STATE_INITIALIZED) throw new IOException("音频播放器初始化失败");
+            // The 70 ms call chime is shorter than the default streaming start threshold.
+            // Otherwise play() can remain in startup until our completion timeout fires.
+            if (Build.VERSION.SDK_INT >= 31) track.setStartThresholdInFrames(1);
             if (target != null && !track.setPreferredDevice(target))
                 log.accept("系统未接受首选设备，正在核验实际蓝牙输出…");
             // Prime with silence: never play private speech before proving a Bluetooth route.
@@ -150,6 +176,19 @@ public final class ReplyPlayer {
                 }
             }
             if (!cancelled && total == 0) throw new IOException("语音为空");
+            // Older Android releases cannot lower the start threshold. Flush a full
+            // silent buffer so short clips (and an underrun at EOF) can start/drain.
+            byte[] tail = new byte[track.getBufferSizeInFrames() * 2];
+            long tailDeadline = SystemClock.elapsedRealtime() + 5000;
+            for (int offset = 0; !cancelled && offset < tail.length;) {
+                if (!acceptable(track.getRoutedDevice())) throw new IOException("播放路由离开蓝牙耳机，已停止");
+                int count = track.write(tail, offset, tail.length - offset, AudioTrack.WRITE_NON_BLOCKING);
+                if (count < 0) throw new IOException("回复音频写入失败：" + count);
+                if (count == 0) {
+                    if (SystemClock.elapsedRealtime() >= tailDeadline) throw new IOException("回复音频写入超时");
+                    Thread.sleep(20);
+                } else { offset += count; tailDeadline = SystemClock.elapsedRealtime() + 5000; }
+            }
             long deadline = SystemClock.elapsedRealtime() + total / 48 + 5000;
             long expectedFrames = (total + silence.length) / 2L;
             while (!cancelled && Integer.toUnsignedLong(track.getPlaybackHeadPosition()) < expectedFrames) {
@@ -171,7 +210,11 @@ public final class ReplyPlayer {
     private void interrupted() throws IOException { if (interruption != null) throw new IOException(interruption); }
 
     public void cancel() {
-        cancelled = true;
+        AudioTrack prepared;
+        synchronized (this) {
+            cancelled = true; prepared = preparedTrack; preparedTrack = null;
+        }
+        if (prepared != null) prepared.release();
         AudioTrack track = activeTrack;
         if (track != null) { try { track.pause(); track.flush(); } catch (Exception ignored) {} }
     }

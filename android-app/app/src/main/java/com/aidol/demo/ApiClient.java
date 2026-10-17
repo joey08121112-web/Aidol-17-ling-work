@@ -31,6 +31,8 @@ public final class ApiClient {
             .retryOnConnectionFailure(false).followRedirects(false).followSslRedirects(false).build();
         // newBuilder retains the same connection pool, dispatcher, timeouts and redirect policy.
         private final OkHttpClient safeReads = mutations.newBuilder().retryOnConnectionFailure(true).build();
+        private final OkHttpClient liveSockets = mutations.newBuilder().readTimeout(0, TimeUnit.SECONDS)
+            .callTimeout(0, TimeUnit.SECONDS).pingInterval(20, TimeUnit.SECONDS).build();
         HttpTransport() { this(false); }
         HttpTransport(boolean freshConnections) { this.freshConnections = freshConnections; }
         Call call(Request request) {
@@ -41,7 +43,7 @@ public final class ApiClient {
             return (readOnly ? safeReads : mutations).newCall(request);
         }
         WebSocket socket(Request request, WebSocketListener listener) {
-            return mutations.newWebSocket(request, listener);
+            return liveSockets.newWebSocket(request, listener);
         }
         void closeForTest() {
             mutations.connectionPool().evictAll();
@@ -52,11 +54,11 @@ public final class ApiClient {
         public final int status;
         ApiException(int status, String message) { super(message); this.status = status; }
     }
-    public ApiClient(Context context) { this(context, BuildConfig.SERVER_URL); }
+    public ApiClient(Context context) { this(context, new DevelopmentSettings(context).serverUrl()); }
     public ApiClient(Context context, String serverUrl) {
         this.serverUrl = ServerEndpoint.validate(serverUrl, BuildConfig.DEBUG);
         transport = new HttpTransport(useFreshConnections(this.serverUrl, BuildConfig.DEBUG));
-        vault = new AuthVault(context, BuildConfig.DEBUG ? ServerEndpoint.sessionNamespace(this.serverUrl) : "session");
+        vault = new AuthVault(context, ServerEndpoint.sessionNamespace(this.serverUrl));
     }
     static boolean useFreshConnections(String validatedOrigin, boolean debug) {
         return debug && ServerEndpoint.USB_LOCAL.equals(validatedOrigin);

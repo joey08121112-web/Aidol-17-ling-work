@@ -1,5 +1,6 @@
 .gradle/
 **/build/
+**/build-visual-review/
 local.properties
 libs/*.aar
 app/libs/*.aar

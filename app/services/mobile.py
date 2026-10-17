@@ -25,22 +25,37 @@ class MobileRuntime:
         self.store = Store(str(path))
         if fresh:
             self.store.save_settings(Settings(auto_mode=False, preferences=""))
+        settings = self.store.settings()
+        if settings.auto_mode:
+            settings.auto_mode = False
+            self.store.save_settings(settings)
         self.agent = Agent(config, self.store, EventBus(self.store))
         self.agent.conversation = MobileConversation(config)
         self.lock = asyncio.Lock()
 
-    async def turn(self, text, source, interaction_source='ambient_capture'):
+    def conversation_history(self):
         history = list(reversed(self.store.conversation_history(12)))
-        self.agent.conversation.history = [
+        return [
             {'role': 'assistant' if row['speaker'] == 'assistant' else 'user', 'content': row['text'][:2000]}
             for row in history]
-        result = await self.agent.ingest(TextInput(text=text, source=source), respond=True,
-                                        directed=interaction_source == 'direct_question')
+
+    async def turn(self, text, source, interaction_source='ambient_capture', on_response=None, response_provider=None):
+        self.agent.conversation.history = self.conversation_history()
+        # Work audio is evidence, never a command, regardless of client source labels.
+        work_audio = source == 'asr' and self.store.settings().mode == 'work'
+        directed = interaction_source in {'direct_question', 'continuous_call'} and not work_audio
+        content = text
+        silent = work_audio or (interaction_source == 'ambient_capture' and self.store.settings().mode == 'work')
+        result = await self.agent.ingest(TextInput(text=content, source=source), respond=True,
+                                        directed=directed, on_response=on_response,
+                                        response_provider=response_provider, silent=silent, recording=work_audio,
+                                        allow_mode_switch=interaction_source != 'continuous_call')
         answer = result.get('response', '')
-        if answer and self.store.settings().retain_transcripts:
+        if answer and result.get('response_complete', True) and self.store.settings().retain_transcripts:
             self.store.add('transcripts', speaker='assistant', text=answer, mode=result['mode'], source=source)
-        return {'text': text, **result, 'speak': result['mode'] != 'work' or result.get('explicit_reply', False),
-                'notice': '模型暂不可用，本次为基础规则回复' if result['interaction'] == 'rules' and result['mode'] != 'work' else ''}
+        return {'text': text, **result, 'speak': not silent and (result['mode'] != 'work' or result.get('explicit_reply', False)),
+                'notice': '模型暂不可用，本次为基础规则回复' if result['interaction'] == 'rules'
+                    and (result['mode'] != 'work' or result.get('explicit_reply', False)) else ''}
 
 
 class MobileRuntimes:
@@ -49,7 +64,7 @@ class MobileRuntimes:
         self.items = {}
 
     @asynccontextmanager
-    async def use(self, user_id):
+    async def use(self, user_id, wait_seconds=0):
         runtime = self.items.get(user_id)
         if runtime is None:
             if len(self.items) >= self.capacity:
@@ -58,7 +73,16 @@ class MobileRuntimes:
                     raise HTTPException(503, '服务器繁忙，请稍后重试')
                 del self.items[idle]
             runtime = self.items[user_id] = MobileRuntime(self.config, self.directory / (user_id + '.sqlite3'))
-        if runtime.lock.locked():
+        if runtime.lock.locked() and not wait_seconds:
             raise HTTPException(409, '你的上一项操作仍在进行，请稍后再试')
-        async with runtime.lock:
+        try:
+            if wait_seconds:
+                await asyncio.wait_for(runtime.lock.acquire(), wait_seconds)
+            else:
+                await runtime.lock.acquire()
+        except TimeoutError:
+            raise HTTPException(409, '上一项操作仍在收尾，请稍后再开始') from None
+        try:
             yield runtime
+        finally:
+            runtime.lock.release()

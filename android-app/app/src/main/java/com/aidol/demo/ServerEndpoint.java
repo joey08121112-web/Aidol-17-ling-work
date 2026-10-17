@@ -18,8 +18,8 @@ public final class ServerEndpoint {
                 || url.fragment() != null || !url.encodedPath().equals("/"))
             throw new IllegalArgumentException("服务器地址必须是独立的 HTTP(S) 源地址");
         String origin = url.toString().replaceAll("/$", "");
-        if (!url.isHttps() && !(debug && USB_LOCAL.equals(origin)))
-            throw new IllegalArgumentException("只有开发版的 USB 本地后端 127.0.0.1:8108 允许 HTTP");
+        if (!url.isHttps() && !USB_LOCAL.equals(origin))
+            throw new IllegalArgumentException("只有 USB 本地后端 127.0.0.1:8108 允许 HTTP");
         return origin;
     }
 

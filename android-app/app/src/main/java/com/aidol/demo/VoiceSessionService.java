@@ -21,10 +21,14 @@ public final class VoiceSessionService extends Service {
     private static final int NOTIFICATION = 31;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Binder binder = new LocalBinder();
-    private final Runnable expiry = () -> stopSession("锁屏耳机会话已满一小时，请回到 App 重新开启");
+    private final Runnable expiry = () -> { if (this.session == null) stopSession("耳机待命已满一小时，请回到 App 重新开启"); };
+    private long wakeRenewedAt;
     private final Runnable callCheck = new Runnable() {
         @Override public void run() {
             if (!enabled) return;
+            if (session != null && android.os.SystemClock.elapsedRealtime() - wakeRenewedAt >= 300_000L) {
+                wakeLock.acquire(600_000L); wakeRenewedAt = android.os.SystemClock.elapsedRealtime();
+            }
             int mode = getSystemService(android.media.AudioManager.class).getMode();
             boolean ownsCommunication = session != null && session.usesSystemCommunicationRoute();
             if (mode == android.media.AudioManager.MODE_IN_CALL || mode == android.media.AudioManager.MODE_IN_COMMUNICATION && !ownsCommunication
@@ -53,7 +57,7 @@ public final class VoiceSessionService extends Service {
             PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         Notification notification = new Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_launcher).setContentTitle("Aidol 耳机会话已开启")
-            .setContentText("手动触发短语音；点击停止结束本次授权")
+            .setContentText("AI 通话可锁屏继续；点击停止即可挂断")
             .setContentIntent(content).setOngoing(true).setCategory(Notification.CATEGORY_SERVICE)
             .setVisibility(Notification.VISIBILITY_PRIVATE)
             .addAction(new Notification.Action.Builder(null, "停止会话", stop).build()).build();
@@ -80,13 +84,21 @@ public final class VoiceSessionService extends Service {
         if (!enabled) throw new IllegalStateException("耳机会话已停止，请回到 App 重新开启");
         if (session != null && session != active) throw new IllegalStateException("上一轮尚未结束");
         session = active;
+        // A continuing call renews its lease; silence is still part of that call.
+        // Only idle standby expires, never a call because it reached one hour.
+        handler.removeCallbacks(expiry);
+        // Active persistent calls do not expire as idle standby.
         // Bound the wake lock even if a vendor callback or HTTP request never returns.
-        wakeLock.acquire(600_000L);
+        wakeLock.acquire(600_000L); wakeRenewedAt = android.os.SystemClock.elapsedRealtime();
     }
     void release(HostedSession completed) {
+        release(completed, false);
+    }
+    void release(HostedSession completed, boolean continuingCall) {
         if (session != completed) return;
         session = null;
-        if (wakeLock.isHeld()) wakeLock.release();
+        if (!continuingCall && wakeLock.isHeld()) wakeLock.release();
+        if (!continuingCall && enabled) handler.postDelayed(expiry, 60 * 60 * 1000L);
     }
     void stopSession(String reason) {
         if (!enabled) return;

@@ -66,12 +66,36 @@ def test_registration_normalizes_unique_id_and_never_exposes_hashes(mobile):
     assert session["token"] != account["token"]
 
 
-@pytest.mark.parametrize("username,password", [("ab", PASSWORD), ("a b", PASSWORD),
-    ("账号一", PASSWORD), ("alice", "short"), ("a" * 25, PASSWORD), ("alice", "x" * 129)])
+@pytest.mark.parametrize("username,password", [("", PASSWORD), ("   ", PASSWORD),
+    ("a\nb", PASSWORD), ("a\x00b", PASSWORD), ("alice", ""),
+    ("a" * 65, PASSWORD), ("alice", "x" * 129)])
 def test_invalid_credentials_are_rejected_without_echo(mobile, username, password):
     result = mobile.post("/auth/register", json={"username": username, "password": password})
     assert result.status_code == 422
-    assert password not in result.text
+    if password:
+        assert password not in result.text
+
+
+@pytest.mark.parametrize("username,password", [("a", "1"), ("账号一", "短"),
+    ("a b", "123"), ("小明@example.com", "short"), ("🎧", "1"),
+    ("a" * 64, "x" * 128)])
+def test_simple_credentials_work_through_account_lifecycle(mobile, username, password):
+    response = mobile.post("/auth/register", json={"username": " " + username + " ", "password": password})
+    assert response.status_code == 201, response.text
+    account = response.json()
+    assert account["user"]["username"] == username
+    login = mobile.post("/auth/login", json={"username": username.upper(), "password": password})
+    assert login.status_code == 200
+    assert mobile.post("/auth/register", json={"username": username.upper(), "password": password}).status_code == 409
+    headers = {"Authorization": "Bearer " + login.json()["token"]}
+    changed = mobile.put("/auth/password", headers=headers,
+                         json={"old_password": password, "new_password": "2"})
+    assert changed.status_code == 200
+    assert mobile.post("/auth/login", json={"username": username, "password": "2"}).status_code == 200
+    recovered = mobile.post("/auth/recover", json={"username": username, "password": "3",
+                                                   "recovery_code": account["recovery_code"]})
+    assert recovered.status_code == 200
+    assert mobile.post("/auth/login", json={"username": username, "password": "3"}).status_code == 200
 
 
 def test_login_logout_and_expired_sessions(mobile):
@@ -288,7 +312,7 @@ def test_tenant_isolation_memory_chat_recall_reports_tasks_and_export(mobile):
     same_id = uuid4().hex
     assert chat(mobile, ah, "Alice 私密记录", same_id).status_code == 200
     assert chat(mobile, bh, "Bob 私密记录", same_id).status_code == 200
-    mobile.put("/v1/settings", headers=ah, json={"auto_mode": False, "mode": "work", "name": "Alice助手"})
+    mobile.put("/v1/settings", headers=ah, json={"auto_mode": False, "mode": "work", "preferences": "Alice偏好"})
     assert chat(mobile, ah, "我负责提交文档").status_code == 200
     report = mobile.post("/v1/meetings", headers=ah, json={}).json()
     assert report["tasks"]
@@ -309,7 +333,7 @@ def test_tenant_isolation_memory_chat_recall_reports_tasks_and_export(mobile):
     assert "Bob 私密记录" not in ae.text and "Alice" not in be.text
     assert ae.json()["reports"] and not be.json()["reports"]
     assert ae.json()["tasks"] and not be.json()["tasks"]
-    assert ae.json()["settings"]["name"] != be.json()["settings"]["name"]
+    assert ae.json()["settings"]["preferences"] != be.json()["settings"]["preferences"]
     assert ae.json()["user"]["id"] == alice["user"]["id"]
     assert be.json()["user"]["id"] == bob["user"]["id"]
 

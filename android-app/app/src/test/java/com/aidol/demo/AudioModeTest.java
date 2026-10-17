@@ -43,7 +43,7 @@ public class AudioModeTest {
     }
 
     @Test public void physicalModesKeepExplicitHeadsetPolicy() {
-        assertSame(AudioMode.BLUETOOTH, AudioMode.requirePhysical(AudioMode.BLUETOOTH));
+        assertThrows(IllegalArgumentException.class, () -> AudioMode.requirePhysical(AudioMode.BLUETOOTH));
         assertSame(AudioMode.RISE_SDK, AudioMode.requirePhysical(AudioMode.RISE_SDK));
         for (AudioMode mode : AudioMode.values()) {
             assertTrue(mode.requiresVerifiedHeadsetOutput());
@@ -65,10 +65,10 @@ public class AudioModeTest {
     @Test public void mediaOnlyBluetoothDoesNotQualifyAsAnInput() {
         assertFalse(AudioMode.BLUETOOTH.acceptsInputType(AudioDeviceInfo.TYPE_BLUETOOTH_A2DP));
         assertFalse(AudioMode.BLUETOOTH.acceptsInputType(AudioDeviceInfo.TYPE_BLE_SPEAKER));
-        assertTrue(AudioMode.BLUETOOTH.acceptsOutputType(AudioDeviceInfo.TYPE_BLUETOOTH_A2DP));
-        assertTrue(AudioMode.BLUETOOTH.acceptsOutputType(AudioDeviceInfo.TYPE_BLE_SPEAKER));
-        assertTrue(AudioMode.BLUETOOTH.acceptsInputType(AudioDeviceInfo.TYPE_BLUETOOTH_SCO));
-        assertTrue(AudioMode.BLUETOOTH.acceptsInputType(AudioDeviceInfo.TYPE_BLE_HEADSET));
-        assertTrue(AudioMode.BLUETOOTH.acceptsOutputType(AudioDeviceInfo.TYPE_BLE_HEADSET));
+        assertFalse(AudioMode.BLUETOOTH.acceptsOutputType(AudioDeviceInfo.TYPE_BLUETOOTH_A2DP));
+        assertFalse(AudioMode.BLUETOOTH.acceptsOutputType(AudioDeviceInfo.TYPE_BLE_SPEAKER));
+        assertFalse(AudioMode.BLUETOOTH.acceptsInputType(AudioDeviceInfo.TYPE_BLUETOOTH_SCO));
+        assertFalse(AudioMode.BLUETOOTH.acceptsInputType(AudioDeviceInfo.TYPE_BLE_HEADSET));
+        assertFalse(AudioMode.BLUETOOTH.acceptsOutputType(AudioDeviceInfo.TYPE_BLE_HEADSET));
     }
 }

@@ -23,6 +23,8 @@ sh ./start-android-backend.sh
 
 启动器首次安装 Python 依赖；按 `.env.example` 在本机设置后端供应商配置。无配置时健康检查仍可返回 `ready=false`，注册/部分规则文字功能可测，ASR/TTS 不会伪装成功。服务保持电脑 `127.0.0.1:8108`，数据为 `data/android-local/`。可选 Windows `-Reload` / macOS `--reload`，默认关闭；重载会中断请求。不要改成监听全部网卡，手机统一通过 USB reverse 访问。
 
+默认未开启重载时，修改后端代码后必须停止旧进程并重新启动，再与新 APK 联调。`/healthz` 成功只说明进程健康，不证明它已加载磁盘上的新代码；例如旧进程可能拒绝新版 `continuous_call` 参数并提示“语音会话参数不正确”。先挂断正在进行的通话，再重启后端。
+
 在第二个终端建立 USB 转发（`adb` 在 SDK 的 `platform-tools/`；不在 PATH 时使用绝对路径）：
 
 ```sh
@@ -50,14 +52,14 @@ sh ./connect-android-usb.sh --serial <serial> --adb "$ANDROID_HOME/platform-tool
 
 Windows 原生 ADB USB 后端可能对真实手机返回 `get-devpath=unknown`。助手会核对目标设备行的 `usb:` 字段，或使用 USB 专用选择器 `adb -d get-serialno` 验证返回序列号与目标完全一致；不会直接把 `unknown` 当成 USB。多台 USB 手机且没有路径证据时，先只保留目标手机再检查；多设备仍需指定 `--serial` / `-Serial`。本机 ADB 37.0.1 / `LIBADBUSB` 已通过这一身份核验。
 
-App 登录页“开发测试设置”的后端只有 **本地电脑服务** 和 **远端服务器** 两项。本地电脑服务固定使用 `http://127.0.0.1:8108`（需 USB reverse）；远端服务器使用内置 HTTPS 地址。音频来源独立选择“Rise SDK 麦克风”或“系统蓝牙兼容”。当前不提供模拟器输入或后端，`http://10.0.2.2:8108` 已被地址校验和网络安全配置拒绝。
+App 登录页“连接设置”的后端只有 **本地电脑服务** 和 **远端服务器** 两项。本地电脑服务固定使用 `http://127.0.0.1:8108`（需 USB reverse）；远端服务器使用内置 HTTPS 地址。音频固定为“Rise SDK 麦克风”。当前不提供模拟器输入或后端，`http://10.0.2.2:8108` 已被地址校验和网络安全配置拒绝。
 
-升级时，旧 `local_backend=true` 和 `EMULATOR_LOCAL` 偏好迁移为 USB 本地服务，旧 `AudioMode.EMULATOR` 迁移为系统蓝牙兼容；已保存的 Rise 选择保留。登录按精确源隔离：只读取 USB 源自己的加密登录状态，不复制或发送旧模拟器源的 Token；若 USB 源尚无有效会话，请重新登录。本地与远端账号、历史及记忆也不互相迁移。
+升级时，旧 `local_backend=true` 和 `EMULATOR_LOCAL` 偏好迁移为 USB 本地服务，旧 `AudioMode.EMULATOR/BLUETOOTH` 迁移为 Rise SDK；已保存的 Rise 选择保留。登录按精确源隔离：只读取 USB 源自己的加密登录状态，不复制或发送旧模拟器源的 Token；若 USB 源尚无有效会话，请重新登录。本地与远端账号、历史及记忆也不互相迁移。
 
 1. 点“检查后端连接”，在本地注册独立测试账号，先发文字。
 2. 在手机系统连接 Rise，在 debug 设置选 Rise SDK；“我的 → 设备详情”连接目标耳机，等待“耳机已就绪”。多副配对时选择目标。初始化/连接/重连不会自动开始录音。
 3. 点开始，说一条合成句，点“结束并发送”；等待尾帧和结束确认，再显示转写/回复。正常AI输入只有耳机麦克风通道。回复播放需核对同一耳机的实际 Android 输出地址；系统不报告身份时会拒播，保留文字结果。
-4. 工作模式的业务回答不自动朗读，模式切换和开始/结束的操作提示正常播放。分段记录后按选定时段生成纪要，不是完整长会议/连续双工。取消会丢弃未提交音频，已上传内容可能已保存，先查看历史再重试。
+4. 工作模式的安静记录不自动朗读业务回复，主动提问与文字对话可回答并播报；操作提示按所选交互方式播放。分段记录后按选定时段生成纪要，不是完整长会议/连续双工。取消会丢弃未提交音频，已上传内容可能已保存，先查看历史再重试。
 5. 权限拒绝仍可用文字；失败不会自动改为系统蓝牙/手机麦克风。系统蓝牙是用户显式选择的兼容输入。release 仍使用原系统蓝牙策略，等待 SDK 真机门槛后再改。
 
 ### 必须由手机完成的 USB 验收
@@ -76,7 +78,7 @@ Windows 与 macOS 要分别填 [验收](acceptance.md)。2026-10-17，本机 Win
 | --- | --- | --- |
 | App | USB 真机上的 debug APK | 真机上的 debug 或 release APK |
 | 耳机 | 与手机配对 | 与手机配对 |
-| 音频模式 | debug Rise SDK或系统蓝牙兼容 | debug可选同两种来源；release维持系统蓝牙 |
+| 音频模式 | Rise SDK（唯一来源） | debug/release 均固定 Rise SDK |
 | App 连接地址 | `http://127.0.0.1:8108`，需 USB reverse | `https://123.207.219.174:7776` |
 | 账号数据 | 本机 `data/android-local/`，按账号隔离 | 部署服务器，按账号隔离 |
 
@@ -144,16 +146,16 @@ sh ./start-android-backend.sh
 2. 手机开启 USB 调试并授权本电脑，执行 `adb devices -l`；多手机使用 `adb -s <serial>`，在 Android Studio 选择同一真机。
 3. 将 Rise 与手机配对；本地测试先启动后端并建立 `reverse tcp:8108 tcp:8108`。电脑无需接耳机。
 4. 点 Run 安装 debug。后端选“本地电脑服务”或“远端服务器”，使用目标服务的独立账号；保存注册恢复码，先确认文字请求。
-5. 音频来源选 Rise SDK 或系统蓝牙兼容，允许所需麦克风/附近设备权限。Rise 在设备详情连接，显示就绪后再主动开始短录音。
+5. 音频来源固定为 Rise SDK，允许所需麦克风/附近设备权限。Rise 在设备详情连接，显示就绪后再主动开始短录音。
 6. 结束并发送后检查转写、回复、实际目标输出和人耳听音。用近距离发声或耳机静音对照核验真正的输入；仅有转写不能证明声音来自耳机。记录停止尾句、取消、断连和锁屏结果。
 
 ## 真机与发布 APK
 
-开发者可以在手机开启开发者选项和 USB 调试，在 Android Studio 选择手机后 Run。将耳机连接到手机；测试本机后端时选择“本地电脑服务”并建立 USB reverse，测试部署服务时选择“远端服务器”。音频来源独立选“Rise SDK 麦克风”或“系统蓝牙兼容”，再使用所选后端的账号验证流程。切换后端不会替代输入来源选择。
+开发者可以在手机开启开发者选项和 USB 调试，在 Android Studio 选择手机后 Run。将耳机连接到手机；测试本机后端时选择“本地电脑服务”并建立 USB reverse，测试部署服务时选择“远端服务器”。音频固定为“Rise SDK 麦克风”，再使用所选后端的账号验证流程。切换后端不会替代输入来源选择。
 
-不参与开发的同事直接安装负责人发布的 `aidol-android.apk`；无需 Python、Android Studio 或供应商 Key。release 固定共享 HTTPS 与真机蓝牙检查，完整安装步骤见 [Android 使用与交接](android-handoff.md)。debug 名称“Aidol · 开发”，包名 `com.aidol.app.debug`；release 包名 `com.aidol.app`，两者可并存，设备上的登录会话与 App 设置独立。
+不参与开发的同事直接安装负责人发布的 `aidol-android.apk`；无需 Python、Android Studio 或供应商 Key。release 默认本地电脑服务，可切换远端 HTTPS，音频固定 Rise SDK，完整安装步骤见 [Android 使用与交接](android-handoff.md)。debug 名称“Aidol · 开发”，包名 `com.aidol.app.debug`；release 包名 `com.aidol.app`，两者可并存，设备上的登录会话与 App 设置独立。
 
-release 保持证书和主机名验证。本地 HTTP 仅在 debug 指定开发地址开放，不为共享服务关闭 TLS 校验。旧的已分发 APK 不会因为拉取新源码自动更新；以实际安装的构建与验收记录为准。
+release 保持证书和主机名验证。本地 HTTP 在所有构建中仅对精确地址 `127.0.0.1:8108` 开放，不为共享服务关闭 TLS 校验。旧的已分发 APK 不会因为拉取新源码自动更新；以实际安装的构建与验收记录为准。
 
 ## 验收清单
 

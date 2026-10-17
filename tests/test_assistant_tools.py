@@ -155,3 +155,42 @@ async def test_tool_quota_blocks_network_but_not_clock(agent):
     tools = AssistantTools(agent)
     assert '额度' in (await tools.call('web_search', {'query': '公开新闻'}))['reason']
     assert (await tools.call('current_time', {}))['available']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', ['life', 'commute'])
+async def test_weather_without_location_can_continue_with_explicit_city(agent, monkeypatch, mode):
+    agent.mode = mode
+    tools = AssistantTools(agent)
+    result = await tools.call('weather', {})
+    assert result['error'] == 'location_required'
+    assert '城市' in result['reason']
+    async def geocode(city):
+        assert city == '北京市'
+        return {'available': True, 'places': [{'adcode': '110000'}]}
+    async def weather(code, forecast):
+        assert code == '110000' and not forecast
+        return {'available': True, 'source': 'amap_weather'}
+    monkeypatch.setattr(agent.maps, 'geocode', geocode)
+    monkeypatch.setattr(agent.maps, 'weather', weather)
+    assert (await tools.call('weather', {'city': '北京市'}))['available']
+
+
+@pytest.mark.asyncio
+async def test_weather_keeps_configuration_failure_instead_of_city_ambiguity(agent):
+    result = await AssistantTools(agent).call('weather', {'city': '北京市'})
+    assert not result['available'] and 'Key' in result['reason']
+    assert '城市不明确' not in result['reason']
+
+
+@pytest.mark.asyncio
+async def test_tool_failures_distinguish_validation_provider_and_location(agent, monkeypatch):
+    tools = AssistantTools(agent)
+    assert (await tools.call('weather', {'city': 123}))['error'] == 'invalid_arguments'
+    async def weather(*args):
+        raise ValueError('secret-provider-body')
+    monkeypatch.setattr(agent.maps, 'weather', weather)
+    result = await tools.call('weather', {'city': '110000'})
+    assert result['error'] == 'tool_unavailable'
+    assert 'secret-provider-body' not in json.dumps(result)
+    assert '定位' not in result['reason']

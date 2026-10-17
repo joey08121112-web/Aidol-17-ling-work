@@ -20,7 +20,6 @@ public enum BackendTarget {
     }
 
     static BackendTarget resolve(boolean debug, boolean emulator, String saved, Boolean legacyLocal) {
-        if (!debug) return DEPLOYED;
         if (saved != null) {
             try {
                 BackendTarget target = valueOf(saved);
@@ -30,6 +29,6 @@ public enum BackendTarget {
         // Local is now USB-only. AuthVault is selected by the resulting exact origin;
         // this migrates a preference, never the old 10.0.2.2 credential namespace.
         if (legacyLocal != null) return legacyLocal ? USB_LOCAL : DEPLOYED;
-        return DEPLOYED;
+        return USB_LOCAL;
     }
 }

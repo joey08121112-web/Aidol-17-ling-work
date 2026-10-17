@@ -5,6 +5,21 @@ import org.junit.Test;
 import static org.junit.Assert.*;
 
 public class SpeechEndpointTest {
+    @Test public void callEndsAfterSixHundredMillisecondsWithoutCuttingShortPauses() {
+        SpeechEndpoint detector = new SpeechEndpoint(.025, 600);
+        assertFalse(detector.accept(sound(300, (short) 3000)));
+        assertFalse(detector.accept(sound(400, (short) 0)));
+        assertFalse(detector.accept(sound(300, (short) 3000)));
+        assertFalse(detector.accept(sound(580, (short) 0)));
+        assertTrue(detector.accept(sound(20, (short) 0)));
+        assertTrue(detector.heardSpeech()); assertFalse(detector.idle());
+    }
+    @Test public void idleSilenceTimesOutWithoutPretendingItWasSpeech() {
+        SpeechEndpoint detector = new SpeechEndpoint(.025, 600);
+        detector.accept(sound(44980, (short) 0)); assertFalse(detector.idle());
+        detector.accept(sound(20, (short) 0)); assertTrue(detector.idle());
+        assertFalse(detector.heardSpeech());
+    }
     private byte[] sound(int milliseconds, short amplitude) {
         short[] samples = new short[milliseconds * 16]; Arrays.fill(samples, amplitude);
         return AudioFrames.encode(samples, samples.length);

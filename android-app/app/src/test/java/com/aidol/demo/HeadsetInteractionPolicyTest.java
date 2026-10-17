@@ -23,7 +23,7 @@ public class HeadsetInteractionPolicyTest {
         return new HeadsetInteractionPolicy.Device(ready, call, left, right, battery, null);
     }
 
-    @Test public void singleTapStartsOneTurnAndDuplicateCallbacksCannotImmediatelyStopIt() {
+    @Test public void singleTapStartsCallAndDuplicateCallbacksCannotImmediatelySubmitIt() {
         HeadsetInteractionPolicy policy = new HeadsetInteractionPolicy();
         assertTrue(policy.event(TOGGLE, 1, 1000, 1000, idle()).actions.isEmpty());
         assertTrue(policy.event(TOGGLE, 1, 1000, 1001, idle()).actions.isEmpty());
@@ -96,14 +96,60 @@ public class HeadsetInteractionPolicyTest {
         assertTrue(policy.flush(1600, idle()).actions.isEmpty());
     }
 
-    @Test public void doubleTapDuringSubmittedBusinessDoesNotCancelOrChangeMode() {
+    @Test public void doubleTapDuringSubmittedBusinessDefersWithoutCancellingIt() {
         HeadsetInteractionPolicy policy = new HeadsetInteractionPolicy();
         HeadsetInteractionPolicy.Context processing = context(true, true, true, true, false, false, true, false, false, "life");
         HeadsetInteractionPolicy.Decision decision = policy.event(NEXT_MODE, 1, 1000, 1000, processing);
         assertTrue(decision.actions.isEmpty()); assertNull(decision.mode);
-        assertTrue(decision.message.contains("本轮正在处理"));
-        assertFalse(policy.hasPending());
-        assertTrue(policy.flush(1500, idle()).actions.isEmpty());
+        assertTrue(policy.hasPending());
+        assertEquals(Arrays.asList(DEFER_MODE), policy.flush(1400, processing).actions);
+    }
+
+    private static HeadsetInteractionPolicy.Context modeCue(String mode, long generation) {
+        return new HeadsetInteractionPolicy.Context(
+            true, true, true, true, false, false, true, false, false, mode, generation, true);
+    }
+
+    @Test public void repeatedDoubleTapsCanReplaceEachModeAnnouncementWithoutRecording() {
+        HeadsetInteractionPolicy policy = new HeadsetInteractionPolicy();
+        String[] modes = {"life", "work", "commute", "life"};
+        for (int i = 0; i < modes.length - 1; i++) {
+            HeadsetInteractionPolicy.Context cue = modeCue(modes[i], i * 2);
+            long now = 1000 + i * 1000;
+            assertEquals("", policy.event(NEXT_MODE, i + 1, now, now, cue).message);
+            HeadsetInteractionPolicy.Decision decision = policy.flush(now + 400, cue);
+            assertEquals(Arrays.asList(CHANGE_MODE), decision.actions);
+            assertEquals(modes[i + 1], decision.mode);
+        }
+    }
+
+    @Test public void naturalCueCompletionPreservesSettlingModeGestureOnly() {
+        HeadsetInteractionPolicy.Context finished = new HeadsetInteractionPolicy.Context(
+            true, true, true, true, false, false, false, false, false, "work", 8);
+        HeadsetInteractionPolicy policy = new HeadsetInteractionPolicy();
+        policy.event(NEXT_MODE, 1, 1000, 1000, modeCue("work", 7));
+        policy.modeCueFinished(7);
+        HeadsetInteractionPolicy.Decision decision = policy.flush(1400, finished);
+        assertEquals(Arrays.asList(CHANGE_MODE), decision.actions);
+        assertEquals("commute", decision.mode);
+
+        policy = new HeadsetInteractionPolicy();
+        policy.event(TOGGLE, 1, 1000, 1000, modeCue("work", 7));
+        policy.modeCueFinished(7);
+        assertTrue(policy.flush(1400, finished).actions.isEmpty());
+    }
+
+    @Test public void cueGestureCannotAffectReplacementSessionOrSurviveCancellation() {
+        HeadsetInteractionPolicy policy = new HeadsetInteractionPolicy();
+        policy.event(NEXT_MODE, 1, 1000, 1000, modeCue("work", 7));
+        policy.modeCueFinished(6);
+        assertTrue(policy.flush(1400, modeCue("life", 8)).actions.isEmpty());
+
+        policy = new HeadsetInteractionPolicy();
+        policy.event(NEXT_MODE, 1, 1000, 1000, modeCue("work", 7));
+        policy.clearPending();
+        policy.modeCueFinished(7);
+        assertTrue(policy.flush(1400, modeCue("life", 8)).actions.isEmpty());
     }
 
     @Test public void longPressCancelsImmediatelyAndDropsDelayedToggle() {
@@ -145,8 +191,8 @@ public class HeadsetInteractionPolicyTest {
     @Test public void processedTurnCannotBeSubmittedTwiceAndUnmappedOrStaleGesturesDoNothing() {
         HeadsetInteractionPolicy policy = new HeadsetInteractionPolicy();
         HeadsetInteractionPolicy.Context processing = context(true, true, true, true, false, false, true, false, false, "life");
-        policy.event(TOGGLE, 1, 1000, 1000, processing);
-        assertTrue(policy.flush(1400, processing).actions.isEmpty());
+        assertTrue(policy.event(TOGGLE, 1, 1000, 1000, processing).actions.isEmpty());
+        assertEquals(Arrays.asList(STOP_AND_SEND), policy.flush(1400, processing).actions);
         assertTrue(policy.event(IGNORE, 2, 2000, 2000, idle()).actions.isEmpty());
         assertTrue(policy.event(TOGGLE, 3, 2000, 4000, idle()).actions.isEmpty());
         assertTrue(policy.flush(4500, idle()).actions.isEmpty());
@@ -156,8 +202,64 @@ public class HeadsetInteractionPolicyTest {
         HeadsetInteractionPolicy policy = new HeadsetInteractionPolicy();
         HeadsetInteractionPolicy.Context processing = context(true, true, true, true, false, false, true, false, false, "life");
         policy.event(TOGGLE, 1, 1000, 1000, processing);
-        assertFalse(policy.hasPending());
+        assertTrue(policy.hasPending());
         assertTrue(policy.flush(1400, idle()).actions.isEmpty());
+    }
+
+    private static HeadsetInteractionPolicy.Context replying() {
+        return new HeadsetInteractionPolicy.Context(true, true, true, true, false, false,
+            true, false, false, "life", 0, false, true);
+    }
+
+    @Test public void singleTapEndsListeningThinkingAndSpeaking() {
+        HeadsetInteractionPolicy.Context processing = context(true, true, true, true, false, false, true, false, false, "life");
+        for (HeadsetInteractionPolicy.Context state : new HeadsetInteractionPolicy.Context[]{recording(), processing, replying()}) {
+            HeadsetInteractionPolicy policy = new HeadsetInteractionPolicy();
+            policy.event(TOGGLE, 1, 1000, 1000, state);
+            assertEquals(Arrays.asList(STOP_AND_SEND), policy.flush(1400, state).actions);
+            assertTrue(policy.flush(1500, idle()).actions.isEmpty());
+        }
+    }
+
+    @Test public void singleTapCanReplaceModeAnnouncementWithExplicitCallStart() {
+        HeadsetInteractionPolicy policy = new HeadsetInteractionPolicy();
+        policy.event(TOGGLE, 1, 1000, 1000, modeCue("work", 7));
+        assertEquals(Arrays.asList(START), policy.flush(1400, modeCue("work", 7)).actions);
+    }
+
+    @Test public void stopAndModeIntentsSurviveNaturalTurnFinish() {
+        HeadsetInteractionPolicy.Context finished = new HeadsetInteractionPolicy.Context(
+            true, true, true, true, false, false, true, false, false, "life", 1);
+        HeadsetInteractionPolicy policy = new HeadsetInteractionPolicy();
+        policy.event(NEXT_MODE, 1, 1000, 1000, recording());
+        policy.turnFinished(0);
+        HeadsetInteractionPolicy.Decision decision = policy.flush(1400, finished);
+        assertEquals(Arrays.asList(DEFER_MODE), decision.actions);
+        assertEquals("work", decision.mode);
+        policy = new HeadsetInteractionPolicy();
+        policy.event(TOGGLE, 1, 1000, 1000, recording());
+        policy.turnFinished(0);
+        assertEquals(Arrays.asList(STOP_AND_SEND), policy.flush(1400, finished).actions);
+    }
+
+    @Test public void longPressDuringSettingsRequestOrBetweenTurnsAlwaysHangsUp() {
+        for (boolean busy : new boolean[]{true, false}) {
+            HeadsetInteractionPolicy policy = new HeadsetInteractionPolicy();
+            HeadsetInteractionPolicy.Context state = context(true, true, true, true, false, busy, true, false, false, "work");
+            assertEquals(Arrays.asList(CANCEL), policy.event(HeadsetInteractionPolicy.Gesture.CANCEL, 1, 1000, 1000, state).actions);
+            assertFalse(policy.hasPending());
+        }
+    }
+
+    @Test public void laterDoubleUsesAlreadyQueuedModeAsCycleBase() {
+        HeadsetInteractionPolicy policy = new HeadsetInteractionPolicy();
+        policy.event(NEXT_MODE, 1, 1000, 1000, recording());
+        assertEquals("work", policy.flush(1400, recording()).mode);
+        HeadsetInteractionPolicy.Context queuedWork = context(true, true, true, true, false, false, true, true, false, "work");
+        policy.event(NEXT_MODE, 2, 2000, 2000, queuedWork);
+        assertEquals("commute", policy.flush(2400, queuedWork).mode);
+        assertTrue(policy.event(HeadsetInteractionPolicy.Gesture.CANCEL, 3, 2500, 2500, queuedWork).actions.contains(CANCEL));
+        assertFalse(policy.hasPending());
     }
 
     @Test public void pendingStopCannotTurnIntoStartWhenRecordingFinishesNaturally() {

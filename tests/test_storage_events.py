@@ -8,7 +8,7 @@ from app.domain import Settings
 def test_settings_survive_reopening_and_clear_preserves_preferences(store):
     from app.storage import Store
 
-    settings = Settings(name="队友的耳机", auto_mode=False, mode="work")
+    settings = Settings(preferences="队友的偏好", auto_mode=False, mode="work")
     store.save_settings(settings)
     store.add("memories", content="周五交付", kind="task", source="user")
     assert store.claim("asr-1")

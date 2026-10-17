@@ -25,10 +25,15 @@ public final class VendorCaptureSource implements CaptureSource, AutoCloseable {
     private ScheduledFuture<?> stopTimeout, durationTimeout, startupTimeout;
     private long generation;
     private boolean active, stopping, idle, closed, recording;
-    private int queuedBytes, receivedBytes, pendingByte = -1;
+    private int queuedBytes, pendingByte = -1;
+    private long receivedBytes;
     private Thread consumer;
 
     public VendorCaptureSource(HeadsetController controller) { this((FusionDevice) controller); }
+    /** Explicit work recording keeps SDK capture open; both processing queues remain bounded. */
+    public VendorCaptureSource(HeadsetController controller, boolean continuous) {
+        this((FusionDevice) controller, 2500, MAX_QUEUED_BYTES, continuous ? 0 : 60_000);
+    }
     public VendorCaptureSource(FusionDevice device) { this(device, 2500, MAX_QUEUED_BYTES); }
     VendorCaptureSource(FusionDevice device, long stopTimeoutMs, int queueByteLimit) {
         this(device, stopTimeoutMs, queueByteLimit, 60_000);
@@ -101,7 +106,7 @@ public final class VendorCaptureSource implements CaptureSource, AutoCloseable {
             if (startupTimeout != null) startupTimeout.cancel(false);
             // Share HostedSession's readiness origin: SDK startup latency is not recorded audio.
             // The independent deadline still includes the stop/drain budget.
-            durationTimeout = timer.schedule(() -> fail(token, "录音超过 60 秒，已丢弃本段，请重新开始", true),
+            if (durationLimitMs > 0) durationTimeout = timer.schedule(() -> fail(token, "录音超过 60 秒，已丢弃本段，请重新开始", true),
                     durationLimitMs, TimeUnit.MILLISECONDS);
         }
     }
@@ -110,7 +115,7 @@ public final class VendorCaptureSource implements CaptureSource, AutoCloseable {
         String failure = null;
         synchronized (this) {
             if (!current(token) || idle || channel != 2 || bytes == null || bytes.length == 0) return;
-            if (bytes.length > MAX_BYTES - receivedBytes) failure = "耳机录音超过 60 秒音频上限，已丢弃本段";
+            if (durationLimitMs > 0 && bytes.length > MAX_BYTES - receivedBytes) failure = "耳机录音超过 60 秒音频上限，已丢弃本段";
             else if (queue.size() >= MAX_FRAMES || bytes.length > queueByteLimit - queuedBytes)
                 failure = "耳机音频处理队列已满，已丢弃本段，请重试";
             else {

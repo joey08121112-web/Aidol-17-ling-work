@@ -8,6 +8,25 @@
     "cue_work": "工作模式",
     "cue_commute": "通勤模式",
     "cue_start": "开始录音",
-    "cue_end": "录音结束"
+    "cue_end": "录音结束",
+    "cue_busy": "请稍等",
+    "cue_destination": "请先选目的地",
+    "cue_location": "请先定位",
+    "cue_settings": "请检查设置",
+    "cue_password": "密码已更新",
+    "cue_exported": "已导出",
+    "cue_notifications": "请开启通知",
+    "cue_call": "请先结束通话",
+    "cue_connect": "请先连接耳机",
+    "cue_retry": "请重试",
+    "cue_permission": "请检查权限",
+    "cue_wear": "请戴好耳机",
+    "cue_copied": "已复制",
+    "cue_audio": "音频已切换",
+    "cue_touch": "已申请触控联动",
+    "cue_untouch": "触控已关闭",
+    "cue_browser": "无法打开网页",
+    "cue_battery": "耳机电量低",
+    "cue_ready": "耳机已佩戴"
   }
 }

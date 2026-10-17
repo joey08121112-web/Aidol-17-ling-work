@@ -48,6 +48,15 @@ class Store:
                 CREATE INDEX IF NOT EXISTS memory_created ON memories(created_at);
                 CREATE TABLE IF NOT EXISTS mobile_turns (
                   id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT, created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS work_meetings (
+                  id TEXT PRIMARY KEY, started_at TEXT NOT NULL, ended_at TEXT,
+                  status TEXT NOT NULL DEFAULT 'recording', expected_segments INTEGER,
+                  summary_status TEXT NOT NULL DEFAULT 'waiting', report_id TEXT,
+                  error TEXT NOT NULL DEFAULT '');
+                CREATE TABLE IF NOT EXISTS work_meeting_segments (
+                  meeting_id TEXT NOT NULL, segment_index INTEGER NOT NULL,
+                  request_id TEXT NOT NULL UNIQUE, transcript_id TEXT,
+                  PRIMARY KEY(meeting_id, segment_index));
             """)
             # Preserve existing local databases; serialize schema checks and ALTERs
             # so two startup instances cannot both add the same missing column.
@@ -68,6 +77,12 @@ class Store:
             if 'interaction_source' not in transcript_columns:
                 db.execute("ALTER TABLE transcripts ADD COLUMN interaction_source TEXT NOT NULL DEFAULT 'ambient_capture'")
             db.execute("CREATE TABLE IF NOT EXISTS recall_exclusions (transcript_id TEXT PRIMARY KEY)")
+            meeting_columns = {row['name'] for row in db.execute('PRAGMA table_info(work_meetings)')}
+            for name in ('processed_sections', 'total_sections'):
+                if name not in meeting_columns:
+                    db.execute(f'ALTER TABLE work_meetings ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0')
+            if 'summary_stage' not in meeting_columns:
+                db.execute("ALTER TABLE work_meetings ADD COLUMN summary_stage TEXT NOT NULL DEFAULT 'waiting'")
             # One transactional migration indexes existing history, then triggers keep
             # updates/deletes in sync, including writes inside report transactions.
             indexed = db.execute("SELECT 1 FROM sqlite_master WHERE name='recall_index'").fetchone()
@@ -144,6 +159,12 @@ class Store:
             for row in result:
                 row["source_ids"] = json.loads(row["source_ids"])
         return result
+
+    def conversation_memories(self):
+        """Demo context: all saved memories in this account, without list limits."""
+        with self.connect() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT * FROM memories ORDER BY created_at,id")]
 
     def meeting_report(self, signature=None):
         with self.connect() as db:
@@ -243,7 +264,7 @@ class Store:
 
     def clear(self):
         with self.connect() as db:
-            for table in ("memories", "transcripts", "events", "drafts", "processed", "meeting_reports", "action_tasks", "mobile_turns", "recall_exclusions"):
+            for table in ("work_meeting_segments", "work_meetings", "memories", "transcripts", "events", "drafts", "processed", "meeting_reports", "action_tasks", "mobile_turns", "recall_exclusions"):
                 db.execute(f"DELETE FROM {table}")
 
     def mobile_turn(self, turn_id, fingerprint, reserve=True):
@@ -336,6 +357,124 @@ class Store:
                 "AND interaction_source='ambient_capture' AND created_at>=? "
                 "AND NOT EXISTS (SELECT 1 FROM recall_exclusions e WHERE e.transcript_id=r.id) ORDER BY created_at DESC", (cutoff,))]
 
+    def start_work_meeting(self, meeting_id):
+        with self.connect() as db:
+            db.execute("INSERT OR IGNORE INTO work_meetings(id,started_at) VALUES(?,?)", (meeting_id, now()))
+        return self.work_meeting(meeting_id)
+
+    def work_meetings(self, limit=100):
+        with self.connect() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT m.*,json_extract(r.payload,'$.title') AS title,json_extract(r.payload,'$.summary') AS summary, "
+                "(SELECT count(*) FROM work_meeting_segments s JOIN transcripts t ON t.id=s.transcript_id "
+                "WHERE s.meeting_id=m.id) AS transcript_count FROM work_meetings m LEFT JOIN meeting_reports r ON r.id=m.report_id "
+                "ORDER BY m.started_at DESC LIMIT ?", (limit,))]
+
+    def work_meeting(self, meeting_id):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM work_meetings WHERE id=?", (meeting_id,)).fetchone()
+            if row is None:
+                return None
+            sources = [dict(item) for item in db.execute(
+                "SELECT t.*,s.segment_index FROM work_meeting_segments s JOIN transcripts t ON t.id=s.transcript_id "
+                "WHERE s.meeting_id=? ORDER BY s.segment_index", (meeting_id,))]
+            report = db.execute("SELECT payload FROM meeting_reports WHERE id=?", (row['report_id'],)).fetchone()
+            received = db.execute('SELECT count(*) FROM work_meeting_segments WHERE meeting_id=?', (meeting_id,)).fetchone()[0]
+        return {**dict(row), 'sources': sources, 'transcript_count': len(sources),
+                'received_segments': received, 'report': json.loads(report['payload']) if report else None}
+
+    def check_work_segment(self, meeting_id, segment_index, request_id):
+        with self.connect() as db:
+            meeting = db.execute("SELECT status FROM work_meetings WHERE id=?", (meeting_id,)).fetchone()
+            segment = db.execute("SELECT request_id FROM work_meeting_segments WHERE meeting_id=? AND segment_index=?",
+                                 (meeting_id, segment_index)).fetchone()
+        if meeting is None:
+            raise ValueError('会议不存在')
+        if meeting['status'] != 'recording':
+            raise ValueError('会议已结束，不能追加录音')
+        if segment is not None and segment['request_id'] != request_id:
+            raise ValueError('会议片段编号已被使用')
+
+    def save_work_segment(self, meeting_id, segment_index, request_id, text):
+        """Persist ASR evidence and session membership in the same transaction, including silence receipts."""
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute("SELECT status FROM work_meetings WHERE id=?", (meeting_id,)).fetchone()
+            if row is None or row['status'] != 'recording':
+                raise ValueError('会议不存在或已结束')
+            existing = db.execute("SELECT * FROM work_meeting_segments WHERE meeting_id=? AND segment_index=?",
+                                  (meeting_id, segment_index)).fetchone()
+            if existing:
+                if existing['request_id'] != request_id:
+                    raise ValueError('会议片段编号已被使用')
+                return existing['transcript_id']
+            transcript_id = uuid4().hex if text.strip() else None
+            if transcript_id:
+                db.execute("INSERT INTO transcripts(id,speaker,text,mode,source,created_at,interaction_source) VALUES(?,?,?,?,?,?,?)",
+                           (transcript_id, '现场发言（未分离声纹）', text, 'work', 'asr', now(), 'ambient_capture'))
+            db.execute("INSERT INTO work_meeting_segments VALUES(?,?,?,?)",
+                       (meeting_id, segment_index, request_id, transcript_id))
+        return transcript_id
+
+    def finish_work_meeting(self, meeting_id, expected_segments, complete):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            meeting = db.execute("SELECT * FROM work_meetings WHERE id=?", (meeting_id,)).fetchone()
+            if meeting is None:
+                return None
+            if meeting['status'] == 'recording':
+                indices = [row[0] for row in db.execute(
+                    "SELECT segment_index FROM work_meeting_segments WHERE meeting_id=? ORDER BY segment_index", (meeting_id,))]
+                count = db.execute("SELECT count(*) FROM work_meeting_segments s JOIN transcripts t ON t.id=s.transcript_id "
+                                   "WHERE s.meeting_id=?", (meeting_id,)).fetchone()[0]
+                intact = complete and indices == list(range(expected_segments))
+                status = 'saved' if intact and count else 'empty' if intact else 'partial'
+                error = '' if status == 'saved' else '没有识别到可保存的讲话' if status == 'empty' else '录音或上传未完整结束，仅保留已确认保存的原文'
+                db.execute("UPDATE work_meetings SET ended_at=?,status=?,expected_segments=?,summary_status=?,summary_stage=?,error=? WHERE id=?",
+                           (now(), status, expected_segments, 'pending' if count else 'unavailable', 'queued', error, meeting_id))
+            elif meeting['expected_segments'] != expected_segments:
+                raise ValueError('结束请求与已保存的会议不一致')
+        return self.work_meeting(meeting_id)
+
+    def save_work_summary(self, meeting_id, payload, source_ids):
+        # Called while the account runtime lock is held. Never resurrect forgotten evidence.
+        current = self.work_meeting(meeting_id)
+        if current is None or [row['id'] for row in current['sources']] != source_ids:
+            return False
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            old_id = current['report_id']
+            old_tasks = { (task['content'], task['owner'], task['due'], tuple(sorted(json.loads(task['source_ids'])))): dict(task)
+                          for task in db.execute('SELECT * FROM action_tasks WHERE report_id=?', (old_id,)) }
+            if old_id:
+                db.execute('DELETE FROM action_tasks WHERE report_id=?', (old_id,))
+                db.execute('DELETE FROM meeting_reports WHERE id=?', (old_id,))
+            report_id, created = uuid4().hex, now()
+            db.execute('INSERT INTO meeting_reports VALUES(?,?,?,?)',
+                       (report_id, 'work-meeting:' + meeting_id + ':' + report_id, json.dumps(payload, ensure_ascii=False), created))
+            for task in payload.get('tasks', []):
+                old_task = old_tasks.get((task['content'], task['owner'], task['due'], tuple(sorted(task['source_ids']))), {})
+                db.execute('INSERT INTO action_tasks VALUES(?,?,?,?,?,?,?,?)',
+                           (old_task.get('id', uuid4().hex), report_id, task['content'], task['owner'], task['due'],
+                            json.dumps(task['source_ids']), old_task.get('status', 'open'), old_task.get('created_at', created)))
+            db.execute("UPDATE work_meetings SET report_id=?,summary_status=?,summary_stage='done' WHERE id=?",
+                       (report_id, 'ready' if payload['extraction'] == 'llm' else 'fallback', meeting_id))
+        return True
+
+    def work_summary_progress(self, meeting_id, stage, processed=0, total=0):
+        with self.connect() as db:
+            db.execute("UPDATE work_meetings SET summary_stage=?,processed_sections=?,total_sections=? "
+                       "WHERE id=? AND summary_status='pending'", (stage, processed, total, meeting_id))
+
+    def retry_work_summary(self, meeting_id):
+        with self.connect() as db:
+            return db.execute("UPDATE work_meetings SET summary_status='pending',summary_stage='queued',processed_sections=0,total_sections=0 WHERE id=? AND status!='recording' "
+                              "AND summary_status IN ('fallback','failed','ready')", (meeting_id,)).rowcount > 0
+
+    def fail_work_summary(self, meeting_id):
+        with self.connect() as db:
+            db.execute("UPDATE work_meetings SET summary_status='failed' WHERE id=? AND summary_status='pending'", (meeting_id,))
+
     def get_memory(self, memory_id):
         with self.connect() as db:
             row = db.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
@@ -384,6 +523,7 @@ class Store:
                     payload = json.loads(report['payload'])
                     source_ids = set(payload.get('source_ids', [])) | {s['id'] for s in payload.get('sources', [])}
                     if source_id in source_ids:
+                        db.execute("UPDATE work_meetings SET report_id=NULL,summary_status='failed',summary_stage='done' WHERE report_id=?", (report['id'],))
                         removed_reports += db.execute('DELETE FROM meeting_reports WHERE id=?', (report['id'],)).rowcount
             self._invalidate_recall(db)
             return {'memories': removed_memories, 'transcripts': removed_transcripts,

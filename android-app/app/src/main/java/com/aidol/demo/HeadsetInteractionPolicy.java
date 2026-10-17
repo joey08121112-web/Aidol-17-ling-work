@@ -8,7 +8,7 @@ import java.util.List;
 /** Gesture decisions within a visible or explicitly enabled foreground-service session. */
 final class HeadsetInteractionPolicy {
     enum Gesture { TOGGLE, NEXT_MODE, CANCEL, DISCARD_COMBINATION, IGNORE }
-    enum Action { START, STOP_AND_SEND, CANCEL, CHANGE_MODE, DEFER_MODE }
+    enum Action { START, STOP_AND_SEND, INTERRUPT, CANCEL, CHANGE_MODE, DEFER_MODE }
     static final long GESTURE_SETTLE_MS = 400;
     private static final long DEBOUNCE_MS = 800, MAX_EVENT_AGE_MS = 1500;
 
@@ -16,15 +16,25 @@ final class HeadsetInteractionPolicy {
         final boolean foreground, controlsEnabled, loggedIn, ready, inCall, busy, active, recording, notWorn;
         final String mode;
         final long sessionGeneration;
+        final boolean modeCue, replying;
         Context(boolean foreground, boolean controlsEnabled, boolean loggedIn, boolean ready, boolean inCall,
                 boolean busy, boolean active, boolean recording, boolean notWorn, String mode) {
             this(foreground, controlsEnabled, loggedIn, ready, inCall, busy, active, recording, notWorn, mode, 0);
         }
         Context(boolean foreground, boolean controlsEnabled, boolean loggedIn, boolean ready, boolean inCall,
                 boolean busy, boolean active, boolean recording, boolean notWorn, String mode, long sessionGeneration) {
+            this(foreground, controlsEnabled, loggedIn, ready, inCall, busy, active, recording, notWorn, mode, sessionGeneration, false);
+        }
+        Context(boolean foreground, boolean controlsEnabled, boolean loggedIn, boolean ready, boolean inCall,
+                boolean busy, boolean active, boolean recording, boolean notWorn, String mode, long sessionGeneration, boolean modeCue) {
+            this(foreground, controlsEnabled, loggedIn, ready, inCall, busy, active, recording, notWorn, mode, sessionGeneration, modeCue, false);
+        }
+        Context(boolean foreground, boolean controlsEnabled, boolean loggedIn, boolean ready, boolean inCall,
+                boolean busy, boolean active, boolean recording, boolean notWorn, String mode, long sessionGeneration, boolean modeCue, boolean replying) {
             this.foreground = foreground; this.controlsEnabled = controlsEnabled; this.loggedIn = loggedIn;
             this.ready = ready; this.inCall = inCall; this.busy = busy; this.active = active;
             this.recording = recording; this.notWorn = notWorn; this.mode = mode; this.sessionGeneration = sessionGeneration;
+            this.modeCue = modeCue; this.replying = replying;
         }
         boolean enabled() { return foreground && controlsEnabled && loggedIn && ready && !inCall; }
     }
@@ -56,6 +66,7 @@ final class HeadsetInteractionPolicy {
     private String pendingMode;
     private Gesture lastGesture;
     private Device previous;
+    private boolean wearAnnounced;
     private int leftBatteryBand, rightBatteryBand;
 
     Decision event(Gesture gesture, long sequence, long receivedAt, long now, Context context) {
@@ -68,13 +79,12 @@ final class HeadsetInteractionPolicy {
         lastGesture = gesture; lastAcceptedAt = now;
         if (gesture == Gesture.CANCEL) {
             clearPending();
-            return context.active ? new Decision(null, "耳机触控已取消本轮；已提交内容请查看历史", Action.CANCEL) : Decision.none();
+            return context.active ? new Decision(null, "正在结束会话；工作记录会提交", Action.CANCEL) : Decision.none();
         }
+        if (context.notWorn) { clearPending(); return new Decision(null, "双耳已摘下，请佩戴后操作"); }
         if (gesture == Gesture.NEXT_MODE) {
             clearPending();
             if (context.busy) return new Decision(null, "正在同步，请稍后再切换模式");
-            if (context.active && !context.recording)
-                return new Decision(null, "本轮正在处理，请结束后再切换模式");
             String next = "life".equals(context.mode) ? "work" : "work".equals(context.mode) ? "commute" : "life";
             // A subsequent triple event has no product action and can discard this combination.
             pendingActionAt = now + GESTURE_SETTLE_MS;
@@ -83,13 +93,10 @@ final class HeadsetInteractionPolicy {
             return Decision.none();
         }
         if (context.busy) { clearPending(); return new Decision(null, "正在同步，请稍后再开始"); }
-        if (context.active && !context.recording) {
-            clearPending(); return new Decision(null, "本轮正在处理；长按可取消");
-        }
         // Wait for a possible double before opening or ending the microphone.
         if (pendingActionAt < 0) {
             pendingActionAt = now + GESTURE_SETTLE_MS;
-            pendingAction = context.active ? Action.STOP_AND_SEND : Action.START;
+            pendingAction = context.modeCue ? Action.START : context.active ? Action.STOP_AND_SEND : Action.START;
             pendingSessionGeneration = context.sessionGeneration;
         }
         return Decision.none();
@@ -101,40 +108,51 @@ final class HeadsetInteractionPolicy {
         long generation = pendingSessionGeneration;
         clearPending();
         if (!context.enabled() || context.busy || generation != context.sessionGeneration) return Decision.none();
+        if (context.notWorn) return new Decision(null, "双耳已摘下，请佩戴后操作");
         if (intended == Action.CHANGE_MODE) {
-            if (context.active) return new Decision(intendedMode, "本轮结束后切换模式；当前录音会保留", Action.DEFER_MODE);
+            if (context.active && !context.modeCue) return new Decision(intendedMode, "结束当前会话后切换模式；工作记录会提交", Action.DEFER_MODE);
             return new Decision(intendedMode, "", Action.CHANGE_MODE);
         }
-        if (intended == Action.STOP_AND_SEND) return context.active && context.recording
-            ? new Decision(null, "正在结束录音…", Action.STOP_AND_SEND) : Decision.none();
-        if (intended != Action.START || context.active) return Decision.none();
-        if (context.notWorn) return new Decision(null, "耳机当前未佩戴，请佩戴后再开始");
-        return new Decision(null, "耳机触控开始单轮对话", Action.START);
+        if (intended == Action.STOP_AND_SEND) return context.active
+            ? new Decision(null, "", Action.STOP_AND_SEND) : Decision.none();
+        if (intended != Action.START || context.active && !context.modeCue) return Decision.none();
+        return new Decision(null, "正在接通 AI…", Action.START);
     }
     boolean hasPending() { return pendingActionAt >= 0; }
+    // Natural cue completion must not swallow a double tap still settling.
+    void modeCueFinished(long generation) {
+        turnFinished(generation);
+    }
+    // Only an already-chosen mode may cross a natural turn boundary. A tap must
+    // never become a new start/stop on the following recording.
+    void turnFinished(long generation) {
+        if ((pendingAction == Action.CHANGE_MODE || pendingAction == Action.STOP_AND_SEND) && pendingSessionGeneration == generation)
+            pendingSessionGeneration = generation + 1;
+    }
     long pendingDelay(long now) { return Math.max(0, pendingActionAt - now); }
     void clearPending() { pendingActionAt = -1; pendingAction = null; pendingMode = null; pendingSessionGeneration = -1; }
 
     DeviceUpdate device(Device device, boolean active) {
         List<String> notices = new ArrayList<>();
         String stop = null;
-        boolean bothOut = Boolean.FALSE.equals(device.leftWorn) && Boolean.FALSE.equals(device.rightWorn);
+        WearState wear = WearState.from(device.leftWorn, device.rightWorn);
+        boolean bothOut = wear == WearState.REMOVED;
         boolean previouslyBothOut = previous != null && Boolean.FALSE.equals(previous.leftWorn) && Boolean.FALSE.equals(previous.rightWorn);
-        if (previous != null && previous.ready && !device.ready) {
+        if (!device.ready || bothOut) wearAnnounced = false;
+        if (!device.ready) {
             clearPending();
-            if (active) stop = "耳机连接已中断，本轮已停止；重新连接后请手动开始";
-        } else if (device.inCall && (previous == null || !previous.inCall)) {
+            if (active) stop = "耳机连接已中断，通话已结束；重连后单击重新接通";
+        } else if (device.inCall) {
             clearPending();
-            if (active) stop = "检测到来电或通话，本轮已暂停；通话结束后请手动开始";
+            if (active) stop = "检测到手机通话，AI 通话已结束；来电结束后单击重新接通";
         } else if (device.ready && bothOut && active) {
             clearPending();
-            if (active) stop = "检测到耳机摘下，本轮已暂停；重新佩戴后请手动开始";
-            else notices.add("耳机已摘下；重新佩戴后请手动开始");
+            stop = "双耳已摘下，通话已结束；戴回后单击重新接通";
         } else if (device.ready && bothOut && !previouslyBothOut) {
-            notices.add("耳机当前未佩戴；请佩戴后手动开始");
-        } else if (device.ready && previous != null && (Boolean.FALSE.equals(previous.leftWorn) && Boolean.TRUE.equals(device.leftWorn)
-                || Boolean.FALSE.equals(previous.rightWorn) && Boolean.TRUE.equals(device.rightWorn))) {
-            notices.add("耳机已佩戴，等待你手动开始");
+            clearPending(); notices.add("双耳已摘下；戴回后单击接通");
+        } else if (device.ready && wear.worn() && !wearAnnounced) {
+            wearAnnounced = true;
+            if (!active) notices.add("耳机已佩戴，已就绪；单击接通常态对话");
         }
         if (device.ready) {
             leftBatteryBand = batteryNotice(device.leftBattery, leftBatteryBand, "左耳", notices);

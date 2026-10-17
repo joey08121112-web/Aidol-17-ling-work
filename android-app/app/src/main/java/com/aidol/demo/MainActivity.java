@@ -32,7 +32,6 @@ import android.widget.RadioButton;
 import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.TextView;
-import android.widget.Toast;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import java.io.OutputStream;
@@ -46,13 +45,16 @@ import com.aidol.demo.hardware.VendorCaptureSource;
 
 /** Foreground Android client. Credentials and provider protocols stay outside the UI. */
 public final class MainActivity extends Activity {
-    private static final int BG = 0xfff6f7f2, CARD = 0xffffffff, LINE = 0xffe2e7df;
-    private static final int INK = 0xff203b32, MUTED = 0xff5e6d65, TEAL = 0xff28644e, RED = 0xffad413c;
-    private static final int FOREST = 0xff163e31, LIME = 0xffdfedbc, SOFT = 0xffeaf0e5;
+    private static final int BG = 0xffffffff, CARD = 0xfff6f7f9, LINE = 0xffe3e6ec;
+    private static final int INK = 0xff202632, MUTED = 0xff697381, ACCENT = 0xff2468db, RED = 0xffb42318;
+    private static final int SOFT = 0xffedf1f7;
+    private static final int MEMORY = 0xff7356a6, WORK = 0xff305fb5, COMMUTE = 0xff24786d;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private ApiClient api;
     private DevelopmentSettings development;
     private HeadsetController headset;
+    private QuickFeedback quickFeedback;
+    private TextView dialogFeedback;
     private TextView headsetStatus, deviceDetails, voiceHint, developmentSummary;
     private long sessionGeneration;
     private String diagnosticSession = "尚未开始";
@@ -65,6 +67,38 @@ public final class MainActivity extends Activity {
     private boolean deferredOpenConversation;
     private VoiceSessionService voiceService;
     private boolean voiceServiceBound;
+    private boolean callStartPending;
+    private VoicePreparation voicePreparation;
+    private long preparationAttemptAt = -60000;
+    private final Runnable preparationTick = this::prepareVoice;
+    private void clearVoicePreparation() {
+        handler.removeCallbacks(preparationTick);
+        if (voicePreparation != null) { voicePreparation.close(); voicePreparation = null; }
+    }
+    private void prepareVoice() {
+        handler.removeCallbacks(preparationTick);
+        if (headset == null || api == null) return;
+        HeadsetController.Snapshot device = headset.snapshot();
+        boolean eligible = visible && tab == 0 && (session == null || sessionOperationNotice != null)
+            && !api.vault.token().isEmpty() && !"work".equals(mode())
+            && state.optJSONObject("capabilities") != null
+            && state.optJSONObject("capabilities").optBoolean("voice_prepare")
+            && device.ready() && !device.inCall
+            && WearState.from(device.leftWorn, device.rightWorn) != WearState.REMOVED
+            && checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+        if (!eligible) { clearVoicePreparation(); return; }
+        if (voicePreparation != null && !voicePreparation.usable(api)) clearVoicePreparation();
+        // Keep standby alive while eligible, including after an expired/failed
+        // preparation. A stale object must never suppress future preparation.
+        handler.postDelayed(preparationTick, 1000);
+        if (busy || permissionPending) return;
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (voicePreparation == null && now - preparationAttemptAt >= 12000) {
+            preparationAttemptAt = now;
+            voicePreparation = new VoicePreparation(this, api, headset::matchesOutput, handler);
+        }
+    }
+    private long audioPermissionGeneration = -1;
     private final android.content.ServiceConnection voiceConnection = new android.content.ServiceConnection() {
         @Override public void onServiceConnected(android.content.ComponentName name, android.os.IBinder binder) {
             voiceService = ((VoiceSessionService.LocalBinder) binder).service();
@@ -76,8 +110,9 @@ public final class MainActivity extends Activity {
                 if (visible && !isDestroyed()) showApp();
             });
             syncHeadsetControls();
-            lastNotice = "锁屏耳机会话已开启；每次请手动触发，可从通知停止";
+            lastNotice = "耳机会话已开启 · 通话可锁屏继续 · 通知可挂断";
             showApp();
+            if (callStartPending) { callStartPending = false; startVoice(); }
         }
         @Override public void onServiceDisconnected(android.content.ComponentName name) {
             cancelSession("耳机会话服务已中断，请回到 App 重新开启");
@@ -95,6 +130,7 @@ public final class MainActivity extends Activity {
     private final HeadsetController.Listener headsetListener = snapshot -> runOnUiThread(() -> {
         if (isDestroyed()) return;
         renderHeadset();
+        if (quickFeedback != null && !canSpeakFeedback()) quickFeedback.stop();
         if (development.audioMode() == AudioMode.RISE_SDK) {
             HeadsetInteractionPolicy.DeviceUpdate update = headsetPolicy.device(new HeadsetInteractionPolicy.Device(
                 snapshot.ready(), snapshot.inCall, snapshot.leftWorn, snapshot.rightWorn,
@@ -107,6 +143,7 @@ public final class MainActivity extends Activity {
             if (!update.notices.isEmpty()) headsetNotice(android.text.TextUtils.join("；", update.notices));
         }
         syncHeadsetControls();
+        prepareVoice();
     });
     private TextView diagnosticsView;
     private String diagnosticInput = "尚未录音", diagnosticOutput = "尚未播放", diagnosticRequest = "尚未请求", diagnosticStage = "空闲", diagnosticError = "无";
@@ -126,23 +163,38 @@ public final class MainActivity extends Activity {
     private JSONArray lastCitations = new JSONArray(), lastTools = new JSONArray();
     private LinearLayout turnDetails;
     private AlertDialog sourceDialog;
+    private LinearLayout workMeetingList, workMeetingDetail;
+    private String openWorkMeetingId = "", workMeetingDetailSnapshot = "";
+    private boolean workMeetingShowOriginal, workMeetingSyncError;
+    private TextView workMeetingDetailStatus;
+    private boolean workMeetingPollInFlight;
+    private long workMeetingReadGeneration;
+    private final Runnable workMeetingPoll = this::pollWorkMeetings;
     private String lastBusinessRequestId = "", uncertainTurnId = "";
     private boolean turnHasResult;
     private byte[] exportData;
     private android.location.LocationListener locationListener;
+    private boolean startupLocationAttempted, automaticLocation;
+    private final Runnable startupLocationTick = this::updateStartupLocation;
     private final android.os.Handler handler = new android.os.Handler(android.os.Looper.getMainLooper());
-    private final Runnable locationTimeout = () -> { stopLocation(); showError("定位超时，请到开阔位置重试，或检查系统定位开关"); };
-    private int listenMode;
+    private final Runnable locationTimeout = () -> locationFailed("暂未取得准确位置，可报城市查天气，或到开阔处重新定位");
+    private int listenMode = VoiceInteraction.CALL;
+    private boolean continuingCall;
+    private TextView callCaption, liveWords;
+    private LinearLayout modeChoices;
+    private TextView modeHint;
+    private String liveTranscript = "";
+    private String liveReplyText = "";
     private boolean repeatArmed, permissionPending, turnSucceeded;
     private long repeatAt;
     private final Runnable repeatTick = new Runnable() {
         @Override public void run() {
-            if (!repeatArmed || !visible || tab != 0 || api.vault.token().isEmpty()) return;
+            if (!repeatArmed || !sessionAvailable() || (tab != 0 && listenMode != VoiceInteraction.CALL) || api.vault.token().isEmpty()) return;
             if (listenMode == 2 && !"life".equals(mode())) { stopRepeat(); lastNotice = "场景已切换，定时聆听已停止"; showApp(); return; }
             long remaining = repeatAt - android.os.SystemClock.elapsedRealtime();
             if (session == null && !busy && locationListener == null && !permissionPending && remaining <= 0) { startVoice(); return; }
-            if (session == null && !busy && status != null && remaining > 0) setStatusText((listenMode == 2 ? "定时聆听" : "连续对话") + " · " + Math.max(1, (remaining + 999) / 1000) + " 秒后继续 · 点取消结束");
-            handler.postDelayed(this, 1000);
+            if (session == null && !busy && status != null && remaining > 0) setStatusText((listenMode == 2 ? "定时聆听" : InteractionCopy.name(listenMode)) + " · " + Math.max(1, (remaining + 999) / 1000) + " 秒后继续 · 点击停止结束");
+            handler.postDelayed(this, listenMode == VoiceInteraction.SCHEDULED ? 1000 : 180);
         }
     };
     private interface Job { JSONObject run() throws Exception; }
@@ -151,13 +203,14 @@ public final class MainActivity extends Activity {
     @Override public void onCreate(Bundle saved) {
         super.onCreate(saved);
         getWindow().setStatusBarColor(BG);
-        getWindow().setNavigationBarColor(Build.VERSION.SDK_INT >= 27 ? BG : FOREST);
+        getWindow().setNavigationBarColor(Build.VERSION.SDK_INT >= 27 ? BG : INK);
         getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR |
             (Build.VERSION.SDK_INT >= 27 ? View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR : 0));
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
         development = new DevelopmentSettings(this);
-        headsetControlsOptIn = getSharedPreferences("headset_controls", MODE_PRIVATE).getBoolean("touch_enabled", false);
+        headsetControlsOptIn = getSharedPreferences("headset_controls", MODE_PRIVATE).getBoolean("touch_enabled", true);
         headset = new HeadsetController(getApplicationContext());
+        quickFeedback = new QuickFeedback(this, headset::matchesOutput, this::canSpeakFeedback);
         headset.addListener(headsetListener);
         headset.addControlListener(headsetControlListener);
         connectBackend();
@@ -168,6 +221,7 @@ public final class MainActivity extends Activity {
         diagnosticsView = null;
         turnDetails = null;
         voiceButton = null; cancelButton = null; orb = null; chatInput = null;
+        callCaption = null; liveWords = null; content = null;
         headsetStatus = null;
         voiceHint = null;
         developmentSummary = null;
@@ -187,15 +241,15 @@ public final class MainActivity extends Activity {
         ScrollView sc = new ScrollView(this); sc.setFillViewport(true);
         root.addView(sc, new LinearLayout.LayoutParams(-1, -1));
         LinearLayout body = column(); body.setPadding(dp(28), dp(24), dp(28), dp(30)); sc.addView(body);
-        TextView brand = label(body, "aidol / 聆", 28, INK); brand.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL)); brand.setLetterSpacing(-.04f);
+        TextView brand = label(body, "aidol", 25, INK); brand.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL)); brand.setLetterSpacing(-.04f);
         if (mode == 0) {
-            LinearLayout welcome = card(body); welcome.setBackground(shape(FOREST, 32, FOREST));
-            CompanionOrbView mark = new CompanionOrbView(this); welcome.addView(mark, new LinearLayout.LayoutParams(-1, dp(170)));
+            CompanionOrbView mark = new CompanionOrbView(this); body.addView(mark, new LinearLayout.LayoutParams(-1, dp(160)));
         }
         gap(body, 12);
-        label(body, mode == 1 ? "创建账号" : mode == 2 ? "找回账号" : "欢迎回来", 27, INK).setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        label(body, mode == 1 ? "创建你的空间。" : mode == 2 ? "找回账号。" : "好好说话。\n慢慢了解你。", 32, INK).setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        if (mode != 2) label(body, mode == 1 ? "从一次对话，开始彼此了解。" : "登录 Aidol，让每一次对话都有回响。", 14, MUTED);
         if (mode == 2) label(body, "使用恢复码重设密码。", 14, MUTED);
-        if (BuildConfig.DEBUG) label(body, development.localBackend() ? "本地账号 · USB" : "远端账号", 12, TEAL);
+        if (BuildConfig.DEBUG) label(body, development.localBackend() ? "本地账号 · USB" : "远端账号", 12, ACCENT);
         gap(body, 18);
         if (mode != 2) {
             LinearLayout tabs = row(); body.addView(tabs);
@@ -203,21 +257,23 @@ public final class MainActivity extends Activity {
             segment(tabs, "创建账号", mode == 1, () -> { if (!busy) showAuth(1); });
             gap(body, 12);
         }
-        EditText username = field(body, mode == 1 ? "账号（不区分大小写）" : "账号", "3–24 位字母、数字、下划线", false, 24);
-        username.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
-        EditText password = field(body, mode == 2 ? "新密码" : "密码", "8–128 位，请妥善保存", true, 128);
+        EditText username = field(body, mode == 1 ? "账号（英文不区分大小写）" : "账号", "起个好记的名字，中文也可以", false, 128);
+        username.setInputType(InputType.TYPE_CLASS_TEXT);
+        username.setSingleLine(true);
+        EditText password = field(body, mode == 2 ? "新密码" : "密码", "填一个好记的密码即可", true, 128);
         EditText confirm = mode == 0 ? null : field(body, "确认密码", "再输入一次密码", true, 128);
         EditText recovery = mode == 2 ? field(body, "账号恢复码", "粘贴之前保存的恢复码", false, 128) : null;
         CheckBox consent = new CheckBox(this); consent.setTextColor(MUTED); consent.setTextSize(12);
-        consent.setButtonTintList(android.content.res.ColorStateList.valueOf(TEAL));
+        consent.setButtonTintList(android.content.res.ColorStateList.valueOf(ACCENT));
         consent.setText("我已了解：录音和文字会发送到服务器及 AI 服务处理；账号数据可导出、清空或删除。");
         if (mode == 1) body.addView(consent);
         authError = label(body, "", 13, RED); authError.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         Button submit = button(body, mode == 1 ? "创建账号" : mode == 2 ? "重设密码并登录" : "登录", true, () -> {
             if (busy) return;
             String name = value(username), pass = password.getText().toString();
-            if (!name.matches("[a-zA-Z0-9_]{3,24}")) { authError.setText("账号需为 3–24 位字母、数字或下划线。"); return; }
-            if (pass.length() < 8 || pass.length() > 128) { authError.setText("密码长度需为 8–128 位。"); return; }
+            if (name.isEmpty()) { authError.setText("请输入账号。"); return; }
+            if (name.codePointCount(0, name.length()) > 64) { authError.setText("账号最多 64 位。"); return; }
+            if (pass.isEmpty()) { authError.setText("请输入密码。"); return; }
             if (confirm != null && !pass.equals(confirm.getText().toString())) { authError.setText("两次密码不一致，请检查。"); return; }
             if (mode == 1 && !consent.isChecked()) { authError.setText("请先阅读并勾选数据处理说明。"); return; }
             if (recovery != null && value(recovery).length() < 16) { authError.setText("请输入完整的账号恢复码。"); return; }
@@ -241,40 +297,48 @@ public final class MainActivity extends Activity {
     private void recoveryDialog(String code) {
         LinearLayout body = dialogBody();
         label(body, "这是找回账号的唯一凭证。不会再次显示，重置密码后旧恢复码会失效。", 14, MUTED);
-        TextView secret = label(body, code, 18, TEAL); secret.setTextIsSelectable(true); secret.setTypeface(Typeface.MONOSPACE);
+        TextView secret = label(body, code, 18, ACCENT); secret.setTextIsSelectable(true); secret.setTypeface(Typeface.MONOSPACE);
         button(body, "复制恢复码", true, () -> copy("Aidol 账号恢复码", code));
         new AlertDialog.Builder(this).setTitle("请保存账号恢复码").setView(body).setCancelable(false)
             .setPositiveButton("我已妥善保存", (d, w) -> {}).show();
     }
 
     private void showApp() {
+        handler.removeCallbacks(workMeetingPoll);
+        workMeetingList = null;
         boolean restoreComposerFocus = tab == 0 && chatInput != null && chatInput.hasFocus();
         int draftSelection = chatInput == null ? 0 : chatInput.getSelectionStart();
         if (chatInput != null) chatDraft = chatInput.getText().toString();
         authError = null; base();
-        LinearLayout head = row(); head.setGravity(Gravity.CENTER_VERTICAL); head.setPadding(dp(24), dp(10), dp(24), dp(6));
+        LinearLayout head = row(); head.setGravity(Gravity.CENTER_VERTICAL); head.setPadding(dp(24), dp(8), dp(24), dp(4));
         root.addView(head);
         LinearLayout wordmark = column(); head.addView(wordmark, new LinearLayout.LayoutParams(0, -2, 1));
-        TextView logo = label(wordmark, "aidol", 28, INK); logo.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL)); logo.setLetterSpacing(-.04f);
+        TextView logo = label(wordmark, "aidol", 25, INK); logo.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL)); logo.setLetterSpacing(-.04f);
         TextView refresh = action(head, "↻", () -> { if (canAct()) { lastNotice = ""; refresh(); } }); refresh.setTextSize(25); refresh.setContentDescription("刷新服务器数据");
         TextView avatar = action(head, api.vault.username().isEmpty() ? "A" : api.vault.username().substring(0, 1).toUpperCase(Locale.ROOT), () -> switchTab(4));
-        avatar.setBackground(ripple(SOFT, 24, LINE)); avatar.setTextColor(TEAL); avatar.setContentDescription("打开我的空间");
+        avatar.setBackground(ripple(SOFT, 24, LINE)); avatar.setTextColor(ACCENT); avatar.setContentDescription("打开我的空间");
         status = label(root, "", 11, MUTED); status.setPadding(dp(24), 0, dp(24), dp(6));
         status.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        if (tab != 0 && repeatArmed && listenMode == VoiceInteraction.CALL) {
+            LinearLayout activeCall = row(); activeCall.setPadding(dp(24), dp(4), dp(24), dp(4)); root.addView(activeCall);
+            button(activeCall, "AI 通话中 · 返回", false, () -> switchTab(0));
+            button(activeCall, "挂断", false, () -> { cancelSession("通话已结束"); showApp(); });
+        }
         scroll = new ScrollView(this); scroll.setFillViewport(true); scroll.setClipToPadding(false); scroll.setVerticalScrollBarEnabled(false);
         root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
-        page = column(); page.setPadding(dp(24), dp(12), dp(24), dp(24)); scroll.addView(page);
+        page = column(); page.setPadding(dp(24), dp(12), dp(24), dp(32)); scroll.addView(page);
         composer = column(); composer.setPadding(dp(20), dp(8), dp(20), dp(8)); root.addView(composer);
         composer.setVisibility(tab == 0 ? View.VISIBLE : View.GONE);
-        LinearLayout nav = row(); nav.setPadding(dp(12), dp(8), dp(12), dp(8)); nav.setBackgroundColor(CARD); root.addView(nav);
+        View divider = new View(this); divider.setBackgroundColor(SOFT); root.addView(divider, new LinearLayout.LayoutParams(-1, dp(1)));
+        LinearLayout nav = row(); nav.setPadding(dp(12), dp(5), dp(12), dp(5)); nav.setBackgroundColor(BG); root.addView(nav);
         String[] names = {"对话", "记忆", "工作", "通勤", "我的"};
         for (int i = 0; i < names.length; i++) {
             final int index = i; LinearLayout item = column(); item.setGravity(Gravity.CENTER); item.setPadding(0, dp(7), 0, dp(5));
-            item.setBackground(ripple(tab == i ? SOFT : CARD, 20, tab == i ? SOFT : CARD));
+            item.setBackground(ripple(tab == i ? SOFT : BG, 18, tab == i ? SOFT : BG));
             item.setSelected(tab == i); item.setFocusable(true);
             item.setMinimumHeight(dp(60)); nav.addView(item, new LinearLayout.LayoutParams(0, -2, 1));
-            IconView icon = new IconView(i, tab == i ? TEAL : MUTED); item.addView(icon, new LinearLayout.LayoutParams(dp(24), dp(24)));
-            TextView name = label(item, names[i], 11, tab == i ? TEAL : MUTED); name.setGravity(Gravity.CENTER); name.setPadding(0, dp(3), 0, 0);
+            IconView icon = new IconView(i, tab == i ? INK : MUTED); item.addView(icon, new LinearLayout.LayoutParams(dp(22), dp(22)));
+            TextView name = label(item, names[i], 11, tab == i ? INK : MUTED); name.setGravity(Gravity.CENTER); name.setPadding(0, dp(4), 0, 0);
             item.setContentDescription(names[i]); item.setOnClickListener(v -> switchTab(index));
         }
         if (tab == 0) conversation(); else if (tab == 1) memories(); else if (tab == 2) work(); else if (tab == 3) commute(); else profile();
@@ -283,64 +347,64 @@ public final class MainActivity extends Activity {
         }
         updateStatus();
         syncHeadsetControls();
+        prepareVoice();
+        if (tab == 2 && visible) handler.post(workMeetingPoll);
     }
 
     private void switchTab(int next) {
         if (tab == next) return;
         clearHeadsetGesture();
-        if (session != null) cancelSession("已离开对话页，本轮已取消");
-        stopRepeat(); tab = next; hideKeyboard(); showApp();
+        boolean keepCall = sessionUsesCapture && session != null || repeatArmed;
+        if (session != null && !keepCall) cancelSession("已结束当前操作");
+        if (!keepCall) stopRepeat(); tab = next; hideKeyboard(); showApp();
     }
 
     private void conversation() {
-        LinearLayout modes = row(); modes.setPadding(0, dp(12), 0, dp(2)); page.addView(modes);
-        String[] keys = {"life", "work", "commute"}, names = {"日常", "工作", "出行"};
+        if (session == null && !repeatArmed) listenMode = "work".equals(mode()) ? VoiceInteraction.NOTES : VoiceInteraction.CALL;
+        LinearLayout modes = row(); modes.setPadding(dp(4), dp(4), dp(4), dp(4)); modes.setBackground(shape(CARD, 26, CARD)); page.addView(modes);
+        modeChoices = modes;
+        String[] keys = {"life", "work", "commute"};
         for (int i = 0; i < keys.length; i++) {
-            final String mode = keys[i]; segment(modes, names[i], mode.equals(mode()), () -> changeMode(mode));
+            final String mode = keys[i]; segment(modes, ModeCopy.name(mode), mode.equals(mode()), () -> changeMode(mode));
         }
         LinearLayout hero = card(page); hero.setGravity(Gravity.CENTER);
-        hero.setPadding(dp(22), dp(18), dp(22), dp(22));
-        GradientDrawable heroSurface = new GradientDrawable(GradientDrawable.Orientation.TL_BR, new int[]{0xff244e3d, 0xff12362c});
-        heroSurface.setCornerRadius(dp(30)); hero.setBackground(heroSurface);
-        orb = new CompanionOrbView(this); hero.addView(orb, new LinearLayout.LayoutParams(-1, dp(180)));
-        TextView hint = label(hero, "work".equals(mode()) ? "记录此刻" : "commute".equals(mode()) ? "陪你在路上" : "我在，听你说", 23, 0xfff3f7eb);
+        hero.setPadding(dp(8), dp(18), dp(8), dp(20)); hero.setBackgroundColor(BG);
+        TextView eyebrow = label(hero, "你的随身 AI 伙伴", 12, MUTED); eyebrow.setGravity(Gravity.CENTER); eyebrow.setLetterSpacing(.08f);
+        TextView hint = label(hero, conversationHeading(), 30, INK);
+        modeHint = hint;
         hint.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL)); hint.setGravity(Gravity.CENTER);
-        gap(hero, 13);
+        orb = new CompanionOrbView(this); hero.addView(orb, new LinearLayout.LayoutParams(-1, dp(160)));
+        gap(hero, 4);
         LinearLayout voiceRow = row(); voiceRow.setGravity(Gravity.CENTER_VERTICAL); hero.addView(voiceRow, new LinearLayout.LayoutParams(-1, -2));
-        voiceButton = button(voiceRow, "开始说话", true, () -> {
-            if (session != null && recording) { recording = false; voiceButton.setText("正在处理…"); session.stopRecording(); }
-            else if (session == null) startVoice();
-        });
-        voiceButton.setTextColor(FOREST); voiceButton.setBackground(ripple(LIME, 18, LIME));
+        voiceButton = button(voiceRow, InteractionCopy.start(listenMode), true, this::toggleVoice);
+        voiceButton.setTextColor(BG); voiceButton.setBackground(ripple(INK, 28, INK));
         voiceButton.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1)); voiceButton.setMinHeight(dp(54));
-        cancelButton = action(voiceRow, "取消", () -> cancelSession("已取消；未提交的录音已丢弃，已提交内容请查看历史"));
-        cancelButton.setTextColor(LIME); cancelButton.setBackground(ripple(0xff2b5142, 18, 0xff416050));
+        cancelButton = action(voiceRow, InteractionCopy.stop(listenMode), this::endVoice);
+        cancelButton.setTextColor(RED); cancelButton.setBackground(ripple(CARD, 24, CARD));
         cancelButton.setVisibility(session == null && !repeatArmed ? View.GONE : View.VISIBLE);
-        TextView listening = label(hero, listenMode == 1 ? "连续对话 · 离开页面停止" : listenMode == 2 ? "定时聆听 · 离开页面停止" : lockScreenEnabled() ? "单次最长 60 秒 · 可锁屏 · 通知可停止" : "单次最长 60 秒 · 离开页面停止", 11, 0xffc1d5c5); listening.setGravity(Gravity.CENTER);
+        callCaption = label(hero, InteractionCopy.ready(listenMode), 12, MUTED); callCaption.setGravity(Gravity.CENTER);
+        liveWords = label(hero, "试着说：上次答应客户的事是什么？", 13, MUTED);
+        liveWords.setGravity(Gravity.CENTER); liveWords.setMinHeight(dp(48)); liveWords.setMaxLines(4);
+        if (session != null) {
+            liveWords.setText(recording ? liveTranscript : liveReplyText);
+            voiceButton.setText(listenMode == VoiceInteraction.NOTES ? "结束并保存记录" : "结束会话");
+        }
 
-        headsetStatus = label(page, "", 12, TEAL); headsetStatus.setPadding(dp(14), dp(12), dp(14), dp(12));
-        headsetStatus.setMinHeight(dp(48)); headsetStatus.setBackground(ripple(SOFT, 16, SOFT));
+        headsetStatus = label(page, "", 12, ACCENT); headsetStatus.setPadding(dp(14), dp(12), dp(14), dp(12));
+        headsetStatus.setMinHeight(dp(48)); headsetStatus.setBackground(ripple(CARD, 16, CARD));
         headsetStatus.setOnClickListener(v -> showDeviceDetails()); renderHeadset();
-        LinearLayout listeningDetails = disclosure(page, "聆听方式", listenMode == 0 ? "手动" : listenMode == 1 ? "连续对话" : "定时聆听", false);
-        LinearLayout listenChoices = row(); listeningDetails.addView(listenChoices);
-        String[] listenNames = {"手动", "连续对话", "定时聆听"};
-        for (int i = 0; i < listenNames.length; i++) { final int selection = i; segment(listenChoices, listenNames[i], listenMode == i, () -> {
-            if (!canAct()) return;
-            if (selection == 2 && !"life".equals(mode())) { toast("定时聆听用于日常陪伴，请先切换日常模式"); return; }
-            stopRepeat(); listenMode = selection; showApp();
-        }); }
+        LinearLayout listeningDetails = disclosure(page, "通话设置", InteractionCopy.name(listenMode), false);
         voiceHint = label(listeningDetails, voiceHintText(), 12, MUTED);
-        if ("work".equals(mode())) label(listeningDetails, "手动录音或耳机单击用于向助手私人提问，会简短回答；连续模式用于工作记录，保持安静。", 12, MUTED);
+        label(listeningDetails, "生活与通勤：单击开始连续问答，停顿后自动回复，文字和音频逐步返回；再次单击结束。工作：单击录音转写，再次单击结束并保存。双击结束当前会话并切换模式，切换后待机。通话中持续收音，说“小万”可打断 AI 播报。", 12, MUTED);
         button(listeningDetails, lockScreenEnabled() ? "停止锁屏耳机会话" : "开启本次锁屏耳机会话", false, () -> {
             if (lockScreenEnabled()) { stopLockScreenSession(); showApp(); }
             else enableLockScreenSession();
         });
-        label(listeningDetails, "开启后可锁屏完成短语音；Rise 触控就绪时可按一下继续提问。每次授权最长一小时；通知可停止，关闭 App、通话或断连后需重新开启。连续与定时录音不会在后台自动接续。", 12, MUTED);
-        if (listenMode != 0) label(listeningDetails, listenMode == 1 ? "点击开始后自动接续；语音停顿自动结束本轮。仅当前页面生效。" : "点击开始后，每 " + settings().optInt("life_poll_seconds", 300) + " 秒聆听一次，每次最多 " + settings().optInt("listen_seconds", 30) + " 秒。仅当前页面生效。", 12, MUTED);
+        label(listeningDetails, "开启锁屏会话后，AI 通话可在锁屏时继续；通知可随时挂断。通话会持续到挂断；未通话的待命一小时后关闭。关闭 App、来电或断连后需重新开启。定时与记录仅在当前页面运行。", 12, MUTED);
         if (BuildConfig.DEBUG) {
             LinearLayout diagnosticCard = disclosure(listeningDetails, "开发诊断", "", false);
             diagnosticsView = label(diagnosticCard, "", 12, MUTED); diagnosticsView.setTextIsSelectable(true);
-            renderDiagnostics(); button(diagnosticCard, "开发测试设置", false, this::showDevelopmentSettings);
+            renderDiagnostics(); button(diagnosticCard, "连接设置", false, this::showDevelopmentSettings);
         }
         gap(page, 12);
         LinearLayout histHead = row(); histHead.setGravity(Gravity.CENTER_VERTICAL); page.addView(histHead);
@@ -358,8 +422,8 @@ public final class MainActivity extends Activity {
         for (int i = Math.max(0, history.length() - 30); i < history.length(); i++) {
             JSONObject line = history.optJSONObject(i); if (line == null) continue;
             chatBubble(content, "assistant".equals(line.optString("speaker")), line.optString("text"), line.optString("created_at"));
-            if (!"assistant".equals(line.optString("speaker"))) {
-                TextView remember = label(content, "＋ 存为记忆", 11, TEAL); remember.setMinHeight(dp(40));
+            if (!"assistant".equals(line.optString("speaker")) && !line.optString("id").isEmpty()) {
+                TextView remember = label(content, "＋ 存为记忆", 11, ACCENT); remember.setMinHeight(dp(40));
                 remember.setOnClickListener(v -> { if (canAct()) mutate("POST", "/v1/memories/from-transcript/" + line.optString("id"), json()); });
             }
         }
@@ -372,16 +436,20 @@ public final class MainActivity extends Activity {
         chatInput.setContentDescription("文字消息");
         inputRow.addView(chatInput, new LinearLayout.LayoutParams(0, -2, 1));
         TextView send = action(inputRow, "↑", () -> {
-            if (!canAct()) return; String text = value(chatInput); if (text.isEmpty()) return;
+            String text = value(chatInput); if (text.isEmpty()) return;
+            if (session != null && session.isDuplexCall()) {
+                session.sendDuplexText(text); hideKeyboard(); chatInput.setText(""); chatDraft = ""; return;
+            }
+            if (!canAct()) return;
             hideKeyboard(); chatInput.setText(""); chatDraft = ""; startSession(text);
-        }); send.setTextSize(25); send.setTextColor(BG); send.setBackground(ripple(TEAL, 18, TEAL)); send.setContentDescription("发送文字消息");
+        }); send.setTextSize(25); send.setTextColor(BG); send.setBackground(ripple(ACCENT, 18, ACCENT)); send.setContentDescription("发送文字消息");
     }
 
     private void chatBubble(LinearLayout parent, boolean assistant, String text, String time) {
-        LinearLayout bubble = card(parent); bubble.setBackground(shape(assistant ? CARD : SOFT, 22, assistant ? LINE : SOFT));
+        LinearLayout bubble = card(parent); bubble.setBackground(shape(assistant ? CARD : 0xffeef5ff, 22, assistant ? CARD : 0xffeef5ff));
         LinearLayout.LayoutParams bubbleParams = (LinearLayout.LayoutParams) bubble.getLayoutParams();
         if (assistant) bubbleParams.rightMargin = dp(20); else bubbleParams.leftMargin = dp(24);
-        label(bubble, (assistant ? "聆" : "你") + "    " + date(time), 10, assistant ? TEAL : MUTED);
+        label(bubble, (assistant ? "聆" : "你") + "    " + date(time), 10, assistant ? ACCENT : MUTED);
         TextView copyable = label(bubble, text, 15, INK); copyable.setTextIsSelectable(true);
         if (assistant && !text.isEmpty()) {
             LinearLayout actions = row(); bubble.addView(actions);
@@ -426,7 +494,7 @@ public final class MainActivity extends Activity {
                 label(body, row.optString("summary") + "\n" + row.optString("published"), 13, MUTED);
                 String link = row.optString("url"); Uri uri = Uri.parse(link);
                 if (("https".equals(uri.getScheme()) || "http".equals(uri.getScheme())) && uri.getHost() != null)
-                    button(body, "打开来源网页", false, () -> { try { startActivity(new Intent(Intent.ACTION_VIEW, uri)); } catch (RuntimeException error) { toast("未找到可打开网页的应用"); } });
+                    button(body, "打开来源网页", false, () -> { try { startActivity(new Intent(Intent.ACTION_VIEW, uri)); } catch (RuntimeException error) { feedback("未找到可打开网页的应用", LocalCue.BROWSER); } });
             }
         }
         scrollDialog("本轮查询来源", body);
@@ -453,21 +521,42 @@ public final class MainActivity extends Activity {
 
     private void acceptBusinessResult(JSONObject value) {
         String interaction = value.optString("interaction");
+        String resultMode = value.optString("mode");
+        if (resultMode.equals("life") || resultMode.equals("work") || resultMode.equals("commute")) {
+            JSONObject agent = state.optJSONObject("agent"); if (agent == null) agent = new JSONObject();
+            put(agent, "mode", resultMode); put(state, "agent", agent);
+            if ("mode_switch".equals(interaction)) {
+                put(settings(), "mode", resultMode); put(settings(), "auto_mode", false);
+                stopRepeat();
+                // A confirmed spoken target wins over an unsubmitted gesture in this same segment.
+                deferredMode = null; deferredOpenConversation = false; clearHeadsetGesture();
+            }
+            renderModeSelection();
+        }
         if ("memory_correct".equals(interaction) || "memory_forget".equals(interaction)) clearPrivateSnapshots();
         else if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; }
         turnHasResult = true; uncertainTurnId = "";
         lastUser = value.optString("text"); lastAnswer = value.optString("response");
+        if (settings().optBoolean("retain_transcripts", true) && !lastUser.isEmpty()) {
+            JSONArray previous = array(state, "transcripts"), recent = new JSONArray();
+            for (int i = Math.max(0, previous.length() - 28); i < previous.length(); i++) recent.put(previous.opt(i));
+            recent.put(json("speaker", "user", "text", lastUser, "created_at", "刚刚"));
+            if (!lastAnswer.isEmpty()) recent.put(json("speaker", "assistant", "text", lastAnswer, "created_at", "刚刚"));
+            put(state, "transcripts", recent);
+        }
+        if (liveWords != null && !lastAnswer.isEmpty()) liveWords.setText(lastAnswer);
         lastCitations = array(value, "citations"); lastTools = array(value, "tool_results");
         if (!isDestroyed() && content != null) {
             chatBubble(content, false, lastUser, "刚刚");
             if (!lastAnswer.isEmpty()) chatBubble(content, true, lastAnswer, "刚刚");
-            scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
+            if (!repeatArmed) scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
         }
         renderTurnDetails();
     }
 
     /** Invalidate local evidence before refreshing: a failed GET must not restore obsolete text. */
     private void clearPrivateSnapshots() {
+        ++workMeetingReadGeneration;
         JSONObject clean = json("settings", settings(), "agent", json("mode", mode()));
         for (String key : new String[]{"user", "capabilities"}) if (state.has(key)) put(clean, key, state.opt(key));
         state = clean;
@@ -480,10 +569,13 @@ public final class MainActivity extends Activity {
 
     private void memories() {
         pageHeading("记忆");
-        LinearLayout search = card(page);
-        label(search, "问记忆", 16, INK);
+        LinearLayout search = featureCard(page, 0xfff3eff9);
+        eyebrow(search, "RECALL  /  回想", MEMORY);
+        label(search, "记得你说过的事", 21, INK);
+        label(search, "问一句，找回对话里的细节。", 13, MUTED);
+        gap(search, 10);
         EditText question = input("例如：我喜欢什么口味？", false, 500); search.addView(question);
-        button(search, "查找", true, () -> {
+        button(search, "查找记忆", true, () -> {
             if (!canAct() || value(question).isEmpty()) return;
             String q = value(question); hideKeyboard();
             request(() -> api.json("POST", "/v1/recall", json("question", q)), reply -> {
@@ -494,30 +586,48 @@ public final class MainActivity extends Activity {
                 }
                 scrollDialog("记忆检索", view);
             });
-        });
-        LinearLayout tools = row(); page.addView(tools); tools.setGravity(Gravity.CENTER_VERTICAL);
+        }).setBackground(ripple(MEMORY, 16, MEMORY));
         JSONArray allMemories = array(state, "memories"); int pinnedCount = 0;
         for (int i = 0; i < allMemories.length(); i++) if (allMemories.optJSONObject(i) != null && pinned(allMemories.optJSONObject(i))) pinnedCount++;
-        label(tools, allMemories.length() + " 条 · " + pinnedCount + " 置顶", 13, MUTED); tools.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
-        small(tools, "+ 新记忆", () -> { if (canAct()) editMemory(null); });
-        LinearLayout filters = row(); page.addView(filters);
+        sectionHeader(page, "我的记忆", allMemories.length() + " 条 · " + pinnedCount + " 置顶", "＋ 新记忆", () -> { if (canAct()) editMemory(null); });
+        LinearLayout filters = row(); filters.setPadding(dp(3), dp(3), dp(3), dp(3)); filters.setBackground(shape(CARD, 16, CARD)); page.addView(filters);
         String[] keys = {"", "preference", "fact", "task", "trip"}, names = {"全部", "偏好", "事实", "待办", "出行"};
         for (int i = 0; i < keys.length; i++) { final String key = keys[i]; segment(filters, names[i], memoryFilter.equals(key), () -> { memoryFilter = key; showApp(); }); }
         JSONArray items = array(state, "memories"); int count = 0;
         for (int i = 0; i < items.length(); i++) {
             JSONObject memory = items.optJSONObject(i); if (memory == null || (!memoryFilter.isEmpty() && !memoryFilter.equals(memory.optString("kind")))) continue;
             count++; LinearLayout card = card(page);
-            label(card, (pinned(memory) ? "◆  已置顶 · " : "") + kind(memory.optString("kind")) + "  /  " + date(memory.optString("created_at")), 10, TEAL);
-            label(card, memory.optString("content"), 15, INK).setTextIsSelectable(true);
-            LinearLayout actions = row(); card.addView(actions);
-            small(actions, "编辑", () -> { if (canAct()) editMemory(memory); });
-            small(actions, pinned(memory) ? "取消置顶" : "置顶", () -> {
-                if (canAct()) mutate("PUT", "/v1/memories/" + memory.optString("id"), json("content", memory.optString("content"), "kind", memory.optString("kind"), "pinned", !pinned(memory)));
-            });
-            small(actions, "删除", () -> confirm("删除这条记忆？", "删除后无法恢复。", () -> mutate("DELETE", "/v1/memories/" + memory.optString("id"), null)));
-            if (memory.optString("source").startsWith("transcript:")) small(actions, "原文", () -> { if (canAct()) request(() -> api.json("GET", "/v1/memories/" + memory.optString("id") + "/source", null), r -> { LinearLayout body = dialogBody(); label(body, r.optString("text", r.toString()), 15, INK); scrollDialog("记忆来源", body); }); });
+            LinearLayout meta = row(); meta.setGravity(Gravity.CENTER_VERTICAL); card.addView(meta);
+            badge(meta, kind(memory.optString("kind")), MEMORY, 0xfff3eff9);
+            if (pinned(memory)) { TextView pin = label(meta, "  已置顶", 11, MUTED); pin.setPadding(dp(8), 0, 0, 0); }
+            meta.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
+            TextView more = action(meta, "···", () -> {}); more.setTextColor(MUTED); more.setTextSize(22); more.setContentDescription("记忆操作：" + memory.optString("content"));
+            more.setOnClickListener(v -> memoryMenu(more, memory));
+            label(card, memory.optString("content"), 16, INK).setTextIsSelectable(true);
+            gap(card, 8);
+            label(card, date(memory.optString("created_at")), 11, MUTED);
         }
-        if (count == 0) empty(page, "暂无记忆", "点击“新记忆”，或在对话中说“记住”。");
+        if (count == 0) empty(page, memoryFilter.isEmpty() ? "留住第一件小事" : "这个分类还没有记忆", memoryFilter.isEmpty() ? "一句偏好、一个约定，都值得被记住。\n点击「新记忆」，也可以在对话中说“记住”。" : "试试其他分类，或添加一条新记忆。");
+    }
+
+    private void memoryMenu(View anchor, JSONObject memory) {
+        android.widget.PopupMenu menu = new android.widget.PopupMenu(this, anchor);
+        menu.getMenu().add(0, 0, 0, "编辑记忆");
+        menu.getMenu().add(0, 1, 1, pinned(memory) ? "取消置顶" : "置顶记忆");
+        if (memory.optString("source").startsWith("transcript:")) menu.getMenu().add(0, 2, 2, "查看原文");
+        menu.getMenu().add(0, 3, 3, "删除记忆");
+        menu.setOnMenuItemClickListener(item -> {
+            if (!canAct()) return true;
+            switch (item.getItemId()) {
+                case 0: editMemory(memory); break;
+                case 1: mutate("PUT", "/v1/memories/" + memory.optString("id"), json("content", memory.optString("content"), "kind", memory.optString("kind"), "pinned", !pinned(memory))); break;
+                case 2: request(() -> api.json("GET", "/v1/memories/" + memory.optString("id") + "/source", null), r -> { LinearLayout body = dialogBody(); label(body, r.optString("text", r.toString()), 15, INK); scrollDialog("记忆来源", body); }); break;
+                case 3: confirm("删除这条记忆？", "删除后无法恢复。", () -> mutate("DELETE", "/v1/memories/" + memory.optString("id"), null)); break;
+                default: break;
+            }
+            return true;
+        });
+        menu.show();
     }
 
     private void editMemory(JSONObject memory) {
@@ -539,46 +649,215 @@ public final class MainActivity extends Activity {
         })); dialog.show();
     }
 
+    private String workMeetingProgress(JSONObject meeting) {
+        String capture = meeting.optString("status"), summary = meeting.optString("summary_status");
+        if ("recording".equals(capture)) {
+            if (session != null && meeting.optString("id").equals(session.workMeetingId()))
+                return session.workSaving() ? "正在转写并保存 · 请等待尾段提交" : "正在记录 · 原文陆续保存";
+            return "录音尚未确认结束 · 已保存片段可查看";
+        }
+        if ("empty".equals(capture)) return "未识别到讲话 · 没有可整理的原文";
+        String prefix = "partial".equals(capture) ? "原文有缺段 · " : "原文已保存 · ";
+        if ("pending".equals(summary)) {
+            String stage = meeting.optString("summary_stage");
+            if ("analyzing".equals(stage)) return prefix + "正在分析 " + meeting.optInt("processed_sections") + "/" + meeting.optInt("total_sections") + " 组";
+            return prefix + ("synthesizing".equals(stage) ? "正在汇总会议纪要" : "等待 AI 整理");
+        }
+        if ("ready".equals(summary)) return prefix + "纪要已完成";
+        if ("fallback".equals(summary)) return prefix + "AI 整理未完成，可重试";
+        if ("failed".equals(summary)) return prefix + "整理失败，可重试";
+        return prefix + "可查看原文";
+    }
+    private void renderWorkMeetings() {
+        if (workMeetingList == null || tab != 2) return;
+        workMeetingList.removeAllViews();
+        if (workMeetingSyncError) label(workMeetingList, "进度暂未同步，正在重试；下面显示上次确认的状态。", 12, MUTED);
+        JSONArray meetings = array(state, "work_meetings");
+        if (meetings.length() == 0) {
+            LinearLayout empty = card(workMeetingList);
+            label(empty, "还没有会议记录", 15, INK);
+            label(empty, "开始录音，结束后在这里查看本次原文、摘要与处理进度。", 13, MUTED);
+        }
+        for (int i = 0; i < meetings.length(); i++) {
+            JSONObject meeting = meetings.optJSONObject(i); if (meeting == null) continue;
+            LinearLayout item = card(workMeetingList);
+            String title = meeting.isNull("title") ? "会议记录" : fallback(meeting.optString("title"), "会议记录");
+            label(item, title, 17, INK);
+            label(item, date(meeting.optString("started_at")) + " · 已保存 " + meeting.optInt("transcript_count") + " 段原文", 11, MUTED);
+            label(item, workMeetingProgress(meeting), 13, WORK);
+            String summary = meeting.isNull("summary") ? "" : meeting.optString("summary");
+            if (!summary.isEmpty()) label(item, summary.length() > 120 ? summary.substring(0, 120) + "…" : summary, 13, MUTED);
+            button(item, "查看原文与纪要", false, () -> openWorkMeeting(meeting.optString("id")));
+        }
+    }
+    private void pollWorkMeetings() {
+        if (!visible || tab != 2 || isDestroyed() || api.vault.token().isEmpty()) return;
+        if (workMeetingPollInFlight) return;
+        workMeetingPollInFlight = true;
+        ApiClient client = api;
+        long readGeneration = workMeetingReadGeneration;
+        String detailId = openWorkMeetingId;
+        worker.execute(() -> {
+            JSONObject list = null, detail = null;
+            try {
+                list = client.json("GET", "/v1/work-meetings", null);
+                if (!detailId.isEmpty()) detail = client.json("GET", "/v1/work-meetings/" + Uri.encode(detailId), null);
+            } catch (Exception ignored) { /* Keep confirmed state and retry the read, never replay PCM. */ }
+            JSONObject loadedList = list, loadedDetail = detail;
+            runOnUiThread(() -> {
+                workMeetingPollInFlight = false;
+                if (isDestroyed() || client != api || client.vault.token().isEmpty()) return;
+                if (readGeneration == workMeetingReadGeneration) {
+                    if (loadedList != null) put(state, "work_meetings", array(loadedList, "meetings"));
+                    workMeetingSyncError = loadedList == null;
+                    renderWorkMeetings();
+                    if (loadedDetail != null && detailId.equals(openWorkMeetingId)) renderWorkMeetingDetail(loadedDetail);
+                }
+                handler.removeCallbacks(workMeetingPoll);
+                if (visible && tab == 2) handler.postDelayed(workMeetingPoll, 2500);
+            });
+        });
+    }
+    private void openWorkMeeting(String meetingId) {
+        if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; }
+        openWorkMeetingId = meetingId; workMeetingDetailSnapshot = ""; workMeetingShowOriginal = true;
+        workMeetingDetail = dialogBody(); label(workMeetingDetail, "正在加载会议原文…", 14, MUTED);
+        scrollDialog("会议记录", workMeetingDetail);
+        sourceDialog.setOnDismissListener(d -> { openWorkMeetingId = ""; workMeetingDetail = null; workMeetingDetailStatus = null; });
+        handler.removeCallbacks(workMeetingPoll); handler.post(workMeetingPoll);
+    }
+    private void renderWorkMeetingDetail(JSONObject meeting) {
+        if (workMeetingDetail == null || !meeting.optString("id").equals(openWorkMeetingId)) return;
+        if (workMeetingDetailStatus != null) workMeetingDetailStatus.setText(workMeetingProgress(meeting));
+        JSONObject report = meeting.optJSONObject("report");
+        JSONArray sources = array(meeting, "sources");
+        String snapshot = json("sources", sources, "report", report, "summary_status", meeting.optString("summary_status"),
+            "error", meeting.optString("error"), "original", workMeetingShowOriginal).toString();
+        if (snapshot.equals(workMeetingDetailSnapshot)) return;
+        workMeetingDetailSnapshot = snapshot; workMeetingDetail.removeAllViews();
+        label(workMeetingDetail, report == null ? "本次会议" : report.optString("title", "本次会议"), 19, INK);
+        label(workMeetingDetail, date(meeting.optString("started_at")), 11, MUTED);
+        workMeetingDetailStatus = label(workMeetingDetail, workMeetingProgress(meeting), 13, WORK);
+        if (!meeting.optString("error").isEmpty()) label(workMeetingDetail, meeting.optString("error"), 13, MUTED);
+        LinearLayout tabs = row(); workMeetingDetail.addView(tabs);
+        segment(tabs, "原始文稿", workMeetingShowOriginal, () -> { workMeetingShowOriginal = true; renderWorkMeetingDetail(meeting); });
+        segment(tabs, "AI 纪要", !workMeetingShowOriginal, () -> { workMeetingShowOriginal = false; renderWorkMeetingDetail(meeting); });
+        if (workMeetingShowOriginal) {
+            label(workMeetingDetail, "按录音片段顺序显示语音识别原文，未经 AI 改写；未区分说话人身份。", 12, MUTED);
+            if (sources.length() == 0) label(workMeetingDetail, "暂无已保存原文；录音转写后会陆续显示。", 14, MUTED);
+            StringBuilder raw = new StringBuilder();
+            for (int i = 0; i < sources.length(); i++) {
+                JSONObject source = sources.optJSONObject(i); if (source == null) continue;
+                label(workMeetingDetail, "片段 " + (source.optInt("segment_index") + 1), 11, WORK);
+                label(workMeetingDetail, source.optString("text"), 15, INK).setTextIsSelectable(true);
+                if (raw.length() > 0) raw.append("\n\n"); raw.append(source.optString("text"));
+            }
+            if (raw.length() > 0) button(workMeetingDetail, "复制本次会议原文", false, () -> copy("会议原文", raw.toString()));
+        } else if (report != null) {
+            label(workMeetingDetail, report.optString("notice", "AI 整理稿，请结合原文核对。"), 12, MUTED);
+            label(workMeetingDetail, "会议摘要", 16, INK);
+            label(workMeetingDetail, report.optString("summary"), 15, INK).setTextIsSelectable(true);
+            meetingItems(workMeetingDetail, "讨论要点", array(report, "topics"), sources, false);
+            meetingItems(workMeetingDetail, "已确认决策", array(report, "decisions"), sources, false);
+            meetingItems(workMeetingDetail, "行动待办", array(report, "tasks"), sources, true);
+            meetingItems(workMeetingDetail, "待确认事项", array(report, "open_questions"), sources, false);
+        } else label(workMeetingDetail, "原文可以先看，AI 整理完成后这里会自动更新。", 14, MUTED);
+        String summaryStatus = meeting.optString("summary_status");
+        if ("recording".equals(meeting.optString("status")) && (session == null || !openWorkMeetingId.equals(session.workMeetingId()))) {
+            label(workMeetingDetail, "若录音已经中断，可结束本场并整理已上传的片段；未上传的音频无法恢复。", 12, MUTED);
+            button(workMeetingDetail, "结束本场，整理已保存片段", false, () -> {
+                if (!canAct()) return;
+                request(() -> api.json("POST", "/v1/work-meetings/" + Uri.encode(meeting.optString("id")) + "/finish",
+                    json("segment_count", meeting.optInt("received_segments"), "complete", false)), r -> {
+                    workMeetingDetailSnapshot = ""; renderWorkMeetingDetail(r);
+                    handler.removeCallbacks(workMeetingPoll); handler.post(workMeetingPoll);
+                });
+            });
+        }
+        if (!"recording".equals(meeting.optString("status")) && sources.length() > 0 && !"pending".equals(summaryStatus))
+            button(workMeetingDetail, "重新生成 AI 纪要", false, () -> {
+                if (!canAct()) return;
+                request(() -> api.json("POST", "/v1/work-meetings/" + Uri.encode(meeting.optString("id")) + "/retry-summary", json()), r -> {
+                    workMeetingDetailSnapshot = ""; renderWorkMeetingDetail(r);
+                    handler.removeCallbacks(workMeetingPoll); handler.post(workMeetingPoll);
+                });
+            });
+    }
+    private void meetingItems(LinearLayout parent, String title, JSONArray items, JSONArray sources, boolean tasks) {
+        label(parent, title, 16, INK);
+        if (items.length() == 0) label(parent, "暂无明确记录", 13, MUTED);
+        for (int i = 0; i < items.length(); i++) {
+            JSONObject item = items.optJSONObject(i); if (item == null) continue;
+            label(parent, "• " + item.optString(tasks ? "content" : "text"), 14, INK).setTextIsSelectable(true);
+            if (tasks) label(parent, "负责人：" + fallback(item.optString("owner"), "待确认") + " · 截止：" + fallback(item.optString("due"), "待确认"), 12, MUTED);
+            JSONArray ids = array(item, "source_ids");
+            LinearLayout evidence = disclosure(parent, "查看原文依据", "", false);
+            for (int j = 0; j < sources.length(); j++) {
+                JSONObject source = sources.optJSONObject(j); if (source == null) continue;
+                for (int k = 0; k < ids.length(); k++) if (source.optString("id").equals(ids.optString(k)))
+                    label(evidence, source.optString("text"), 13, MUTED).setTextIsSelectable(true);
+            }
+        }
+    }
     private void work() {
         pageHeading("工作");
-        LinearLayout intro = card(page); intro.setBackground(shape(SOFT, 28, SOFT));
-        label(intro, "会议记录", 21, INK);
-        label(intro, "分段记录，生成纪要草稿。", 13, MUTED);
-        button(intro, "开始记录", true, () -> { if (canAct()) saveModeAndOpenWork(); });
-        button(intro, "生成会议纪要", false, () -> {
+        LinearLayout intro = featureCard(page, 0xffeef3fc);
+        eyebrow(intro, "FOCUS  /  专注当下", WORK);
+        label(intro, "你专心，琐事交给我。", 22, INK);
+        label(intro, "安静记录讨论，结束后整理重点与待办。", 13, MUTED);
+        gap(intro, 12);
+        LinearLayout process = row(); intro.addView(process);
+        badge(process, "记录", WORK, BG); badge(process, "整理", WORK, BG); badge(process, "行动", WORK, BG);
+        for (int i = 0; i < process.getChildCount(); i++) {
+            TextView step = (TextView) process.getChildAt(i); step.setGravity(Gravity.CENTER);
+            LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, -2, 1); if (i > 0) p.leftMargin = dp(6); step.setLayoutParams(p);
+        }
+        gap(intro, 6);
+        boolean recordingMeeting = session != null && sessionUsesCapture && "work".equals(mode());
+        button(intro, recordingMeeting ? "结束并保存本次会议" : "work".equals(mode()) ? "开始会议记录" : "切换到工作模式", true, () -> {
+            if (session != null && sessionUsesCapture && "work".equals(mode())) endVoice();
+            else if (canAct()) { if ("work".equals(mode())) startVoice(); else changeMode("work"); }
+        });
+        label(intro, "结束后自动保存原文，再由 AI 整理摘要、决策与待办", 11, MUTED).setGravity(Gravity.CENTER);
+        sectionHeader(page, "会议记录", "每次录音独立保存 · 处理进度自动更新", "", null);
+        workMeetingList = column(); page.addView(workMeetingList); renderWorkMeetings();
+        sectionHeader(page, "历史记录整理", "按时间范围整理较早的工作记录", "选择范围", () -> {
             if (!canAct()) return;
             String[] options = {"最近 1 小时", "最近 24 小时", "最近 7 天"}; int[] hours = {1, 24, 168};
             new AlertDialog.Builder(this).setTitle("选择工作记录范围").setItems(options, (d, w) -> request(() -> api.json("POST", "/v1/meetings", json("hours", hours[w])), result -> refresh())).setNegativeButton("取消", null).show();
         });
         JSONObject report = state.optJSONObject("meeting_report");
-        if (report != null) {
-            LinearLayout summary = card(page); label(summary, "最近纪要  ·  " + date(report.optString("created_at")), 11, TEAL);
-            label(summary, "AI 草稿，请核对原文", 11, MUTED);
-            JSONObject coverage = report.optJSONObject("coverage");
-            if (coverage != null) {
-                label(summary, "记录覆盖：已保存 " + coverage.optInt("available_records") + " 条 · 纳入 "
-                    + coverage.optInt("summarized_records") + " 条 · 未纳入 " + coverage.optInt("omitted_records") + " 条", 12, TEAL);
-                label(summary, coverage.optBoolean("partial") ? "仅覆盖部分记录（可能有未纳入或截短片段）" : "已纳入本次提供的记录", 12, MUTED);
-                String first = coverage.optString("first_record_at", ""), last = coverage.optString("last_record_at", "");
-                if (!first.isEmpty() && !"null".equals(first)) label(summary, "记录时间：" + date(first) + " — " + date(last), 11, MUTED);
-                label(summary, coverage.optString("note", "记录时间范围不代表持续采集，不能据此确认没有缺段。"), 11, MUTED);
-            } else label(summary, "此纪要未提供记录覆盖信息，无法确认有无缺段。", 11, MUTED);
-            label(summary, report.optString("summary"), 15, INK).setTextIsSelectable(true);
+        if (report != null && !report.has("meeting_id")) {
+            LinearLayout summary = card(page);
+            badge(summary, "最近纪要 · AI 草稿", WORK, 0xffeef3fc);
+            label(summary, date(report.optString("created_at")), 11, MUTED);
+            label(summary, report.optString("summary"), 16, INK).setTextIsSelectable(true);
             JSONArray decisions = array(report, "decisions");
-            if (decisions.length() > 0) label(summary, "已记录的决策", 14, INK);
+            if (decisions.length() > 0) { gap(summary, 10); label(summary, "已记录的决策", 14, INK); }
             for (int i = 0; i < decisions.length(); i++) { JSONObject d = decisions.optJSONObject(i); if (d != null) label(summary, "• " + d.optString("text"), 13, MUTED); }
+            JSONObject coverage = report.optJSONObject("coverage");
+            LinearLayout coverageView = disclosure(summary, "记录覆盖", coverage != null && coverage.optBoolean("partial") ? "仅覆盖部分记录" : "请核对原文", false);
+            if (coverage != null) {
+                label(coverageView, "记录覆盖：已保存 " + coverage.optInt("available_records") + " 条 · 纳入 "
+                    + coverage.optInt("summarized_records") + " 条 · 未纳入 " + coverage.optInt("omitted_records") + " 条", 12, ACCENT);
+                label(coverageView, coverage.optBoolean("partial") ? "仅覆盖部分记录（可能有未纳入或截短片段）" : "已纳入本次提供的记录", 12, MUTED);
+                String first = coverage.optString("first_record_at", ""), last = coverage.optString("last_record_at", "");
+                if (!first.isEmpty() && !"null".equals(first)) label(coverageView, "记录时间：" + date(first) + " — " + date(last), 11, MUTED);
+                label(coverageView, coverage.optString("note", "记录时间范围不代表持续采集，不能据此确认没有缺段。"), 11, MUTED);
+            } else label(coverageView, "此纪要未提供记录覆盖信息，无法确认有无缺段。", 11, MUTED);
             LinearLayout actions = row(); summary.addView(actions);
             small(actions, "复制纪要", () -> copy("Aidol 会议纪要", report.optString("summary")));
             small(actions, "查看原始记录", () -> showSources(array(report, "sources")));
-        } else empty(page, "暂无纪要", "完成工作记录后，点击生成。");
-        JSONArray tasks = array(state, "tasks"); int open = 0; for (int i = 0; i < tasks.length(); i++) if (!"done".equals(tasks.optJSONObject(i).optString("status"))) open++;
-        label(page, "行动清单  ·  " + open + " 项待完成", 17, INK);
-        if (tasks.length() == 0) label(page, "暂无待办", 13, MUTED);
+        } else empty(page, "下一次讨论，从这里开始", "完成记录后，点击「生成纪要」。\n重点和决策会留在这里，方便回看。");
+        JSONArray tasks = array(state, "tasks"); int open = 0; for (int i = 0; i < tasks.length(); i++) if (tasks.optJSONObject(i) != null && !"done".equals(tasks.optJSONObject(i).optString("status"))) open++;
+        sectionHeader(page, "行动清单", open + " 项待完成", "", null);
+        if (tasks.length() == 0) { LinearLayout noTasks = card(page); label(noTasks, "还没有待办，先专注眼前。", 14, MUTED); }
         for (int i = 0; i < tasks.length(); i++) {
             JSONObject task = tasks.optJSONObject(i); if (task == null) continue;
             boolean done = "done".equals(task.optString("status")); LinearLayout taskCard = card(page);
-            CheckBox check = new CheckBox(this); check.setText(task.optString("content")); check.setTextColor(done ? MUTED : INK); check.setTextSize(14);
-            check.setButtonTintList(android.content.res.ColorStateList.valueOf(TEAL)); check.setChecked(done); taskCard.addView(check);
+            taskCard.setPadding(dp(16), dp(12), dp(16), dp(12));
+            CheckBox check = new CheckBox(this); check.setText(task.optString("content")); check.setTextColor(done ? MUTED : INK); check.setTextSize(15); check.setMinHeight(dp(48));
+            check.setButtonTintList(android.content.res.ColorStateList.valueOf(ACCENT)); check.setChecked(done); taskCard.addView(check);
             if (done) check.setPaintFlags(check.getPaintFlags() | Paint.STRIKE_THRU_TEXT_FLAG);
             check.setOnClickListener(v -> { if (canAct()) mutate("PATCH", "/v1/tasks/" + task.optString("id"), json("status", check.isChecked() ? "done" : "open")); else check.setChecked(done); });
             label(taskCard, "负责人：" + fallback(task.optString("owner"), "待确认") + "    截止：" + fallback(task.optString("due"), "待确认"), 11, MUTED);
@@ -587,50 +866,68 @@ public final class MainActivity extends Activity {
 
     private void commute() {
         pageHeading("通勤");
-        LinearLayout destination = card(page); destination.setBackground(shape(SOFT, 28, SOFT));
-        label(destination, settings().isNull("destination_lon") ? "去哪里" : settings().optString("destination_name", "选择目的地"), 22, INK);
-        EditText city = field(destination, "城市", "例如 上海", false, 80); city.setText(settings().optString("transit_city", "上海"));
-        EditText query = input("搜索公司、车站、餐厅…", false, 100); destination.addView(query);
-        button(destination, "搜索目的地", true, () -> {
+        JSONObject agent = state.optJSONObject("agent"), route = agent == null ? null : agent.optJSONObject("route");
+        if (route != null) {
+            sectionHeader(page, "本次路线", "出发前，再确认一下", "", null);
+            LinearLayout routeCard = card(page);
+            if (route.optBoolean("available")) {
+                badge(routeCard, "路线估算", COMMUTE, 0xffedf6f2);
+                LinearLayout metrics = row(); routeCard.addView(metrics); gap(routeCard, 8);
+                metric(metrics, String.valueOf(Math.max(1, Math.round(route.optDouble("eta_seconds") / 60))), "分钟", COMMUTE);
+                metric(metrics, String.format(Locale.CHINA, "%.1f", route.optDouble("distance_meters") / 1000), "公里", INK);
+                label(routeCard, "前往 " + route.optString("destination"), 16, INK); label(routeCard, route.optString("note"), 12, MUTED);
+                JSONArray steps = array(route, "steps");
+                if (steps.length() > 0) {
+                    LinearLayout routeSteps = disclosure(routeCard, "路线详情", steps.length() + " 个路段", false);
+                    for (int i = 0; i < Math.min(steps.length(), 10); i++) { JSONObject step = steps.optJSONObject(i); if (step != null) label(routeSteps, String.format(Locale.CHINA, "%02d   %s", i + 1, step.optString("instruction", step.optString("name", step.toString()))), 14, INK); }
+                    if (steps.length() > 10) small(routeSteps, "查看全部路线", () -> { LinearLayout body = dialogBody(); for (int i = 0; i < steps.length(); i++) { JSONObject step = steps.optJSONObject(i); if (step != null) label(body, (i + 1) + ". " + step.optString("instruction", step.toString()), 14, INK); } scrollDialog("路线详情", body); });
+                }
+            } else label(routeCard, route.optString("reason", "暂时没有可用路线"), 14, MUTED);
+        }
+        boolean hasDestination = settings().has("destination_lon") && !settings().isNull("destination_lon");
+        LinearLayout destination = featureCard(page, 0xffedf6f2);
+        eyebrow(destination, "ON THE WAY  /  在路上", COMMUTE);
+        label(destination, hasDestination ? settings().optString("destination_name", "已选目的地") : "今天，想去哪里？", 23, INK);
+        label(destination, hasDestination ? "目的地已就绪，选择你的出发方式。" : "选好目的地，让出发更从容。", 13, MUTED);
+        LinearLayout searchDestination;
+        if (hasDestination) searchDestination = disclosure(destination, "更换目的地", "", false);
+        else { searchDestination = column(); destination.addView(searchDestination); gap(searchDestination, 14); }
+        LinearLayout searchFields = row(); searchDestination.addView(searchFields);
+        LinearLayout cityField = column(); LinearLayout.LayoutParams cityLayout = new LinearLayout.LayoutParams(dp(80), -2); cityLayout.rightMargin = dp(8); searchFields.addView(cityField, cityLayout);
+        LinearLayout placeField = column(); searchFields.addView(placeField, new LinearLayout.LayoutParams(0, -2, 1));
+        EditText city = field(cityField, "所在城市", "城市", false, 80); city.setSingleLine(true); city.setText(settings().optString("transit_city", "上海"));
+        EditText query = field(placeField, "目的地", "公司、车站、餐厅…", false, 100); query.setSingleLine(true);
+        button(searchDestination, "查找地点", false, () -> {
             if (!canAct() || value(query).isEmpty()) return; hideKeyboard();
             request(() -> api.json("GET", "/v1/maps/search?q=" + Uri.encode(value(query)) + "&city=" + Uri.encode(value(city)), null), this::poiResults);
         });
+        gap(destination, 12); label(destination, "出行方式", 12, MUTED);
         LinearLayout methods = row(); destination.addView(methods); gap(destination, 5);
         String[] methodsKeys = {"driving", "walking", "transit", "bicycling"}, methodsNames = {"驾车", "步行", "公共交通", "骑行"};
         for (int i = 0; i < methodsKeys.length; i++) { String key = methodsKeys[i]; segment(methods, methodsNames[i], key.equals(settings().optString("transport", "driving")), () -> {
             if (!canAct()) return; JSONObject payload = cloneJson(settings()); put(payload, "transport", key); mutate("PUT", "/v1/settings", payload);
         }); }
-        button(destination, "◎  定位并更新路线", false, this::locate);
-        label(destination, "仅在点击时获取位置。路线是规划估算，请结合实际路况。", 11, MUTED);
-        JSONObject agent = state.optJSONObject("agent"), route = agent == null ? null : agent.optJSONObject("route");
-        if (route != null) {
-            LinearLayout routeCard = card(page);
-            if (route.optBoolean("available")) {
-                label(routeCard, String.format(Locale.CHINA, "%d 分钟   /   %.1f km", Math.max(1, Math.round(route.optDouble("eta_seconds") / 60)), route.optDouble("distance_meters") / 1000), 24, TEAL);
-                label(routeCard, "前往 " + route.optString("destination"), 15, INK); label(routeCard, route.optString("note"), 11, MUTED);
-                JSONArray steps = array(route, "steps");
-                for (int i = 0; i < Math.min(steps.length(), 10); i++) { JSONObject step = steps.optJSONObject(i); if (step != null) label(routeCard, String.format(Locale.CHINA, "%02d  %s", i + 1, step.optString("instruction", step.optString("name", step.toString()))), 13, INK); }
-                if (steps.length() > 10) small(routeCard, "查看全部路线", () -> { LinearLayout body = dialogBody(); for (int i = 0; i < steps.length(); i++) { JSONObject step = steps.optJSONObject(i); if (step != null) label(body, (i + 1) + ". " + step.optString("instruction", step.toString()), 14, INK); } scrollDialog("路线详情", body); });
-            } else label(routeCard, route.optString("reason", "暂时没有可用路线"), 14, MUTED);
-        }
-        LinearLayout around = disclosure(page, "附近与天气", "", false);
+        button(destination, "定位并更新路线", true, this::locate).setBackground(ripple(COMMUTE, 16, COMMUTE));
+        label(destination, "仅在点击时获取位置 · 路线为规划估算", 11, MUTED).setGravity(Gravity.CENTER);
+        sectionHeader(page, "沿途安排", "给路上的自己，多一点照顾", "", null);
+        LinearLayout around = disclosure(page, "附近与天气", "找个好去处，看看晴雨", false);
         EditText keyword = input("咖啡、美食、公园…", false, 80); keyword.setText("咖啡"); around.addView(keyword);
         button(around, "搜索周边 3 km", false, () -> {
             if (!canAct()) return; JSONObject current = state.optJSONObject("agent"), location = current == null ? null : current.optJSONObject("location");
-            if (location == null) { toast("请先点击“定位并更新路线”"); return; }
+            if (location == null) { feedback("请先点击“定位并更新路线”", LocalCue.LOCATION); return; }
             JSONObject payload = cloneJson(location); put(payload, "keyword", fallback(value(keyword), "美食"));
             request(() -> api.json("POST", "/v1/maps/nearby", payload), this::poiResults);
         });
         button(around, "附近地铁站", false, () -> {
             if (!canAct()) return;
             JSONObject nearbyAgent = state.optJSONObject("agent"), location = nearbyAgent == null ? null : nearbyAgent.optJSONObject("location");
-            if (location == null) { toast("请先点击定位并更新路线"); return; }
+            if (location == null) { feedback("请先点击定位并更新路线", LocalCue.LOCATION); return; }
             JSONObject payload = cloneJson(location); put(payload, "metro_only", true); put(payload, "radius", 2000);
             request(() -> api.json("POST", "/v1/maps/nearby", payload), this::poiResults);
         });
         button(around, "目的地天气预报", false, () -> {
             if (!canAct()) return;
-            if (settings().isNull("destination_lon")) { toast("请先选择目的地"); return; }
+            if (settings().isNull("destination_lon")) { feedback("请先选择目的地", LocalCue.DESTINATION); return; }
             request(() -> api.json("GET", "/v1/maps/weather?forecast=true", null), weather -> {
                 if (!weather.optBoolean("available")) { showError(weather.optString("reason", "暂无预报")); return; }
                 LinearLayout body = dialogBody(); JSONArray days = array(weather, "forecast");
@@ -642,7 +939,7 @@ public final class MainActivity extends Activity {
         });
         button(around, "查看目的地天气", false, () -> {
             if (!canAct()) return; String code = getPreferences(MODE_PRIVATE).getString(weatherPreferenceKey(), "");
-            if (settings().isNull("destination_lon")) { toast("先从搜索结果选择目的地，即可查询当地天气"); return; }
+            if (settings().isNull("destination_lon")) { feedback("先从搜索结果选择目的地，即可查询当地天气", LocalCue.DESTINATION); return; }
             String weatherCode = code.matches("[0-9]{6}") ? code : "";
             request(() -> api.json("GET", "/v1/maps/weather?city=" + Uri.encode(weatherCode), null), weather -> {
                 if (!weather.optBoolean("available")) { showError(weather.optString("reason", "天气暂不可用")); return; }
@@ -650,7 +947,7 @@ public final class MainActivity extends Activity {
                     .setMessage(weather.optString("weather") + "\n" + weather.optString("wind_direction") + "风 " + weather.optString("wind_power") + "级\n湿度 " + weather.optString("humidity") + "%\n\n" + weather.optString("note") + "\n发布时间：" + weather.optString("report_time")).setPositiveButton("知道了", null).show();
             });
         });
-        LinearLayout notice = disclosure(page, "到达提醒", "生成草稿，由你发送", false);
+        LinearLayout notice = disclosure(page, "到达提醒", "提前准备一句报平安", false);
         EditText contact = field(notice, "联系人称呼", "例如 同事", false, 100); contact.setText(settings().optString("contact", "同事"));
         EditText minutes = field(notice, "预计到达前几分钟提醒", "1–60", false, 2); minutes.setInputType(InputType.TYPE_CLASS_NUMBER); minutes.setText(String.valueOf(settings().optInt("arrival_notice_minutes", 5)));
         button(notice, "保存提醒偏好", false, () -> { if (!canAct()) return; int m; try { m = Integer.parseInt(value(minutes)); } catch (Exception e) { minutes.setError("请输入 1–60"); return; } if (m < 1 || m > 60) { minutes.setError("请输入 1–60"); return; } JSONObject payload = cloneJson(settings()); put(payload, "contact", value(contact)); put(payload, "arrival_notice_minutes", m); mutate("PUT", "/v1/settings", payload); });
@@ -658,7 +955,7 @@ public final class MainActivity extends Activity {
         JSONArray drafts = array(state, "drafts"); int pending = 0;
         for (int i = 0; i < drafts.length(); i++) {
             JSONObject draft = drafts.optJSONObject(i); if (draft == null || !"pending".equals(draft.optString("status"))) continue; pending++;
-            LinearLayout draftCard = card(page); label(draftCard, "发给 " + draft.optString("contact"), 11, TEAL); label(draftCard, draft.optString("text"), 15, INK);
+            LinearLayout draftCard = card(page); badge(draftCard, "待发送 · 给" + draft.optString("contact"), COMMUTE, 0xffedf6f2); label(draftCard, draft.optString("text"), 15, INK);
             LinearLayout actions = row(); draftCard.addView(actions);
             small(actions, "复制草稿", () -> { if (!canAct()) return; copy("到达提醒草稿", draft.optString("text")); mutate("POST", "/v1/drafts/" + draft.optString("id") + "/copied", json()); });
             small(actions, "忽略", () -> mutate("POST", "/v1/drafts/" + draft.optString("id") + "/dismissed", json()));
@@ -680,69 +977,115 @@ public final class MainActivity extends Activity {
         dialog.show();
     }
 
-    private void locate() {
+    private boolean hasLocationPermission() {
+        return checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+            || checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+    }
+    private void updateStartupLocation() {
+        handler.removeCallbacks(startupLocationTick);
+        if (!visible || isDestroyed() || api == null || startupLocationAttempted) return;
+        if (busy || permissionPending) { handler.postDelayed(startupLocationTick, 500); return; }
+        if (session != null || repeatArmed || locationListener != null) return;
+        if (!hasLocationPermission()) {
+            if (getPreferences(MODE_PRIVATE).getBoolean("startup_location_asked", false)) return;
+            getPreferences(MODE_PRIVATE).edit().putBoolean("startup_location_asked", true).apply();
+            permissionPending = true;
+            requestPermissions(new String[]{Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION}, 5);
+            return;
+        }
+        if (api.vault.token().isEmpty() || state.optJSONObject("settings") == null) return;
+        startupLocationAttempted = true;
+        locate(false);
+    }
+    private void locationFailed(String message) {
+        boolean quiet = automaticLocation;
+        stopLocation();
+        if (!visible) return;
+        if (quiet) { lastNotice = message; updateStatus(); }
+        else showError(message);
+    }
+    private void locate() { locate(true); }
+    private void locate(boolean updateRoute) {
         if (!canAct()) return;
-        if (checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED && checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) { requestPermissions(new String[]{Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION}, 2); return; }
+        if (!hasLocationPermission()) {
+            getPreferences(MODE_PRIVATE).edit().putBoolean("startup_location_asked", true).apply();
+            permissionPending = true;
+            requestPermissions(new String[]{Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION}, 2); return;
+        }
+        automaticLocation = !updateRoute;
         android.location.LocationManager manager = (android.location.LocationManager) getSystemService(LOCATION_SERVICE);
         boolean precise = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
         String provider = precise && manager.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER) ? android.location.LocationManager.GPS_PROVIDER : android.location.LocationManager.NETWORK_PROVIDER;
-        if (!manager.isProviderEnabled(provider)) { new AlertDialog.Builder(this).setTitle("请开启系统定位").setMessage("定位只会在你主动更新路线时使用。")
+        if (!manager.isProviderEnabled(provider)) {
+            if (!updateRoute) { locationFailed("系统定位未开启，可报城市查天气，或在系统设置开启定位"); return; }
+            new AlertDialog.Builder(this).setTitle("请开启系统定位").setMessage("用于查询当地天气、附近地点和路线。")
             .setNegativeButton("取消", null).setPositiveButton("打开定位设置", (d, w) -> startActivity(new Intent(android.provider.Settings.ACTION_LOCATION_SOURCE_SETTINGS))).show(); return; }
         lastNotice = "正在获取当前位置…"; updateStatus();
+        final ApiClient locationApi = api;
+        final String locationToken = api.vault.token();
         locationListener = new android.location.LocationListener() {
             @Override public void onLocationChanged(android.location.Location location) {
+                if (locationListener != this || api != locationApi || !locationToken.equals(api.vault.token())) return;
+                long age = android.os.SystemClock.elapsedRealtimeNanos() - location.getElapsedRealtimeNanos();
+                if (age < 0 || age > 60000000000L || !location.hasAccuracy() || location.getAccuracy() > 200) return;
                 stopLocation(); if (!visible) return;
                 JSONObject point = json("longitude", location.getLongitude(), "latitude", location.getLatitude(), "accuracy", location.getAccuracy(), "source", "gps"); if (location.hasSpeed()) put(point, "speed", location.getSpeed());
                 JSONObject payload = cloneJson(settings()); put(payload, "mode", "commute"); put(payload, "auto_mode", false);
-                request(() -> { api.json("PUT", "/v1/settings", payload); api.json("POST", "/v1/location", point); return api.json("GET", "/v1/state", null); }, r -> { state = r; lastNotice = "定位已更新 · 位置精度约 " + Math.round(location.getAccuracy()) + " m"; showApp(); });
+                request(() -> {
+                    if (updateRoute) locationApi.json("PUT", "/v1/settings", payload);
+                    locationApi.json("POST", "/v1/location", point);
+                    return locationApi.json("GET", "/v1/state", null);
+                }, r -> {
+                    if (api != locationApi || !locationToken.equals(api.vault.token())) return;
+                    state = r; lastNotice = "定位已更新 · 可查询当地天气与附近地点"; showApp();
+                });
             }
             @Override public void onProviderEnabled(String p) {}
             @Override public void onProviderDisabled(String p) {}
             @Override public void onStatusChanged(String p, int status, Bundle extras) {}
         };
         try { manager.requestLocationUpdates(provider, 0, 0, locationListener, android.os.Looper.getMainLooper()); handler.postDelayed(locationTimeout, 25000); }
-        catch (Exception e) { stopLocation(); showError("无法获取位置，请检查定位权限与系统设置"); }
+        catch (Exception e) { locationFailed("无法获取位置，可报城市查天气，或检查定位权限与系统设置"); }
     }
     private void stopLocation() { handler.removeCallbacks(locationTimeout); if (locationListener != null) { try { ((android.location.LocationManager) getSystemService(LOCATION_SERVICE)).removeUpdates(locationListener); } catch (Exception ignored) {} locationListener = null; } }
 
     private void profile() {
         pageHeading("我的");
-        LinearLayout account = card(page); account.setBackground(shape(SOFT, 28, SOFT));
+        LinearLayout account = featureCard(page, SOFT);
         LinearLayout identity = row(); identity.setGravity(Gravity.CENTER_VERTICAL); account.addView(identity);
         TextView initial = label(identity, api.vault.username().isEmpty() ? "A" : api.vault.username().substring(0, 1).toUpperCase(Locale.ROOT), 26, BG);
-        initial.setGravity(Gravity.CENTER); initial.setBackground(shape(TEAL, 22, TEAL)); initial.setLayoutParams(new LinearLayout.LayoutParams(dp(60), dp(60)));
+        initial.setGravity(Gravity.CENTER); initial.setBackground(shape(INK, 30, INK)); initial.setLayoutParams(new LinearLayout.LayoutParams(dp(60), dp(60)));
         LinearLayout identityText = column(); identityText.setPadding(dp(16), 0, 0, 0); identity.addView(identityText, new LinearLayout.LayoutParams(0, -2, 1));
         label(identityText, fallback(api.vault.username(), "你的空间"), 22, INK);
+        label(identityText, "每一点偏好，都是独一无二的你。", 12, MUTED);
+        sectionHeader(page, "设备与陪伴", "按你的习惯来", "", null);
         LinearLayout device = card(page); label(device, "耳机与音频", 17, INK);
-        headsetStatus = label(device, "", 12, TEAL); renderHeadset();
+        headsetStatus = label(device, "", 12, ACCENT); renderHeadset();
         button(device, "设备详情", false, this::showDeviceDetails);
-        LinearLayout settings = disclosure(page, "陪伴偏好", "", false);
-        EditText name = field(settings, "助手称呼", "你想怎么称呼聆", false, 40); name.setText(settings().optString("name", "小聆"));
+        LinearLayout settings = disclosure(page, "陪伴偏好", "日常习惯与聆听方式", false);
         EditText preferences = field(settings, "关于你的偏好", "喜欢什么、如何与你交流…", false, 2000); preferences.setMinLines(2); preferences.setText(settings().optString("preferences"));
-        CheckBox retain = new CheckBox(this); retain.setText("保存转写与对话历史"); retain.setTextColor(INK); retain.setTextSize(13); retain.setButtonTintList(android.content.res.ColorStateList.valueOf(TEAL)); retain.setChecked(settings().optBoolean("retain_transcripts", true)); settings.addView(retain);
-        label(settings, "关闭后不新增转写历史；仍可能自动提取记忆并保存请求结果，已有数据也会保留。需要移除账号业务数据请使用清空数据。", 11, MUTED);
-        CheckBox autoMode = new CheckBox(this); autoMode.setText("按工作时间自动切换模式"); autoMode.setTextColor(INK); autoMode.setTextSize(13); autoMode.setButtonTintList(android.content.res.ColorStateList.valueOf(TEAL)); autoMode.setChecked(settings().optBoolean("auto_mode", false)); settings.addView(autoMode);
+        CheckBox retain = new CheckBox(this); retain.setText("保存转写与对话历史"); retain.setTextColor(INK); retain.setTextSize(13); retain.setButtonTintList(android.content.res.ColorStateList.valueOf(ACCENT)); retain.setChecked(settings().optBoolean("retain_transcripts", true)); settings.addView(retain);
+        label(settings, "关闭后不新增聊天转写历史；明确开始的工作记录仍保存转写。仍可能自动提取记忆并保存请求结果，已有数据也会保留。需要移除账号业务数据请使用清空数据。", 11, MUTED);
         LinearLayout hours = row(); settings.addView(hours); EditText start = input("上班小时", false, 2), end = input("下班小时", false, 2); start.setInputType(InputType.TYPE_CLASS_NUMBER); end.setInputType(InputType.TYPE_CLASS_NUMBER); start.setText(String.valueOf(settings().optInt("work_start", 9))); end.setText(String.valueOf(settings().optInt("work_end", 18))); hours.addView(start, new LinearLayout.LayoutParams(0, -2, 1)); hours.addView(end, new LinearLayout.LayoutParams(0, -2, 1));
-        label(settings, "自动模式按以上小时及下方时区判断；手动切换会关闭自动模式。", 11, MUTED);
         EditText zone = field(settings, "时区", "例如 Asia/Shanghai", false, 80); zone.setText(settings().optString("timezone", "Asia/Shanghai"));
         label(settings, "前台聆听设置", 15, INK);
         EditText interval = field(settings, "定时聆听间隔（秒）", "60–3600，默认 300", false, 4); interval.setInputType(InputType.TYPE_CLASS_NUMBER); interval.setText(String.valueOf(settings().optInt("life_poll_seconds", 300)));
         EditText duration = field(settings, "定时单次最长录音（秒）", "5–60，默认 30", false, 2); duration.setInputType(InputType.TYPE_CLASS_NUMBER); duration.setText(String.valueOf(settings().optInt("listen_seconds", 30)));
         EditText threshold = field(settings, "语音检测阈值", "0.005–0.2，默认 0.025", false, 5); threshold.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL); threshold.setText(String.valueOf(settings().optDouble("vad_threshold", .025)));
-        label(settings, "阈值越低越敏感。定时或连续聆听都需要在对话页主动开始；锁屏、离开页面即停止。", 11, MUTED);
+        label(settings, "阈值越低越敏感。AI 通话始终自动停句；开启通知会话后可锁屏继续。定时和安静记录只在前台运行。", 11, MUTED);
         button(settings, "保存偏好", true, () -> {
-            if (!canAct()) return; if (value(name).isEmpty()) { name.setError("称呼不能为空"); return; }
-            JSONObject payload = cloneJson(settings()); put(payload, "name", value(name)); put(payload, "preferences", value(preferences)); put(payload, "retain_transcripts", retain.isChecked());
-            int from, until; try { from = Integer.parseInt(value(start)); until = Integer.parseInt(value(end)); } catch (Exception e) { toast("请输入有效的工作时间"); return; }
-            if (from < 0 || until > 24 || until <= from) { toast("工作时间需要在 0–24 时内，结束晚于开始"); return; }
-            put(payload, "work_start", from); put(payload, "work_end", until); put(payload, "auto_mode", autoMode.isChecked()); put(payload, "timezone", value(zone));
+            if (!canAct()) return;
+            JSONObject payload = cloneJson(settings()); put(payload, "preferences", value(preferences)); put(payload, "retain_transcripts", retain.isChecked());
+            int from, until; try { from = Integer.parseInt(value(start)); until = Integer.parseInt(value(end)); } catch (Exception e) { feedback("请输入有效的工作时间", LocalCue.SETTINGS); return; }
+            if (from < 0 || until > 24 || until <= from) { feedback("工作时间需要在 0–24 时内，结束晚于开始", LocalCue.SETTINGS); return; }
+            put(payload, "work_start", from); put(payload, "work_end", until); put(payload, "auto_mode", false); put(payload, "timezone", value(zone));
             try { int every = Integer.parseInt(value(interval)), seconds = Integer.parseInt(value(duration)); double level = Double.parseDouble(value(threshold));
                 if (every < 60 || every > 3600 || seconds < 5 || seconds > 60 || level < .005 || level > .2) throw new IllegalArgumentException();
                 put(payload, "life_poll_seconds", every); put(payload, "listen_seconds", seconds); put(payload, "vad_threshold", level);
-            } catch (Exception e) { toast("请检查聆听间隔、录音时长和检测阈值的范围"); return; }
+            } catch (Exception e) { feedback("请检查聆听间隔、录音时长和检测阈值的范围", LocalCue.SETTINGS); return; }
             mutate("PUT", "/v1/settings", payload);
         });
-        LinearLayout privacy = disclosure(page, "账号与隐私", "", false);
+        LinearLayout privacy = disclosure(page, "账号与隐私", "密码、数据导出与管理", false);
         button(privacy, "修改登录密码   ›", false, this::changePassword);
         button(privacy, "导出我的数据   ↗", false, this::export);
         button(privacy, "数据处理说明   ›", false, this::privacyInfo);
@@ -758,14 +1101,14 @@ public final class MainActivity extends Activity {
 
     private void changePassword() {
         if (!canAct()) return;
-        LinearLayout body = dialogBody(); EditText old = field(body, "原密码", "当前密码", true, 128), next = field(body, "新密码", "至少 8 位", true, 128), confirm = field(body, "确认新密码", "再输入一次", true, 128);
+        LinearLayout body = dialogBody(); EditText old = field(body, "原密码", "当前密码", true, 128), next = field(body, "新密码", "填一个好记的密码即可", true, 128), confirm = field(body, "确认新密码", "再输入一次", true, 128);
         AlertDialog dialog = new AlertDialog.Builder(this).setTitle("修改密码").setView(body).setNegativeButton("取消", null).setPositiveButton("保存", null).create();
         dialog.setOnShowListener(v -> dialog.getButton(-1).setOnClickListener(w -> {
             if (!canAct()) return;
-            String pass = next.getText().toString(); if (pass.length() < 8) { next.setError("密码至少 8 位"); return; }
+            String pass = next.getText().toString(); if (pass.isEmpty()) { next.setError("请输入新密码"); return; }
             if (!pass.equals(confirm.getText().toString())) { confirm.setError("两次密码不一致"); return; }
             request(() -> api.json("PUT", "/auth/password", json("old_password", old.getText().toString(), "new_password", pass)), r -> {
-                api.vault.save(r.getString("token"), api.vault.username()); dialog.dismiss(); toast("密码已更新，其他登录已失效");
+                api.vault.save(r.getString("token"), api.vault.username()); dialog.dismiss(); feedback("密码已更新，其他登录已失效", LocalCue.PASSWORD);
             });
         })); dialog.show();
     }
@@ -797,11 +1140,11 @@ public final class MainActivity extends Activity {
         byte[] payload = exportData; exportData = null;
         if (result != RESULT_OK || data == null || payload == null) return;
         Uri uri = data.getData();
-        worker.execute(() -> { try (OutputStream output = getContentResolver().openOutputStream(uri)) { if (output == null) throw new Exception("文件无法写入"); output.write(payload); runOnUiThread(() -> toast("数据已导出")); } catch (Exception e) { runOnUiThread(() -> showError("导出失败，请选择其他保存位置")); } });
+        worker.execute(() -> { try (OutputStream output = getContentResolver().openOutputStream(uri)) { if (output == null) throw new Exception("文件无法写入"); output.write(payload); runOnUiThread(() -> feedback("数据已导出", LocalCue.EXPORTED)); } catch (Exception e) { runOnUiThread(() -> showError("导出失败，请选择其他保存位置")); } });
     }
 
     private void privacyInfo() {
-        new AlertDialog.Builder(this).setTitle("数据处理说明").setMessage("Aidol 测试版由测试负责人运营。\n\n账号使用唯一用户名和密码登录，无需邮箱或手机号。忘记密码时需使用注册时保存的恢复码。\n\n仅在你点击开始录音后采集麦克风，每次最多 60 秒。录音上传服务器用于语音识别；文字发送 AI 服务生成回复与记忆；回复可转换为语音播放。原始录音不保存到账号数据库。\n\n对话、偏好、记忆和会议待办按账号存储在服务器。你可以关闭新的转写保存、导出、清空数据或注销账号。测试负责人可管理服务器及备份。\n\n录制他人讲话前，请先征得对方同意。AI 回复与纪要需要自行核对。\n\n账号密钥保存在设备加密存储中；服务商 API Key 不下发到手机。").setPositiveButton("了解", null).show();
+        new AlertDialog.Builder(this).setTitle("数据处理说明").setMessage("Aidol 测试版由测试负责人运营。\n\n账号使用唯一用户名和密码登录，无需邮箱或手机号。忘记密码时需使用注册时保存的恢复码。\n\n在你点击或通过耳机接通 AI 后采集麦克风，每句最多 60 秒；AI 通话会在回复后继续听，挂断即可停止。录音上传服务器用于语音识别；文字发送 AI 服务生成回复与记忆；回复可转换为语音播放。原始录音不保存到账号数据库。\n\n对话、偏好、记忆和会议待办按账号存储在服务器。你可以关闭新的转写保存、导出、清空数据或注销账号。测试负责人可管理服务器及备份。\n\n录制他人讲话前，请先征得对方同意。AI 回复与纪要需要自行核对。\n\n账号密钥保存在设备加密存储中；服务商 API Key 不下发到手机。").setPositiveButton("了解", null).show();
     }
 
     private void showSources(JSONArray sources) {
@@ -810,17 +1153,21 @@ public final class MainActivity extends Activity {
     private void showSources(String title, JSONArray sources) {
         LinearLayout body = dialogBody();
         if (sources.length() == 0) label(body, "暂无原始记录", 14, MUTED);
-        for (int i = 0; i < sources.length(); i++) { JSONObject source = sources.optJSONObject(i); if (source != null) { label(body, date(source.optString("created_at")), 10, TEAL); label(body, source.optString("text"), 14, INK); } }
+        for (int i = 0; i < sources.length(); i++) { JSONObject source = sources.optJSONObject(i); if (source != null) { label(body, date(source.optString("created_at")), 10, ACCENT); label(body, source.optString("text"), 14, INK); } }
         scrollDialog(title, body);
     }
 
     private void changeMode(String mode) { changeMode(mode, false); }
     private void changeMode(String mode, boolean openConversation) {
-        if (busy || locationListener != null || permissionPending) { toast("上一项操作正在进行，请稍后切换模式"); return; }
-        if (session != null) {
+        if (busy || locationListener != null || permissionPending) { feedback("上一项操作正在进行，请稍后切换模式", LocalCue.BUSY); return; }
+        clearVoicePreparation(); preparationAttemptAt = -60000;
+        if (session != null && sessionOperationNotice != null) cancelSession("");
+        if (session != null && "work".equals(mode()) && sessionUsesCapture) {
             deferredMode = mode; deferredOpenConversation = openConversation;
-            headsetNotice("本轮结束后切换" + modeName(mode) + "；当前录音会保留"); return;
+            stopRepeat(); session.stopRecording();
+            lastNotice = "正在结束并保存工作记录，保存成功后切换"; updateStatus(); return;
         }
+        if (session != null || repeatArmed || callStartPending) cancelSession("会话已结束");
         stopRepeat(); clearHeadsetGesture();
         JSONObject body = cloneJson(settings()); put(body, "mode", mode); put(body, "auto_mode", false);
         ModeChangeRetry change = new ModeChangeRetry(mode, api, sessionGeneration, android.os.SystemClock.elapsedRealtime());
@@ -838,6 +1185,7 @@ public final class MainActivity extends Activity {
     }
     private void abandonModeChange(ModeChangeRetry change) {
         if (modeChange != change) return;
+        stopRepeat();
         finishModeChange(change);
         if (!isDestroyed()) {
             lastNotice = "模式切换已停止，请刷新确认当前模式"; updateStatus();
@@ -849,6 +1197,7 @@ public final class MainActivity extends Activity {
         // A scheduled retry follows a confirmed rejection: there is no update to wait for.
         // An in-flight request may already have applied, so let its existing response finish.
         if (modeChangeDelay != null) {
+            stopRepeat();
             finishModeChange(modeChange);
             lastNotice = "模式尚未切换，请稍后重新选择"; updateStatus();
         }
@@ -870,9 +1219,11 @@ public final class MainActivity extends Activity {
                     put(agent, "mode", appliedMode); put(state, "agent", agent);
                     diagnosticError = "无";
                     String appliedNotice = "已切换" + modeName(appliedMode);
-                    lastNotice = appliedNotice + "；等待你手动开始";
+                    lastNotice = appliedNotice + (repeatArmed ? "；提示后继续聆听" : "；等待你手动开始");
+                    listenMode = "work".equals(appliedMode) ? VoiceInteraction.NOTES : VoiceInteraction.CALL;
                     if (openConversation) tab = 0;
-                    showApp(); if (visible) toast(lastNotice);
+                    showApp();
+
                     // Commit the real settings result first. Playback cannot undo or repeat that update.
                     if (sessionAvailable() && client == api && change.matches(api, sessionGeneration) && session == null) {
                         try {
@@ -897,6 +1248,7 @@ public final class MainActivity extends Activity {
                     return;
                 }
                 finishModeChange(change);
+                stopRepeat();
                 if (statusCode == 401) client.vault.clear();
                 lastNotice = statusCode == 409 ? "上一轮仍在处理，模式尚未切换；请稍后再试"
                     : statusCode == 401 ? "登录已失效，请重新登录"
@@ -914,7 +1266,13 @@ public final class MainActivity extends Activity {
     }); }
     private void refresh() {
         if (busy || session != null || api.vault.token().isEmpty()) return;
-        request(() -> api.json("GET", "/v1/state", null), r -> { state = r; showApp(); });
+        // Background state sync must not erase the reason a voice turn just failed.
+        // The explicit refresh button clears lastNotice before calling this method.
+        final String notice = lastNotice;
+        request(() -> api.json("GET", "/v1/state", null), r -> {
+            state = r; lastNotice = notice; showApp();
+            handler.post(startupLocationTick);
+        });
     }
     private void request(Job job, Result result) {
         if (busy) return; busy = true; updateStatus();
@@ -922,11 +1280,11 @@ public final class MainActivity extends Activity {
             try { JSONObject value = job.run(); runOnUiThread(() -> {
                 busy = false; if (isDestroyed()) return; lastNotice = ""; updateStatus();
                 try { result.accept(value); } catch (Exception e) { showError("操作未完成，请稍后重试"); }
-            }); } catch (Exception e) { runOnUiThread(() -> { busy = false; if (!isDestroyed()) { lastNotice = fallback(e.getMessage(), "无法连接服务器，请检查网络后重试"); diagnosticError = lastNotice; renderDiagnostics(); updateStatus(); showError(lastNotice); } }); }
+            }); } catch (Exception e) { runOnUiThread(() -> { busy = false; if (!isDestroyed()) { lastNotice = fallback(e.getMessage(), "无法连接服务器，请检查网络后重试"); diagnosticError = lastNotice; renderDiagnostics(); updateStatus(); if (!(e instanceof ApiClient.ApiException) || ((ApiClient.ApiException) e).status != 409) showError(lastNotice); } }); }
         });
     }
-    private void signOut() { chatDraft = ""; stopLockScreenSession(); cancelSession(""); clearPrivateSnapshots(); api.vault.clear(); syncHeadsetControls(); state = new JSONObject(); lastNotice = ""; showAuth(0); }
-    private boolean canAct() { if (busy || session != null || locationListener != null) { toast("上一项操作正在进行，请稍候"); return false; } return true; }
+    private void signOut() { clearVoicePreparation(); preparationAttemptAt = -60000; if (quickFeedback != null) quickFeedback.stop(); chatDraft = ""; stopLockScreenSession(); cancelSession(""); clearPrivateSnapshots(); api.vault.clear(); syncHeadsetControls(); state = new JSONObject(); lastNotice = ""; showAuth(0); }
+    private boolean canAct() { if (busy || session != null || locationListener != null) { feedback("上一项操作正在进行，请稍候", LocalCue.BUSY); return false; } return true; }
 
     private boolean lockScreenEnabled() { return voiceService != null && voiceService.enabled(); }
     private boolean sessionAvailable() { return visible || lockScreenEnabled(); }
@@ -939,23 +1297,23 @@ public final class MainActivity extends Activity {
         android.app.NotificationManager notifications = getSystemService(android.app.NotificationManager.class);
         android.app.NotificationChannel channel = notifications.getNotificationChannel("headset_session");
         if (!notifications.areNotificationsEnabled() || channel != null && channel.getImportance() == android.app.NotificationManager.IMPORTANCE_NONE) {
-            toast("请先在系统设置开启通知，以便随时停止锁屏耳机会话"); return;
+            feedback("请先在系统设置开启通知，以便随时停止锁屏耳机会话", LocalCue.NOTIFICATIONS); return;
         }
         android.media.AudioManager audio = getSystemService(android.media.AudioManager.class);
         if (audio.getMode() == android.media.AudioManager.MODE_IN_CALL || audio.getMode() == android.media.AudioManager.MODE_IN_COMMUNICATION
-            || headset.snapshot().inCall) { toast("通话期间不能开启锁屏耳机会话"); return; }
+            || headset.snapshot().inCall) { feedback("通话期间不能开启锁屏耳机会话", LocalCue.CALL); return; }
         if (development.audioMode() == AudioMode.RISE_SDK && !headset.snapshot().ready()) {
-            toast("请先连接耳机，显示就绪后再开启"); return;
+            feedback("请先连接耳机，显示就绪后再开启", LocalCue.CONNECT); return;
         }
         stopRepeat();
         Intent service = new Intent(this, VoiceSessionService.class);
         try {
             startForegroundService(service);
             voiceServiceBound = bindService(service, voiceConnection, BIND_AUTO_CREATE);
-            if (!voiceServiceBound) { stopService(service); toast("锁屏会话未能开启，请重试"); }
+            if (!voiceServiceBound) { stopService(service); feedback("锁屏会话未能开启，请重试", LocalCue.RETRY); }
         } catch (RuntimeException unavailable) {
             disconnectVoiceService(); stopService(service);
-            toast("系统未允许开启锁屏会话，请保持 App 前台并检查权限");
+            feedback("系统未允许开启锁屏会话，请保持 App 前台并检查权限", LocalCue.PERMISSION);
         }
     }
     private void disconnectVoiceService() {
@@ -963,35 +1321,76 @@ public final class MainActivity extends Activity {
         if (voiceServiceBound) { voiceServiceBound = false; unbindService(voiceConnection); }
     }
     private void stopLockScreenSession() {
+        callStartPending = false;
         if (voiceService != null) voiceService.stopSession("锁屏耳机会话已停止；下一次请手动开启");
         disconnectVoiceService();
         stopService(new Intent(this, VoiceSessionService.class));
         syncHeadsetControls();
     }
 
+    private void toggleVoice() {
+        if (session != null && sessionOperationNotice != null) { cancelSession(""); startVoice(); return; }
+        if (session != null || repeatArmed || callStartPending) endVoice(); else startVoice();
+    }
+    private void endVoice() {
+        if ("work".equals(mode()) && session != null && sessionUsesCapture) {
+            stopRepeat(); session.stopRecording(); lastNotice = "正在结束并保存工作记录…"; updateStatus();
+            if (visible && tab != 2) { tab = 2; showApp(); }
+            renderWorkMeetings();
+        } else cancelSession("会话已结束，单击可重新开始");
+    }
     private void startVoice() {
+        listenMode = "work".equals(mode()) ? VoiceInteraction.NOTES : VoiceInteraction.CALL;
+        if (listenMode == VoiceInteraction.CALL && (state.optJSONObject("capabilities") == null
+                || !state.optJSONObject("capabilities").optBoolean("voice_realtime"))) {
+            stopRepeat(); feedback("千问实时语音当前不可用，请配置后端并刷新连接状态后重试", LocalCue.RETRY); return;
+        }
         if (!sessionAvailable() || permissionPending || !canAct()) return;
+        if (!VoiceInteraction.allowed(listenMode, mode())) {
+            stopRepeat(); headsetNotice(InteractionCopy.name(listenMode) + "不适用于" + modeName(mode()) + "，请重新选择通话与记录方式"); return;
+        }
+        if (listenMode == VoiceInteraction.NOTES && (state.optJSONObject("capabilities") == null
+                || !state.optJSONObject("capabilities").optBoolean("asr"))) {
+            stopRepeat(); feedback("工作录音转写当前不可用，请配置后端语音识别后重试", LocalCue.RETRY); return;
+        }
+        if (listenMode == VoiceInteraction.NOTES && !state.optJSONObject("capabilities").optBoolean("work_meetings")) {
+            stopRepeat(); feedback("服务器尚未支持独立会议记录，请更新后端并刷新后再开始", LocalCue.RETRY); return;
+        }
         int audioState = getSystemService(android.media.AudioManager.class).getMode();
         if (audioState == android.media.AudioManager.MODE_IN_CALL || audioState == android.media.AudioManager.MODE_IN_COMMUNICATION
             || audioState == android.media.AudioManager.MODE_RINGTONE) {
-            stopRepeat(); stopLockScreenSession(); headsetNotice("来电或通话期间不能开启 AI 录音"); return;
+            stopRepeat(); stopLockScreenSession(); headsetNotice("来电或手机通话结束后再接通 AI"); return;
         }
         if (development.audioMode() == AudioMode.RISE_SDK) {
             HeadsetController.Snapshot snapshot = headset.snapshot();
-            if (snapshot.inCall) { stopRepeat(); toast("通话期间不能开启 AI 录音"); return; }
-            if (Boolean.FALSE.equals(snapshot.leftWorn) && Boolean.FALSE.equals(snapshot.rightWorn)) {
-                stopRepeat(); toast("耳机当前未佩戴，请佩戴后再开始"); return;
+            if (snapshot.inCall) { stopRepeat(); feedback("手机通话结束后再接通 AI", LocalCue.CALL); return; }
+            if (WearState.from(snapshot.leftWorn, snapshot.rightWorn) == WearState.REMOVED) {
+                stopRepeat(); feedback("耳机当前未佩戴，请佩戴后再开始", LocalCue.WEAR); return;
             }
         }
         ArrayList<String> missing = audioPermissions(development.audioMode() == AudioMode.RISE_SDK);
+        if (visible && listenMode == VoiceInteraction.CALL && Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                && !getSharedPreferences("headset_controls", MODE_PRIVATE).getBoolean("notification_asked", false)) {
+            missing.add(Manifest.permission.POST_NOTIFICATIONS);
+            getSharedPreferences("headset_controls", MODE_PRIVATE).edit().putBoolean("notification_asked", true).apply();
+        }
         if (!missing.isEmpty()) {
             if (!visible) { stopLockScreenSession(); return; }
-            permissionPending = true; requestPermissions(missing.toArray(new String[0]), 1); return;
+            permissionPending = true; audioPermissionGeneration = sessionGeneration;
+            requestPermissions(missing.toArray(new String[0]), 1); return;
         }
         if (development.audioMode() == AudioMode.RISE_SDK && !headset.snapshot().ready()) {
-            stopRepeat(); showDeviceDetails(); toast("请先连接耳机，显示就绪后再点击开始"); return;
+            stopRepeat(); showDeviceDetails(); feedback("请先连接耳机，显示就绪后再点击开始", LocalCue.CONNECT); return;
         }
-        repeatArmed = listenMode != 0; handler.removeCallbacks(repeatTick); hideKeyboard(); startSession(null);
+        if (visible && listenMode == VoiceInteraction.CALL && !lockScreenEnabled() && !voiceServiceBound
+                && getSystemService(android.app.NotificationManager.class).areNotificationsEnabled()) {
+            callStartPending = true; enableLockScreenSession();
+            if (voiceServiceBound) { lastNotice = "正在接通 AI…"; updateStatus(); return; }
+            callStartPending = false;
+        }
+        continuingCall = repeatArmed;
+        repeatArmed = listenMode == VoiceInteraction.CALL; handler.removeCallbacks(repeatTick); hideKeyboard(); startSession(null);
     }
     private ArrayList<String> audioPermissions(boolean rise) {
         ArrayList<String> missing = new ArrayList<>();
@@ -1002,26 +1401,40 @@ public final class MainActivity extends Activity {
         } else if (rise && checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) missing.add(Manifest.permission.ACCESS_FINE_LOCATION);
         return missing;
     }
-    private void startSession(String text) { if (text != null) stopRepeat(); newSession(); lastBusinessRequestId = session.requestId(); uncertainTurnId = ""; renderTurnDetails(); sessionUsesCapture = text == null; if (text == null) {
-        session.streaming(state.optJSONObject("capabilities") != null && state.optJSONObject("capabilities").optBoolean("voice_stream"),
+    private void startSession(String text) { if (text != null) { stopRepeat(); clearVoicePreparation(); } newSession(); lastBusinessRequestId = session.requestId(); uncertainTurnId = ""; renderTurnDetails(); sessionUsesCapture = text == null; if (text == null) {
+        boolean qwen = VoiceInteraction.directed(listenMode) && state.optJSONObject("capabilities") != null
+            && state.optJSONObject("capabilities").optBoolean("voice_realtime");
+        session.qwenRealtime(qwen);
+        if (qwen && listenMode == VoiceInteraction.CALL && voicePreparation != null) {
+            if (voicePreparation.claim(api, session)) preparationAttemptAt = -60000;
+            voicePreparation = null;
+            lastBusinessRequestId = session.requestId(); renderTurnDetails();
+        } else clearVoicePreparation();
+        session.workRecording(listenMode == VoiceInteraction.NOTES);
+        session.streaming(qwen || state.optJSONObject("capabilities") != null && state.optJSONObject("capabilities").optBoolean("voice_stream"),
             state.optJSONObject("capabilities") != null && state.optJSONObject("capabilities").optBoolean("speech_stream"));
-        session.interactionSource(listenMode == 0).configure(listenMode == 2 ? settings().optInt("listen_seconds", 30) : 60,
-            settings().optBoolean("vad_enabled", true) && !"work".equals(mode()), settings().optDouble("vad_threshold", .025)); session.start();
+        session.interactionSource(VoiceInteraction.source(listenMode)).configure(listenMode == 2 ? settings().optInt("listen_seconds", 30) : 60,
+            VoiceInteraction.endpoint(listenMode, settings().optBoolean("vad_enabled", true)), settings().optDouble("vad_threshold", .025))
+            .callExperience(VoiceInteraction.directed(listenMode), !continuingCall,
+                qwen || state.optJSONObject("capabilities") != null && state.optJSONObject("capabilities").optBoolean("voice_reply_stream")); session.start();
     } else { lastUser = text;
         session.streaming(false, state.optJSONObject("capabilities") != null && state.optJSONObject("capabilities").optBoolean("speech_stream"));
         session.startText(text); } }
     private void newSession() { newSession(null); }
     private void newSession(String operationNotice) {
+        if (quickFeedback != null) quickFeedback.stop();
         final boolean operationCue = operationNotice != null;
         final long generation = ++sessionGeneration;
+        final int submittedInteraction = listenMode;
         sessionUsesCapture = false; sessionIsReplay = operationCue; sessionOperationNotice = operationNotice;
         turnSucceeded = operationCue; turnHasResult = false; recording = false;
-        lastNotice = operationCue ? operationNotice + "；正在播放操作提示" : "正在连接…";
+        liveTranscript = ""; liveReplyText = ""; if (liveWords != null && !continuingCall) liveWords.setText("");
+        lastNotice = operationCue ? operationNotice + "；正在播放操作提示" : continuingCall ? "我在，直接说就好" : "正在接通 AI…";
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         diagnosticInput = operationCue ? "操作提示，不采集录音" : "本轮尚未录音";
         diagnosticOutput = "本轮尚未播放"; diagnosticError = "无"; diagnosticRms = 0; diagnosticBytes = 0;
         HostedSession.Listener listener = new HostedSession.Listener() {
-            @Override public void status(String text) { if (!currentSession(generation)) return; lastNotice = operationCue && !text.startsWith(operationNotice) ? operationNotice + "；" + text : text; diagnosticStage = text; renderDiagnostics(); if (text.contains("正在识别") || text.contains("正在思考") || text.contains("正在结束")) { recording = false; if (voiceButton != null) voiceButton.setText("正在处理…"); } setStatusText(lastNotice); }
+            @Override public void status(String text) { if (!currentSession(generation)) return; lastNotice = operationCue && !text.startsWith(operationNotice) ? operationNotice + "；" + text : text; diagnosticStage = text; renderDiagnostics(); setStatusText(lastNotice); }
             @Override public void failure(String text) {
                 if (!currentSession(generation)) return;
                 if (!operationCue && !turnHasResult && session != null && session.requestId().equals(lastBusinessRequestId)) uncertainTurnId = lastBusinessRequestId;
@@ -1031,55 +1444,95 @@ public final class MainActivity extends Activity {
             @Override public void input(String text) { if (!currentSession(generation)) return; diagnosticInput = text; renderDiagnostics(); }
             @Override public void output(String text) { if (!currentSession(generation)) return; diagnosticOutput = text; renderDiagnostics(); }
             @Override public void diagnostic(String text) { if (!currentSession(generation)) return; diagnosticSession = text; renderDiagnostics(); }
+            @Override public void submitted(String id) {
+                if (!currentSession(generation)) return;
+                lastBusinessRequestId = id; turnHasResult = false;
+            }
+            @Override public void meeting(JSONObject value) {
+                if (!currentSession(generation)) return;
+                JSONArray previous = array(state, "work_meetings"), updated = new JSONArray();
+                updated.put(value);
+                for (int i = 0; i < previous.length(); i++) {
+                    JSONObject item = previous.optJSONObject(i);
+                    if (item != null && !item.optString("id").equals(value.optString("id"))) updated.put(item);
+                }
+                put(state, "work_meetings", updated);
+                if (!"recording".equals(value.optString("status"))) {
+                    turnSucceeded = "saved".equals(value.optString("status"));
+                    turnHasResult = true; uncertainTurnId = "";
+                }
+                renderWorkMeetings();
+                if (visible && tab == 2) { handler.removeCallbacks(workMeetingPoll); handler.post(workMeetingPoll); }
+            }
             @Override public void result(JSONObject value) {
                 if (!currentSession(generation) || operationCue) return;
+                if (value.has("meeting_id")) { turnHasResult = true; uncertainTurnId = ""; return; }
                 turnSucceeded = true;
                 acceptBusinessResult(value);
+                if (value.optBoolean("voice_error")) { turnSucceeded = false; stopRepeat(); }
             }
-            @Override public void recording() { if (!currentSession(generation)) return; recording = true; if (voiceButton != null) voiceButton.setText("■  结束并发送"); }
-            @Override public void meter(long bytes, double rms) { if (currentSession(generation)) { diagnosticBytes = bytes; diagnosticRms = rms; renderDiagnostics(); setStatusText(String.format(Locale.CHINA, "正在聆听  %.1f / %d 秒", bytes / 32000.0, listenMode == 2 ? settings().optInt("listen_seconds", 30) : 60)); if (orb != null) orb.level = (float) Math.min(1, rms * 9); } }
+            @Override public void transcript(String text) { if (!currentSession(generation)) return; liveTranscript = text; if (liveWords != null) liveWords.setText(text); }
+            @Override public void reply(String text) { if (!currentSession(generation)) return; liveReplyText = text; recording = false; if (liveWords != null) liveWords.setText(text); if (voiceButton != null) voiceButton.setText("结束会话"); if (callCaption != null) callCaption.setText("正在回答 · 说“小万”可打断 · 单击结束通话"); }
+            @Override public void processing() { if (!currentSession(generation)) return; recording = false; if (voiceButton != null) voiceButton.setText(submittedInteraction == VoiceInteraction.NOTES ? "正在保存…" : "结束会话"); if (callCaption != null) callCaption.setText(submittedInteraction == VoiceInteraction.NOTES ? "正在保存工作记录" : "正在思考 · 单击结束会话"); }
+            @Override public void idle() { if (!currentSession(generation)) return; turnSucceeded = listenMode == VoiceInteraction.CALL; if (!turnSucceeded) stopRepeat(); uncertainTurnId = ""; }
+            @Override public void recording() { if (!currentSession(generation)) return; recording = true; if (voiceButton != null) voiceButton.setText(listenMode == VoiceInteraction.NOTES ? "结束并保存记录" : "结束会话"); if (callCaption != null) callCaption.setText(InteractionCopy.recording(listenMode, settings().optBoolean("vad_enabled", true))); setStatusText("正在听你说…"); }
+            @Override public void meter(long bytes, double rms) { if (currentSession(generation)) { diagnosticBytes = bytes; diagnosticRms = rms; renderDiagnostics(); if (orb != null) orb.level = (float) Math.min(1, rms * 9); } }
             @Override public void done() {
                 if (!currentSession(generation)) return;
+                if (session != null && session.isDuplexCall()) stopRepeat();
+                if (turnSucceeded) headsetPolicy.turnFinished(generation);
                 ++sessionGeneration;
-                if (voiceService != null) voiceService.release(session);
+                if (voiceService != null) voiceService.release(session, repeatArmed && listenMode == VoiceInteraction.CALL && turnSucceeded);
                 session = null; recording = false; sessionOperationNotice = null;
+                if (!turnSucceeded) { deferredMode = null; deferredOpenConversation = false; }
                 if (deferredMode != null) {
                     String nextMode = deferredMode; boolean open = deferredOpenConversation;
                     deferredMode = null; deferredOpenConversation = false;
-                    stopRepeat();
-                    getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                    if (voiceButton != null) voiceButton.setText("开始说话");
-                    if (cancelButton != null) cancelButton.setVisibility(View.GONE);
+                    if (busy || permissionPending || locationListener != null) {
+                        stopRepeat(); lastNotice = "另一项操作尚未完成，场景未切换；请完成后重新接通"; updateStatus(); return;
+                    }
                     changeMode(nextMode, open); return;
                 }
                 if (!isDestroyed()) {
                     if (operationCue) {
-                        stopRepeat();
-                        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                        if (voiceButton != null) voiceButton.setText("开始说话");
-                        if (cancelButton != null) cancelButton.setVisibility(View.GONE);
+                        boolean resume = repeatArmed && turnSucceeded && sessionAvailable();
+                        if (!resume) stopRepeat();
+                        if (voiceButton != null) voiceButton.setText(InteractionCopy.start(listenMode));
+                        if (cancelButton != null) cancelButton.setVisibility(resume ? View.VISIBLE : View.GONE);
                         if (orb != null) orb.level = 0;
-                        if (turnSucceeded) lastNotice = operationNotice + "；等待你手动开始";
+                        if (turnSucceeded) lastNotice = operationNotice + (resume ? "；继续聆听" : "；等待你手动开始");
+                        if (resume) scheduleNextTurn();
                         updateStatus();
-                        return; // Local operation cues do not refresh business data or start another recording.
+                        return; // Resume only the call already active before this mode change.
                     }
-                    if (!turnSucceeded || !visible || (listenMode == 2 && !"life".equals(mode()))) stopRepeat();
-                    if (repeatArmed) { repeatAt = android.os.SystemClock.elapsedRealtime() + (listenMode == 2 ? settings().optInt("life_poll_seconds", 300) * 1000L : 1000); handler.removeCallbacks(repeatTick); handler.postDelayed(repeatTick, 1000); }
+                    if (!turnSucceeded || !sessionAvailable() || (!visible && listenMode != VoiceInteraction.CALL) || (listenMode == 2 && !"life".equals(mode()))) stopRepeat();
+                    if (repeatArmed) scheduleNextTurn();
                     else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                    if (voiceButton != null) voiceButton.setText("开始说话"); if (cancelButton != null) cancelButton.setVisibility(repeatArmed ? View.VISIBLE : View.GONE); if (orb != null) orb.level = 0;
-                    if (api.vault.token().isEmpty()) { showAuth(0); authError.setText("登录已失效，请重新登录"); } else { updateStatus(); if (visible) refresh(); }
+                    if (voiceButton != null) voiceButton.setText(InteractionCopy.start(listenMode)); if (cancelButton != null) cancelButton.setVisibility(repeatArmed ? View.VISIBLE : View.GONE); if (orb != null) orb.level = 0;
+                    if (api.vault.token().isEmpty()) { showAuth(0); authError.setText("登录已失效，请重新登录"); } else {
+                        if (visible && submittedInteraction == VoiceInteraction.NOTES && !operationCue) { tab = 2; showApp(); }
+                        updateStatus(); if (visible && !repeatArmed) refresh();
+                    }
                 }
             }
         };
         AudioMode input = development.audioMode();
-        if (input == AudioMode.RISE_SDK) session = new HostedSession(this, api, input, new VendorCaptureSource(headset), headset::matchesOutput, listener);
-        else session = new HostedSession(this, api, input, listener);
+        session = new HostedSession(this, api, AudioMode.RISE_SDK, new VendorCaptureSource(headset, !operationCue), headset::matchesOutput, listener);
         if (lockScreenEnabled()) voiceService.own(session);
         if (voiceButton != null) voiceButton.setText(operationCue ? "正在播放操作提示…" : "正在准备…"); if (cancelButton != null) cancelButton.setVisibility(View.VISIBLE); updateStatus();
     }
     private boolean currentSession(long generation) { return !isDestroyed() && generation == sessionGeneration; }
     private boolean hasHeadsetBoundSession() { return session != null && (sessionUsesCapture || sessionIsReplay); }
+    private void scheduleNextTurn() {
+        long delay = VoiceInteraction.nextDelay(listenMode, settings().optInt("life_poll_seconds", 300));
+        if (headsetPolicy.hasPending()) delay = Math.max(delay, headsetPolicy.pendingDelay(android.os.SystemClock.elapsedRealtime()) + 1);
+        repeatAt = android.os.SystemClock.elapsedRealtime() + delay;
+        handler.removeCallbacks(repeatTick); handler.postDelayed(repeatTick, delay);
+    }
     private void cancelSession(String reason) {
+        callStartPending = false;
+        audioPermissionGeneration = -1;
+        if (modeChange != null) { modeChange.stopRetrying(); finishModeChange(modeChange); }
         stopRepeat(); clearHeadsetGesture(); ++sessionGeneration;
         deferredMode = null; deferredOpenConversation = false;
         String appliedNotice = sessionOperationNotice; sessionOperationNotice = null;
@@ -1087,7 +1540,7 @@ public final class MainActivity extends Activity {
         if (voiceService != null) voiceService.release(old);
         if (old != null) old.cancel();
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        if (voiceButton != null) voiceButton.setText("开始说话");
+        if (voiceButton != null) voiceButton.setText(InteractionCopy.start(listenMode));
         if (cancelButton != null) cancelButton.setVisibility(View.GONE);
         if (orb != null) orb.level = 0;
         lastNotice = appliedNotice == null ? reason : appliedNotice + "；操作提示已停止";
@@ -1099,14 +1552,25 @@ public final class MainActivity extends Activity {
             permissionPending = false;
             if (grants.length == 0) return;
             for (int grant : grants) if (grant != PackageManager.PERMISSION_GRANTED) {
-                toast("锁屏会话需要麦克风、附近设备与通知权限；仍可使用前台对话"); return;
+                feedback("锁屏会话需要麦克风、附近设备与通知权限；仍可使用前台对话", LocalCue.PERMISSION); return;
             }
             if (visible) enableLockScreenSession();
             return;
         }
-        if (code == 2) { if (grants.length > 0 && (checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED || checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED)) locate(); else toast("定位未授权，可继续使用目的地搜索与天气查询"); return; }
+        if (code == 5) {
+            permissionPending = false;
+            if (hasLocationPermission()) handler.post(startupLocationTick);
+            else { lastNotice = "定位未授权，可直接说城市查天气"; updateStatus(); }
+            return;
+        }
+        if (code == 2) { permissionPending = false; if (grants.length > 0 && hasLocationPermission()) locate(); else feedback("定位未授权，可继续使用目的地搜索与天气查询", LocalCue.PERMISSION); return; }
         if (code != 1 && code != 3) return; permissionPending = false;
-        for (int grant : grants) if (grant != PackageManager.PERMISSION_GRANTED) {
+        if (code == 1) {
+            long requestedGeneration = audioPermissionGeneration; audioPermissionGeneration = -1;
+            if (requestedGeneration < 0 || requestedGeneration != sessionGeneration) return;
+        }
+        for (int i = 0; i < grants.length; i++) if (grants[i] != PackageManager.PERMISSION_GRANTED && !Manifest.permission.POST_NOTIFICATIONS.equals(permissions[i])) {
+            stopRepeat();
             new AlertDialog.Builder(this).setTitle(development.audioMode().requiresBluetooth() ? "需要麦克风与附近设备权限" : "需要麦克风权限").setMessage("用于所选音频模式的采音与播放。你仍然可以使用文字对话；也可在系统设置中开启权限。")
                 .setNegativeButton("使用文字", null).setPositiveButton("打开设置", (d, w) -> startActivity(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getPackageName())))).show(); return;
         }
@@ -1114,18 +1578,25 @@ public final class MainActivity extends Activity {
     }
     @Override protected void onResume() {
         super.onResume(); visible = true; syncHeadsetControls();
+        startupLocationAttempted = false;
+        handler.post(startupLocationTick);
+        prepareVoice();
         if (!pendingHeadsetNotice.isEmpty()) { String notice = pendingHeadsetNotice; pendingHeadsetNotice = ""; headsetNotice(notice); }
         if (orb != null) orb.invalidate();
+        if (tab == 2) { handler.removeCallbacks(workMeetingPoll); handler.post(workMeetingPoll); }
     }
-    private void stopRepeat() { repeatArmed = false; listenMode = 0; handler.removeCallbacks(repeatTick); if (session == null) getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON); }
+    private void stopRepeat() { repeatArmed = false; continuingCall = false; handler.removeCallbacks(repeatTick); if (session == null) getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON); }
     @Override protected void onPause() {
-        visible = false; if (!lockScreenEnabled()) pauseModeChange(); clearHeadsetGesture(); syncHeadsetControls();
-        if (session != null && !lockScreenEnabled()) cancelSession("离开前台，本轮已取消；返回后请手动开始");
-        else stopRepeat();
+        handler.removeCallbacks(startupLocationTick);
+        handler.removeCallbacks(workMeetingPoll);
+        clearVoicePreparation();
+        visible = false; if (quickFeedback != null) quickFeedback.stop(); if (!lockScreenEnabled()) pauseModeChange(); clearHeadsetGesture(); syncHeadsetControls();
+        if ((session != null || repeatArmed) && !lockScreenEnabled()) endVoice();
+        else if (listenMode != VoiceInteraction.CALL && session != null && sessionUsesCapture) endVoice();
         stopLocation(); super.onPause();
     }
-    @Override protected void onDestroy() { if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); super.onDestroy(); }
-    @Override public void onBackPressed() { if (session != null) { cancelSession("本轮已取消"); return; } if (!api.vault.token().isEmpty() && tab != 0) { switchTab(0); return; } if (api.vault.token().isEmpty() && authMode != 0) { showAuth(0); return; } super.onBackPressed(); }
+    @Override protected void onDestroy() { if (quickFeedback != null) quickFeedback.close(); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); super.onDestroy(); }
+    @Override public void onBackPressed() { if (session != null) { endVoice(); return; } if (!api.vault.token().isEmpty() && tab != 0) { switchTab(0); return; } if (api.vault.token().isEmpty() && authMode != 0) { showAuth(0); return; } super.onBackPressed(); }
 
     private void syncHeadsetControls() {
         if (headset == null || development == null || api == null) return;
@@ -1139,8 +1610,9 @@ public final class MainActivity extends Activity {
         HeadsetController.Snapshot snapshot = headset.snapshot();
         return new HeadsetInteractionPolicy.Context(sessionAvailable(), headsetControlsOptIn && development.audioMode() == AudioMode.RISE_SDK
             && snapshot.controlsState == HeadsetController.ControlsState.ENABLED, !api.vault.token().isEmpty(), snapshot.ready(),
-            snapshot.inCall, busy || permissionPending || locationListener != null, session != null || repeatArmed, recording,
-            Boolean.FALSE.equals(snapshot.leftWorn) && Boolean.FALSE.equals(snapshot.rightWorn), mode(), sessionGeneration);
+            snapshot.inCall, busy || permissionPending || locationListener != null, session != null || repeatArmed || callStartPending || modeChange != null || audioPermissionGeneration >= 0, recording,
+            WearState.from(snapshot.leftWorn, snapshot.rightWorn) == WearState.REMOVED, deferredMode == null ? mode() : deferredMode, sessionGeneration,
+            session != null && sessionOperationNotice != null, session != null && sessionUsesCapture && session.isReplyPlaying());
     }
     private void handleHeadsetControl(HeadsetController.ControlEvent event) {
         HeadsetInteractionPolicy.Gesture gesture;
@@ -1161,20 +1633,24 @@ public final class MainActivity extends Activity {
         for (HeadsetInteractionPolicy.Action action : decision.actions) {
             switch (action) {
                 case CANCEL:
-                    cancelSession(decision.mode == null ? decision.message : "触控切换模式，本轮已取消；已提交内容请查看历史");
+                    endVoice();
                     break;
                 case CHANGE_MODE: changeMode(decision.mode); break;
                 case DEFER_MODE: changeMode(decision.mode); break;
                 case START:
+                    if (session != null && sessionOperationNotice != null) cancelSession("");
                     stopRepeat();
-                    if (tab != 0) { tab = 0; showApp(); }
+                    listenMode = VoiceInteraction.CALL;
+                    int targetTab = "work".equals(mode()) ? 2 : 0;
+                    if (tab != targetTab) { tab = targetTab; showApp(); }
                     startVoice();
                     break;
                 case STOP_AND_SEND:
-                    stopRepeat();
-                    if (session != null && recording) {
-                        recording = false; if (voiceButton != null) voiceButton.setText("正在处理…"); session.stopRecording();
-                    }
+                    endVoice();
+                    break;
+                case INTERRUPT:
+                    if (session != null && sessionUsesCapture) session.interruptReply();
+                    else if (repeatArmed) { handler.removeCallbacks(repeatTick); repeatAt = 0; handler.post(repeatTick); }
                     break;
             }
         }
@@ -1182,9 +1658,28 @@ public final class MainActivity extends Activity {
     private void clearHeadsetGesture() { headsetPolicy.clearPending(); handler.removeCallbacks(settleHeadsetGesture); }
     private void headsetNotice(String message) {
         if (!visible) { pendingHeadsetNotice = message; return; }
-        lastNotice = message; updateStatus(); toast(message);
+        LocalCue cue = message.contains("电量较低") ? LocalCue.BATTERY
+            : message.contains("未佩戴") || message.contains("已摘下") ? LocalCue.WEAR
+            : message.contains("已佩戴") ? LocalCue.READY : null;
+        feedback(message, cue);
     }
-    private static String modeName(String value) { return "work".equals(value) ? "工作模式" : "commute".equals(value) ? "通勤模式" : "生活模式"; }
+    private static String modeName(String value) { return ModeCopy.name(value); }
+
+    private String conversationHeading() {
+        return "work".equals(mode()) ? "专注当下。" : "commute".equals(mode()) ? "一路，有我。" : "我在，听你说。";
+    }
+
+    private void renderModeSelection() {
+        if (tab != 0 || modeChoices == null) return;
+        String[] keys = {"life", "work", "commute"};
+        for (int i = 0; i < keys.length && i < modeChoices.getChildCount(); i++) {
+            TextView choice = (TextView) modeChoices.getChildAt(i);
+            boolean selected = keys[i].equals(mode());
+            styleSegment(choice, selected);
+            choice.setContentDescription(ModeCopy.name(keys[i]) + (selected ? "，已选中" : ""));
+        }
+        if (modeHint != null) modeHint.setText(conversationHeading());
+    }
 
     private void setStatusText(String text) {
         if (status == null) return;
@@ -1193,9 +1688,13 @@ public final class MainActivity extends Activity {
     }
     private void updateStatus() {
         setStatusText(busy ? "正在同步…" : lastNotice);
-        if (status != null) status.setTextColor(busy ? MUTED : TEAL);
+        if (status != null) status.setTextColor(busy ? MUTED : ACCENT);
+        if (voiceButton != null && session == null) voiceButton.setText(callStartPending ? "正在接通…" : repeatArmed ? "通话中 · 我在听" : InteractionCopy.start(listenMode));
+        if (cancelButton != null) { cancelButton.setVisibility(session != null || repeatArmed || callStartPending ? View.VISIBLE : View.GONE); cancelButton.setText(InteractionCopy.stop(listenMode)); }
+        if (callCaption != null && session == null) callCaption.setText(InteractionCopy.ready(listenMode));
     }
     private void connectBackend() {
+        clearVoicePreparation(); preparationAttemptAt = -60000;
         ApiClient next = new ApiClient(this, development.serverUrl());
         api = next;
         next.setDiagnostics(message -> runOnUiThread(() -> {
@@ -1205,43 +1704,56 @@ public final class MainActivity extends Activity {
         }));
     }
     private String audioModeLabel() { return development.audioMode().label(); }
-    private String voiceHintText() { return (development.audioMode() == AudioMode.RISE_SDK ? "在设备详情连接 Rise，耳机就绪后开始\n触控联动就绪后：按一下开始/结束，按两下切模式，长按取消" : "连接蓝牙耳机后，轻触下方开始") + "\n每次最长 60 秒（含结束收尾）· " + (lockScreenEnabled() ? "锁屏会话已开启，通知可停止" : "离开前台自动停止，可单独开启本次锁屏会话"); }
+    private String voiceHintText() {
+        return "work".equals(mode()) ? "工作录音只转写保存，不执行录音中的指令；再次单击结束并保存。"
+            : "单击开始连续语音问答，再次单击结束整场会话；双击切换模式后待机。";
+    }
     private String weatherPreferenceKey() { return "weather." + ServerEndpoint.sessionNamespace(api.serverUrl) + "." + api.vault.username(); }
     private void developmentEntry(LinearLayout parent) {
-        if (!BuildConfig.DEBUG) return;
-        LinearLayout details = disclosure(parent, "开发设置", "", false);
-        developmentSummary = label(details, "开发版 · " + audioModeLabel() + "\n" + api.serverUrl, 11, TEAL);
-        button(details, "开发测试设置", false, this::showDevelopmentSettings);
-        button(details, "检查后端连接", false, () -> { if (canAct()) request(() -> api.json("GET", "/healthz", null), r -> {
-            new AlertDialog.Builder(this).setTitle("后端可达").setMessage(api.serverUrl + "\n服务配置：" + (r.optBoolean("ready") ? "齐备（供应商调用仍需验证）" : "未齐备，请检查电脑后端配置")).setPositiveButton("完成", null).show();
+        LinearLayout details = disclosure(parent, "连接设置", "Rise · 本地或远端服务", false);
+        developmentSummary = label(details, "音频 · " + audioModeLabel() + "\n" + api.serverUrl, 11, ACCENT);
+        button(details, "连接设置", false, this::showDevelopmentSettings);
+        button(details, "检查后端连接", false, () -> { if (canAct()) request(() -> {
+            JSONObject health = api.json("GET", "/healthz", null);
+            if (!api.vault.token().isEmpty()) health.put("account_state", api.json("GET", "/v1/state", null));
+            return health;
+        }, r -> {
+            JSONObject current = r.optJSONObject("account_state");
+            String availability = "请登录后检查实时语音配置";
+            if (current != null) {
+                state = current;
+                JSONObject caps = state.optJSONObject("capabilities");
+                availability = caps != null && caps.optBoolean("voice_realtime")
+                    ? "千问实时语音已配置（实际通话仍需验证）" : "千问实时语音未配置，请检查电脑后端";
+                showApp();
+            }
+            new AlertDialog.Builder(this).setTitle("后端可达").setMessage(api.serverUrl + "\n" + availability).setPositiveButton("完成", null).show();
         }); });
     }
     private RadioGroup choices(LinearLayout parent, String[] options, int selected) {
         RadioGroup group = new RadioGroup(this); parent.addView(group);
         for (int i = 0; i < options.length; i++) {
             RadioButton option = new RadioButton(this); option.setId(View.generateViewId()); option.setText(options[i]);
-            option.setTextColor(INK); option.setTextSize(13); option.setButtonTintList(android.content.res.ColorStateList.valueOf(TEAL));
+            option.setTextColor(INK); option.setTextSize(13); option.setButtonTintList(android.content.res.ColorStateList.valueOf(ACCENT));
             group.addView(option); if (i == selected) group.check(option.getId());
         }
         return group;
     }
     private void showDevelopmentSettings() {
-        if (!BuildConfig.DEBUG || permissionPending || !canAct()) return;
+        if (permissionPending || !canAct()) return;
         stopRepeat(); clearHeadsetGesture();
         LinearLayout body = dialogBody();
-        label(body, "音频模式", 15, TEAL);
-        AudioMode[] audioOptions = {AudioMode.RISE_SDK, AudioMode.BLUETOOTH};
-        String[] audioNames = new String[audioOptions.length]; for (int i = 0; i < audioOptions.length; i++) audioNames[i] = audioOptions[i].label();
-        RadioGroup audio = choices(body, audioNames, development.audioMode() == AudioMode.RISE_SDK ? 0 : 1);
-        label(body, "Rise 使用耳机专用收音；系统蓝牙是独立兼容来源。来源失败不会自动切换。", 11, MUTED);
-        label(body, "后端", 15, TEAL);
+        label(body, "音频模式", 15, ACCENT);
+        label(body, "Rise SDK 麦克风", 15, INK);
+        label(body, "连接 Rise 后即可通话，声音直接来自耳机麦克风。", 11, MUTED);
+        label(body, "后端", 15, ACCENT);
         RadioGroup backend = choices(body, new String[]{backendChoiceLabel("本地电脑服务（USB）", ServerEndpoint.USB_LOCAL), backendChoiceLabel("远端服务器", BuildConfig.SERVER_URL)}, development.localBackend() ? 0 : 1);
-        label(body, "本地和远端账号独立，各登录一次后自动记住。切换回来会恢复该服务的登录；凭证失效时才需重登。只切音频不会退出账号或清空页面。", 11, MUTED);
+        label(body, "默认连接本地电脑服务，通过 USB 连接手机。也可选择远端服务；两端账号独立，切回时恢复各自登录。", 11, MUTED);
         ScrollView container = new ScrollView(this); container.addView(body);
-        new AlertDialog.Builder(this).setTitle("开发测试设置").setView(container).setNegativeButton("取消", null)
+        new AlertDialog.Builder(this).setTitle("连接设置").setView(container).setNegativeButton("取消", null)
             .setPositiveButton("应用", (dialog, which) -> {
                 if (permissionPending || !canAct()) return;
-                AudioMode selected = audioOptions[audio.indexOfChild(audio.findViewById(audio.getCheckedRadioButtonId()))];
+                AudioMode selected = AudioMode.RISE_SDK;
                 boolean localBackend = backend.getCheckedRadioButtonId() == backend.getChildAt(0).getId();
                 if (selected == development.audioMode() && localBackend == development.localBackend()) return;
                 stopLockScreenSession(); cancelSession(""); if (development.audioMode() == AudioMode.RISE_SDK && selected != AudioMode.RISE_SDK) headset.disconnect();
@@ -1250,9 +1762,9 @@ public final class MainActivity extends Activity {
                 if (api.serverUrl.equals(development.serverUrl())) {
                     // Audio selection does not change the account, view tree, drafts or results.
                     if (voiceHint != null) voiceHint.setText(voiceHintText());
-                    if (developmentSummary != null) developmentSummary.setText("开发版 · " + audioModeLabel() + "\n" + api.serverUrl);
+                    if (developmentSummary != null) developmentSummary.setText("音频 · " + audioModeLabel() + "\n" + api.serverUrl);
                     renderHeadset();
-                    toast("音频已切换，登录和当前页面已保留");
+                    feedback("音频已切换，登录和当前页面已保留", LocalCue.AUDIO);
                     return;
                 }
                 chatDraft = ""; if (chatInput != null) chatInput.setText("");
@@ -1294,8 +1806,8 @@ public final class MainActivity extends Activity {
     private void showDeviceDetails() {
         LinearLayout body = dialogBody();
         deviceDetails = label(body, "", 13, INK); renderHeadset();
-        label(body, "先在手机系统配对耳机。耳机就绪后仍需点击开始录音；连接成功不代表已核验声音来源和播放。", 12, MUTED);
-        if (BuildConfig.DEBUG && development.audioMode() == AudioMode.RISE_SDK) {
+        label(body, "先在手机系统配对 Rise，再连接耳机。显示就绪后，点一下接通 AI 就可以一直聊。", 12, MUTED);
+        if (development.audioMode() == AudioMode.RISE_SDK) {
             button(body, "连接 / 重新连接 Rise", true, () -> { if (canAct()) connectHeadset(); });
             button(body, "断开耳机", false, () -> { cancelSession("耳机已断开"); headset.disconnect(); });
             CheckBox controls = new CheckBox(this); controls.setText("开启耳机触控联动（前台或已开启的锁屏会话）");
@@ -1304,10 +1816,10 @@ public final class MainActivity extends Activity {
                 headsetControlsOptIn = checked;
                 getSharedPreferences("headset_controls", MODE_PRIVATE).edit().putBoolean("touch_enabled", checked).apply();
                 clearHeadsetGesture(); syncHeadsetControls();
-                toast(checked ? "已申请触控联动；请看设备状态并实际测试手势" : "触控联动已关闭");
+                feedback(checked ? "已申请触控联动；请看设备状态并实际测试手势" : "触控联动已关闭", checked ? LocalCue.TOUCH : LocalCue.UNTOUCH);
             });
-            label(body, "按一下（单击 / 单捏）：开始或结束发送单轮对话\n按两下（双击 / 双捏）：生活 → 工作 → 通勤\n长按 / 长捏：取消本轮\n单击、双击会等待组合手势判定。三击不绑定动作，并撤销尚未执行的组合手势；短按、释放及滑动不映射动作。\n\n以上只响应 SDK 实际上报的事件，不修改耳机系统手势或固件。显示已开启不等于每种手势已实测。", 11, MUTED);
-            label(body, "双耳都明确未佩戴时停止本轮；单耳及未知状态不推断摘下。戴回、重连只恢复就绪，不自动开麦。电量 ≤20% 和 ≤10% 分级提醒，回升超过25%后才重新提醒。录音中切换模式会等本轮完成，保留当前录音。工作模式的手动提问会简短回答，连续记录保持安静。", 11, MUTED);
+            label(body, "单击 / 单捏：待机时开始；聆听、思考或播报时均结束整场会话。工作录音停止后提交并保存。\n双击 / 双捏：生活 → 工作 → 通勤 → 生活；先结束当前会话，工作先保存，AI 停止播报；目标模式保持待机。\n长按 / 长捏：结束当前会话；工作录音停止后提交并保存。已提交内容可查看历史。\n\n单击、双击等待 400 毫秒组合判定；三击只撤销尚在判定的动作。短按、释放、滑动不绑定操作。\n\n仅响应 SDK 实际上报的事件，不修改耳机系统手势或固件。开启成功不等于所有手势已经实测。", 11, MUTED);
+            label(body, "单击开始或结束；双击按生活、工作、通勤循环切换。工作记录先提交再切换。断连、摘下或来电后不会自动开麦。", 11, MUTED);
         } else label(body, "当前使用 " + audioModeLabel() + "。Rise 接入在开发设置中选择，实物验收后再调整发布策略。", 12, MUTED);
         button(body, "打开系统蓝牙设置", false, () -> startActivity(new Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS)));
         ScrollView container = new ScrollView(this); container.addView(body);
@@ -1315,7 +1827,7 @@ public final class MainActivity extends Activity {
         dialog.setOnDismissListener(d -> deviceDetails = null); dialog.show();
     }
     private void connectHeadset() {
-        if (!BuildConfig.DEBUG || development.audioMode() != AudioMode.RISE_SDK || permissionPending || !canAct()) return;
+        if (permissionPending || !canAct()) return;
         ArrayList<String> missing = audioPermissions(true);
         if (!missing.isEmpty()) { permissionPending = true; requestPermissions(missing.toArray(new String[0]), 3); return; }
         try {
@@ -1337,8 +1849,26 @@ public final class MainActivity extends Activity {
         sourceDialog = new AlertDialog.Builder(this).setTitle(title).setView(sc).setPositiveButton("完成", null).create();
         sourceDialog.show();
     }
-    private void copy(String label, String text) { ((ClipboardManager) getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText(label, text)); toast("已复制"); }
-    private void toast(String text) { Toast.makeText(this, text, Toast.LENGTH_SHORT).show(); }
+    private void copy(String label, String text) { ((ClipboardManager) getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText(label, text)); feedback("已复制", LocalCue.COPIED); }
+    private void feedback(String text, LocalCue cue) {
+        if (isDestroyed()) return;
+        lastNotice = text;
+        updateStatus();
+        setStatusText(text);
+        if (dialogFeedback != null && dialogFeedback.isAttachedToWindow()) {
+            dialogFeedback.setText(text);
+            dialogFeedback.setVisibility(View.VISIBLE);
+        }
+        if (cue != null && quickFeedback != null) quickFeedback.say(cue);
+    }
+    private boolean canSpeakFeedback() {
+        if (!visible || isDestroyed() || session != null || repeatArmed || callStartPending || headset == null) return false;
+        HeadsetController.Snapshot snapshot = headset.snapshot();
+        android.media.AudioManager audio = (android.media.AudioManager) getSystemService(AUDIO_SERVICE);
+        return snapshot.ready() && !snapshot.inCall
+            && !(Boolean.FALSE.equals(snapshot.leftWorn) && Boolean.FALSE.equals(snapshot.rightWorn))
+            && audio.getMode() == android.media.AudioManager.MODE_NORMAL;
+    }
     private void hideKeyboard() { View focus = getCurrentFocus(); if (focus != null) { ((InputMethodManager) getSystemService(INPUT_METHOD_SERVICE)).hideSoftInputFromWindow(focus.getWindowToken(), 0); focus.clearFocus(); } }
     private JSONObject settings() { JSONObject s = state.optJSONObject("settings"); return s == null ? new JSONObject() : s; }
     private String mode() { JSONObject agent = state.optJSONObject("agent"); return agent == null ? settings().optString("mode", "life") : agent.optString("mode", settings().optString("mode", "life")); }
@@ -1356,34 +1886,81 @@ public final class MainActivity extends Activity {
     private LinearLayout column() { LinearLayout view = new LinearLayout(this); view.setOrientation(LinearLayout.VERTICAL); return view; }
     private LinearLayout row() { LinearLayout view = new LinearLayout(this); view.setOrientation(LinearLayout.HORIZONTAL); return view; }
     private void gap(LinearLayout parent, int height) { parent.addView(new View(this), new LinearLayout.LayoutParams(1, dp(height))); }
-    private LinearLayout dialogBody() { LinearLayout body = column(); body.setPadding(dp(24), dp(8), dp(24), dp(16)); return body; }
+    private LinearLayout dialogBody() {
+        LinearLayout body = column(); body.setPadding(dp(24), dp(8), dp(24), dp(16));
+        dialogFeedback = label(body, "", 12, ACCENT);
+        dialogFeedback.setVisibility(View.GONE);
+        return body;
+    }
     private LinearLayout card(LinearLayout parent) {
-        LinearLayout view = column(); view.setPadding(dp(20), dp(18), dp(20), dp(18)); view.setBackground(shape(CARD, 26, LINE));
-        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, -2); p.setMargins(0, dp(12), 0, dp(8)); parent.addView(view, p); return view;
+        LinearLayout view = column(); view.setPadding(dp(18), dp(16), dp(18), dp(16)); view.setBackground(shape(BG, 20, LINE));
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, -2); p.setMargins(0, dp(8), 0, dp(8)); parent.addView(view, p); return view;
+    }
+    private LinearLayout featureCard(LinearLayout parent, int tint) {
+        LinearLayout view = card(parent); view.setPadding(dp(20), dp(20), dp(20), dp(18)); view.setBackground(shape(tint, 24, tint)); return view;
+    }
+    private int pageAccent() { return tab == 1 ? MEMORY : tab == 2 ? WORK : tab == 3 ? COMMUTE : ACCENT; }
+    private void eyebrow(LinearLayout parent, String text, int color) {
+        TextView view = label(parent, text, 10, color); view.setLetterSpacing(.12f); view.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+    }
+    private void badge(LinearLayout parent, String text, int color, int fill) {
+        TextView view = label(parent, text, 11, color); view.setPadding(dp(10), dp(5), dp(10), dp(5)); view.setBackground(shape(fill, 8, fill));
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-2, -2); p.rightMargin = dp(6); view.setLayoutParams(p);
+    }
+    private void metric(LinearLayout parent, String number, String caption, int color) {
+        LinearLayout box = column(); box.setPadding(0, dp(12), 0, 0); parent.addView(box, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView value = label(box, number, 36, color); value.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        label(box, caption, 11, MUTED);
+    }
+    private void sectionHeader(LinearLayout parent, String title, String subtitle, String actionText, Runnable action) {
+        LinearLayout header = row(); header.setGravity(Gravity.CENTER_VERTICAL); header.setPadding(0, dp(20), 0, dp(6)); parent.addView(header);
+        LinearLayout text = column(); header.addView(text, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView heading = label(text, title, 18, INK); heading.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        if (Build.VERSION.SDK_INT >= 28) heading.setAccessibilityHeading(true);
+        if (!subtitle.isEmpty()) label(text, subtitle, 12, MUTED);
+        if (action != null) {
+            TextView link = label(header, actionText, 13, pageAccent()); link.setGravity(Gravity.CENTER); link.setMinHeight(dp(48)); link.setPadding(dp(12), dp(10), 0, dp(10));
+            link.setLayoutParams(new LinearLayout.LayoutParams(-2, -2)); link.setBackground(ripple(Color.TRANSPARENT, 12, Color.TRANSPARENT)); link.setFocusable(true); link.setOnClickListener(v -> action.run());
+        }
     }
     private GradientDrawable shape(int color, int radius, int border) { GradientDrawable d = new GradientDrawable(); d.setColor(color); d.setCornerRadius(dp(radius)); d.setStroke(dp(1), border); return d; }
-    private RippleDrawable ripple(int color, int radius, int border) { return new RippleDrawable(ColorStateList.valueOf(0x2028644e), shape(color, radius, border), shape(Color.WHITE, radius, Color.WHITE)); }
+    private RippleDrawable ripple(int color, int radius, int border) { return new RippleDrawable(ColorStateList.valueOf(0x180071e3), shape(color, radius, border), shape(Color.WHITE, radius, Color.WHITE)); }
     private TextView label(LinearLayout parent, String text, int size, int color) {
         TextView view = new TextView(this); view.setText(text); view.setTextSize(size); view.setTextColor(color); view.setFontFeatureSettings("kern");
-        view.setLineSpacing(dp(3), 1.06f); view.setPadding(0, dp(5), 0, dp(5)); parent.addView(view); return view;
+        view.setLineSpacing(dp(3), 1.06f); view.setPadding(0, dp(4), 0, dp(4)); parent.addView(view); return view;
     }
     private void pageHeading(String title) {
-        TextView heading = label(page, title, 26, INK); heading.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        LinearLayout header = row(); header.setGravity(Gravity.CENTER_VERTICAL); page.addView(header);
+        LinearLayout words = column(); header.addView(words, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView heading = label(words, title, 32, INK); heading.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL)); heading.setLetterSpacing(-.025f);
         if (Build.VERSION.SDK_INT >= 28) heading.setAccessibilityHeading(true);
-        gap(page, 4);
+        String subtitle = "记忆".equals(title) ? "重要的事，替你记得。" : "工作".equals(title) ? "把注意力，留给眼前。" : "通勤".equals(title) ? "从容出发，安心抵达。" : "你的日常，由你定义。";
+        label(words, subtitle, 13, MUTED);
+        if (getResources().getConfiguration().fontScale < 1.5f) {
+            SceneMarkView mark = new SceneMarkView(this, tab, pageAccent()); header.addView(mark, new LinearLayout.LayoutParams(dp(76), dp(76)));
+        }
+        gap(page, 16);
     }
     private LinearLayout disclosure(LinearLayout parent, String title, String summary, boolean expanded) {
-        LinearLayout shell = card(parent); shell.setPadding(dp(16), dp(4), dp(16), dp(4));
-        String caption = title + (summary.isEmpty() ? "" : "   ·   " + summary);
-        TextView toggle = label(shell, caption + (expanded ? "  −" : "  +"), 14, INK);
-        toggle.setMinHeight(dp(48)); toggle.setGravity(Gravity.CENTER_VERTICAL); toggle.setBackground(ripple(CARD, 12, CARD)); toggle.setFocusable(true);
+        LinearLayout shell = card(parent); shell.setPadding(dp(16), dp(8), dp(16), dp(8));
+        shell.setBackground(shape(CARD, 18, CARD));
+        LinearLayout header = row(); header.setGravity(Gravity.CENTER_VERTICAL); shell.addView(header);
+        LinearLayout words = column(); header.addView(words, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView toggle = label(words, title, 15, INK);
+        toggle.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        if (!summary.isEmpty()) { TextView detail = label(words, summary, 12, MUTED); detail.setPadding(0, 0, 0, dp(4)); }
+        TextView indicator = label(header, expanded ? "−" : "+", 20, MUTED); indicator.setGravity(Gravity.CENTER); indicator.setLayoutParams(new LinearLayout.LayoutParams(dp(32), -2));
+        header.setMinimumHeight(dp(52)); header.setBackground(ripple(CARD, 12, CARD)); header.setFocusable(true);
         LinearLayout body = column(); body.setPadding(0, dp(8), 0, dp(14)); shell.addView(body); body.setVisibility(expanded ? View.VISIBLE : View.GONE);
-        toggle.setContentDescription(title + (expanded ? "，已展开，点击收起" : "，已收起，点击展开"));
-        toggle.setOnClickListener(v -> {
+        header.setContentDescription(title + (summary.isEmpty() ? "" : "，" + summary) + (expanded ? "，已展开，点击收起" : "，已收起，点击展开"));
+        View.OnClickListener listener = v -> {
             boolean open = body.getVisibility() != View.VISIBLE; body.setVisibility(open ? View.VISIBLE : View.GONE);
-            toggle.setText(caption + (open ? "  −" : "  +"));
-            toggle.setContentDescription(title + (open ? "，已展开，点击收起" : "，已收起，点击展开"));
-        }); return body;
+            indicator.setText(open ? "−" : "+");
+            header.setContentDescription(title + (summary.isEmpty() ? "" : "，" + summary) + (open ? "，已展开，点击收起" : "，已收起，点击展开"));
+        };
+        header.setOnClickListener(listener); toggle.setOnClickListener(listener);
+        toggle.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        return body;
     }
     private void fillPrompt(String prompt) {
         if (chatInput == null || !canAct()) return;
@@ -1392,8 +1969,8 @@ public final class MainActivity extends Activity {
     }
     private EditText input(String hint, boolean password, int max) {
         EditText view = new EditText(this); view.setTextColor(INK); view.setHintTextColor(MUTED); view.setTextSize(14); view.setHint(hint); view.setContentDescription(hint);
-        view.setMinHeight(dp(52)); view.setPadding(dp(16), dp(14), dp(16), dp(14)); view.setBackground(shape(BG, 16, LINE));
-        view.setOnFocusChangeListener((v, focused) -> v.setBackground(shape(CARD, 16, focused ? TEAL : LINE)));
+        view.setMinHeight(dp(52)); view.setPadding(dp(16), dp(14), dp(16), dp(14)); view.setBackground(shape(BG, 14, LINE));
+        view.setOnFocusChangeListener((v, focused) -> v.setBackground(shape(BG, 14, focused ? ACCENT : LINE)));
         view.setInputType(InputType.TYPE_CLASS_TEXT | (password ? InputType.TYPE_TEXT_VARIATION_PASSWORD : InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES));
         view.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(max)}); view.setSingleLine(password); return view;
     }
@@ -1403,30 +1980,40 @@ public final class MainActivity extends Activity {
         LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, -2); p.bottomMargin = dp(12); parent.addView(input, p); return input;
     }
     private Button button(LinearLayout parent, String text, boolean primary, Runnable action) {
-        Button view = new Button(this); view.setText(text); view.setTextSize(14); view.setAllCaps(false); view.setTextColor(primary ? BG : INK);
-        view.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL)); view.setBackground(ripple(primary ? TEAL : BG, 16, primary ? TEAL : LINE));
+        Button view = new Button(this); view.setText(text); view.setTextSize(14); view.setAllCaps(false); view.setTextColor(primary ? BG : ACCENT);
+        view.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL)); view.setBackground(ripple(primary ? ACCENT : BG, 16, primary ? ACCENT : LINE));
         view.setStateListAnimator(null); view.setMinHeight(dp(52)); view.setMinimumHeight(dp(52)); view.setPadding(dp(14), dp(12), dp(14), dp(12));
-        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, -2); p.topMargin = dp(10); p.bottomMargin = dp(4); parent.addView(view, p); view.setOnClickListener(v -> action.run()); return view;
+        LinearLayout.LayoutParams p = parent.getOrientation() == LinearLayout.HORIZONTAL
+            ? new LinearLayout.LayoutParams(0, -2, 1) : new LinearLayout.LayoutParams(-1, -2);
+        if (parent.getOrientation() == LinearLayout.HORIZONTAL && parent.getChildCount() > 0) p.leftMargin = dp(8);
+        p.topMargin = dp(10); p.bottomMargin = dp(4); parent.addView(view, p); view.setOnClickListener(v -> action.run()); return view;
     }
     private TextView action(LinearLayout parent, String text, Runnable action) {
-        TextView v = new TextView(this); v.setText(text); v.setTextColor(TEAL); v.setTextSize(14); v.setGravity(Gravity.CENTER); v.setFocusable(true); v.setBackground(ripple(BG, 18, BG));
+        TextView v = new TextView(this); v.setText(text); v.setTextColor(ACCENT); v.setTextSize(14); v.setGravity(Gravity.CENTER); v.setFocusable(true); v.setBackground(ripple(BG, 18, BG));
         LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(dp(48), dp(48)); p.leftMargin = dp(8); parent.addView(v, p); v.setOnClickListener(w -> action.run()); return v;
     }
     private void small(LinearLayout parent, String text, Runnable action) {
-        TextView v = label(parent, text, 12, TEAL); v.setGravity(Gravity.CENTER); v.setPadding(dp(5), dp(10), dp(5), dp(10)); v.setMinHeight(dp(48));
+        TextView v = label(parent, text, 12, ACCENT); v.setGravity(Gravity.CENTER); v.setPadding(dp(5), dp(10), dp(5), dp(10)); v.setMinHeight(dp(48));
         v.setLayoutParams(parent.getOrientation() == LinearLayout.HORIZONTAL ? new LinearLayout.LayoutParams(0, -2, 1) : new LinearLayout.LayoutParams(-1, -2));
         v.setBackground(ripple(Color.TRANSPARENT, 12, Color.TRANSPARENT)); v.setFocusable(true); v.setOnClickListener(w -> action.run());
     }
     private void segment(LinearLayout parent, String text, boolean selected, Runnable action) {
-        TextView v = new TextView(this); v.setText(text); v.setTextSize(12); v.setTextColor(selected ? BG : MUTED); v.setGravity(Gravity.CENTER);
-        v.setPadding(dp(4), dp(10), dp(4), dp(10)); v.setMinHeight(dp(48)); v.setBackground(ripple(selected ? TEAL : SOFT, 15, selected ? TEAL : SOFT));
-        v.setSelected(selected); v.setFocusable(true); v.setContentDescription(text + (selected ? "，已选中" : ""));
-        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, -2, 1); p.setMargins(0, 0, dp(5), 0); parent.addView(v, p); v.setOnClickListener(w -> action.run());
+        TextView v = new TextView(this); v.setText(text); v.setTextSize(12); v.setGravity(Gravity.CENTER);
+        v.setPadding(dp(4), dp(10), dp(4), dp(10)); v.setMinHeight(dp(48)); styleSegment(v, selected);
+        v.setFocusable(true); v.setContentDescription(text + (selected ? "，已选中" : ""));
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, -2, 1); p.setMargins(dp(2), 0, dp(2), 0); parent.addView(v, p); v.setOnClickListener(w -> action.run());
+    }
+    private void styleSegment(TextView view, boolean selected) {
+        view.setSelected(selected); view.setTextColor(selected ? INK : MUTED);
+        view.setTypeface(Typeface.create(selected ? "sans-serif-medium" : "sans-serif", Typeface.NORMAL));
+        view.setBackground(ripple(selected ? BG : Color.TRANSPARENT, 12, selected ? LINE : Color.TRANSPARENT));
     }
     private void empty(LinearLayout parent, String title, String subtitle) {
-        LinearLayout box = column(); box.setGravity(Gravity.CENTER); box.setPadding(dp(14), dp(24), dp(14), dp(24)); parent.addView(box, new LinearLayout.LayoutParams(-1, -2));
-        IconView icon = new IconView(tab == 0 ? 0 : tab, TEAL); box.addView(icon, new LinearLayout.LayoutParams(dp(28), dp(28))); gap(box, 8);
-        label(box, title, 16, INK).setGravity(Gravity.CENTER); label(box, subtitle, 12, MUTED).setGravity(Gravity.CENTER);
+        LinearLayout box = column(); box.setGravity(Gravity.CENTER); box.setPadding(dp(16), dp(26), dp(16), dp(26));
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, -2); p.topMargin = dp(8); parent.addView(box, p);
+        box.setBackground(shape(CARD, 20, CARD));
+        IconView icon = new IconView(tab == 0 ? 0 : tab, pageAccent()); box.addView(icon, new LinearLayout.LayoutParams(dp(26), dp(26))); gap(box, 10);
+        label(box, title, 15, INK).setGravity(Gravity.CENTER); label(box, subtitle, 12, MUTED).setGravity(Gravity.CENTER);
     }
 
     private final class IconView extends View {

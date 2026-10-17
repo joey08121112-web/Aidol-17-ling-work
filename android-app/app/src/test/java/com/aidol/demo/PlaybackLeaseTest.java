@@ -10,6 +10,29 @@ import org.junit.Test;
 import static org.junit.Assert.*;
 
 public class PlaybackLeaseTest {
+    @Test public void duplexPlaysDuringCaptureButStillSerializesOutputs() throws Exception {
+        Object capture = new Object(), otherCapture = new Object();
+        assertTrue(SystemCaptureLease.acquire(capture));
+        try {
+            try (PlaybackLease playing = PlaybackLease.acquireDuplex(() -> false, 100)) {
+                assertFalse(SystemCaptureLease.acquire(otherCapture));
+                assertThrows(IOException.class, () -> PlaybackLease.acquireDuplex(() -> false, 10));
+                assertThrows(IOException.class, () -> PlaybackLease.acquire(() -> false, 10));
+            }
+            // Playback cleanup must not release the still-running SDK capture.
+            assertFalse(SystemCaptureLease.acquire(otherCapture));
+            try (PlaybackLease next = PlaybackLease.acquireDuplex(() -> false, 100)) {}
+        } finally { SystemCaptureLease.release(capture); SystemCaptureLease.release(otherCapture); }
+    }
+
+    @Test public void cancelledDuplexWaitCannotStartOrReleaseAnotherOutput() throws Exception {
+        try (PlaybackLease old = PlaybackLease.acquireDuplex(() -> false, 100)) {
+            assertThrows(InterruptedException.class, () -> PlaybackLease.acquireDuplex(() -> true, 100));
+            assertThrows(IOException.class, () -> PlaybackLease.acquireDuplex(() -> false, 10));
+        }
+        try (PlaybackLease next = PlaybackLease.acquireDuplex(() -> false, 100)) {}
+    }
+
     @Test public void playbackWaitsForCaptureCleanupAndBlocksAReplacementRecording() throws Exception {
         Object capture = new Object(), replacement = new Object();
         assertTrue(SystemCaptureLease.acquire(capture));

@@ -281,4 +281,17 @@ public class VendorCaptureSourceTest {
             assertNotNull(result.error); assertEquals(0, result.endings.get()); assertEquals(1, device.recoveries);
         }
     }
+    @Test public void explicitContinuousWorkCaptureCrossesOldByteLimitAndOnlyStopsOnRequest() throws Exception {
+        Device device = new Device(); Result result = new Result();
+        try (VendorCaptureSource source = new VendorCaptureSource(device, 2500, 4_000_000, 0)) {
+            source.start(result); device.listener.state("recording", 2);
+            byte[] first = new byte[VendorCaptureSource.MAX_BYTES];
+            device.listener.pcm(2, first); device.listener.pcm(2, new byte[]{7, 8});
+            assertFalse(result.complete.await(20, TimeUnit.MILLISECONDS));
+            assertEquals(0, device.stops); assertEquals(0, device.recoveries);
+            source.stop(result); device.listener.state("idle", 2); result.await();
+            assertNull(result.error); assertEquals(1, result.endings.get());
+            assertEquals(first.length + 2, result.audio.size());
+        }
+    }
 }

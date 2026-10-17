@@ -21,7 +21,8 @@ public class LocalCueTest {
         if (!Files.isDirectory(directory)) directory = Paths.get("app/src/main/res/raw");
         if (!Files.isDirectory(directory)) directory = Paths.get("android-app/app/src/main/res/raw");
         assertTrue("Run the tests from the Android project or module directory", Files.isDirectory(directory));
-        for (String cue : new String[] {"life", "work", "commute", "start", "end"}) {
+        for (LocalCue value : LocalCue.values()) {
+            String cue = value.name().toLowerCase(java.util.Locale.ROOT);
             byte[] pcm = WavAudio.pcm(Files.readAllBytes(directory.resolve("cue_" + cue + ".wav")));
             assertTrue(cue + " must be audible and brief", pcm.length >= 4800 && pcm.length <= 144000);
             boolean audible = false;

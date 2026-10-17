@@ -1,5 +1,10 @@
 plugins { id 'com.android.application' }
 
+// Keep review APKs and generated package names separate from normal debug builds.
+if (project.hasProperty('aidolVisualReview')) {
+    layout.buildDirectory = file('build-visual-review')
+}
+
 android {
     namespace 'com.aidol.demo'
     compileSdk 35
@@ -25,7 +30,8 @@ android {
     }
     buildTypes {
         debug {
-            applicationIdSuffix '.debug'
+            // An isolated install for offline UI fixtures; never reuses a developer account.
+            applicationIdSuffix project.hasProperty('aidolVisualReview') ? '.review' : '.debug'
             versionNameSuffix '-dev'
         }
         release {
@@ -50,6 +56,7 @@ dependencies {
     implementation 'com.squareup.okhttp3:okhttp:4.12.0'
     testImplementation 'junit:junit:4.13.2'
     testImplementation 'com.squareup.okhttp3:mockwebserver:4.12.0'
+    testImplementation 'org.json:json:20240303'
 }
 
 // A fixed external vendor artifact is required on every developer machine; never substitute a newer AAR silently.

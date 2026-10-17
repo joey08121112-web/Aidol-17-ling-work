@@ -1,6 +1,6 @@
 """Hosted Android API; importing this module never opens account databases."""
 import asyncio
-from contextlib import contextmanager
+from contextlib import contextmanager, AsyncExitStack
 import json
 import logging
 from pathlib import Path
@@ -9,16 +9,21 @@ import hashlib
 import time
 from datetime import datetime, timezone, timedelta
 
-from fastapi import FastAPI, HTTPException, Request, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, Query, WebSocket, WebSocketDisconnect, BackgroundTasks
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .config import Config
 from .domain import Settings, LocationInput, MemoryInput, SpeechInput, NearbyInput
 from .domain import MeetingRequest, RecallRequest, TaskStatusInput, MemoryUpdate
 from .providers.volc_speech import VolcSpeechProvider, SpeechProviderError
+from .providers.qwen_realtime import QwenRealtimeProvider
 from .services.insights import MeetingInsights, meeting_coverage
+from .services.work_meetings import WorkMeetingMinutes
 from .services.recall import RecallService
-from .services.voice_stream import transcribe_live
+from .services.voice_stream import CompletionBarrier, transcribe_live, reply_live
+from .services.qwen_voice import reply_qwen, realtime_instructions
+from .services.duplex_voice import duplex_call
+from .services.assistant_tools import AssistantTools
 from .providers.bocha import BochaSearch
 
 
@@ -43,7 +48,9 @@ def create_hosted_app(config=None, data_directory=None):
     speech = VolcSpeechProvider(config.speech)
     api = FastAPI(title='Aidol Android API', version='0.2.0', docs_url=None, redoc_url=None, openapi_url=None)
     api.state.accounts, api.state.runtimes, api.state.speech = accounts, runtimes, speech
+    api.state.qwen = QwenRealtimeProvider(config.qwen)
     active = 0
+    preparing_voice = set()
     # Inherit Uvicorn's configured INFO handler without changing global logging.
     # No account identifiers, payloads, audio or exception details enter these logs.
     diagnostics = logging.getLogger('uvicorn.error.aidol.mobile')
@@ -68,19 +75,22 @@ def create_hosted_app(config=None, data_directory=None):
             trace(request_id, stage, status, int((time.monotonic() - started) * 1000))
 
     class Credentials(BaseModel):
-        username: str = Field(min_length=3, max_length=24)
-        password: str = Field(min_length=8, max_length=128)
+        username: str = Field(min_length=1, max_length=64)
+        password: str = Field(min_length=1, max_length=128)
 
-        @field_validator('username')
+        @field_validator('username', mode='before')
         @classmethod
         def valid_username(cls, value):
-            if not re.fullmatch(r'[a-zA-Z0-9_]{3,24}', value):
-                raise ValueError('账号仅支持 3–24 位字母、数字、下划线')
-            return value.lower()
+            if not isinstance(value, str):
+                raise ValueError('请输入账号')
+            value = value.strip()
+            if not value or not value.isprintable():
+                raise ValueError('请输入账号，不能包含换行或控制字符')
+            return value.translate(str.maketrans('ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'))
 
     class ChangePassword(BaseModel):
         old_password: str = Field(min_length=1, max_length=128)
-        new_password: str = Field(min_length=8, max_length=128)
+        new_password: str = Field(min_length=1, max_length=128)
 
     class Recovery(Credentials):
         recovery_code: str = Field(min_length=16, max_length=128)
@@ -91,13 +101,20 @@ def create_hosted_app(config=None, data_directory=None):
     class Turn(BaseModel):
         text: str = Field(min_length=1, max_length=6000)
         request_id: str = Field(pattern=r'^[a-zA-Z0-9-]{16,64}$')
-        interaction_source: str = Field(default='ambient_capture', pattern=r'^(direct_question|ambient_capture)$')
+        interaction_source: str = Field(default='ambient_capture', pattern=r'^(direct_question|ambient_capture|continuous_call)$')
+
+    class WorkMeetingStart(BaseModel):
+        meeting_id: str = Field(pattern=r'^[a-zA-Z0-9-]{16,64}$')
+
+    class WorkMeetingFinish(BaseModel):
+        segment_count: int = Field(ge=0, le=100000)
+        complete: bool = True
 
     @api.exception_handler(RequestValidationError)
     async def invalid(request, error):
         message = '请求参数格式不正确，请检查必填项和输入长度'
         if request.url.path.startswith('/auth/'):
-            message = '请检查输入：账号为 3–24 位字母、数字或下划线；密码为 8–128 位'
+            message = '请检查输入：账号为 1–64 位可见字符，不能全为空格；密码为 1–128 位；找回账号时请填写完整恢复码'
         elif request.url.path == '/v1/maps/weather':
             message = '请先选择目的地，或填写 6 位城市行政区代码'
         return JSONResponse({'detail': message}, 422)
@@ -144,13 +161,13 @@ def create_hosted_app(config=None, data_directory=None):
                 'user': {key: found[key] for key in ('id', 'username', 'created_at')}}
 
     @asynccontextmanager
-    async def runtime(current, request, billable=False):
+    async def runtime(current, request, billable=False, wait_seconds=0):
         nonlocal active
         if active >= 8:
             raise HTTPException(503, '服务器正在处理较多请求，请稍后再试')
         active += 1
         try:
-            async with runtimes.use(current['id']) as value:
+            async with runtimes.use(current['id'], wait_seconds=wait_seconds) as value:
                 # Recheck after acquiring the per-account lock (password/logout races).
                 if not accounts.authenticate(digest(token(request))):
                     raise HTTPException(401, '登录已失效')
@@ -164,7 +181,8 @@ def create_hosted_app(config=None, data_directory=None):
 
     @api.get('/healthz')
     async def hosted_health():
-        return {'ok': True, 'version': '0.2.0', 'ready': bool(config.text_key and config.text_model and config.speech.asr_ready and config.speech.tts_ready)}
+        return {'ok': True, 'version': '0.2.0', 'work_meetings': True, 'ready': bool(config.qwen.ready or
+            config.text_key and config.text_model and config.speech.asr_ready and config.speech.tts_ready)}
 
     @api.post('/auth/register', status_code=201)
     def register(value: Credentials, request: Request):
@@ -242,20 +260,23 @@ def create_hosted_app(config=None, data_directory=None):
         return {'ok': True}
 
     @api.get('/v1/state')
-    async def mobile_state(request: Request, current=Depends(user)):
-        async with runtime(current, request) as rt:
+    async def mobile_state(request: Request, background: BackgroundTasks, current=Depends(user)):
+        async with runtime(current, request, wait_seconds=5) as rt:
             await rt.agent.decide()
+            meetings = rt.store.work_meetings()
+            resume_work_summaries(background, current, meetings)
             return {'user': current, 'settings': rt.store.settings().model_dump(),
                     'capabilities': config.capabilities(), 'agent': rt.agent.snapshot(),
                     'transcripts': list(reversed(rt.store.list('transcripts', 100))),
                     'memories': rt.store.list('memories', 300), 'tasks': rt.store.list('action_tasks', 300),
                     'drafts': rt.store.list('drafts', 30),
-                    'meeting_report': rt.store.meeting_report()}
+                    'meeting_report': rt.store.meeting_report(), 'work_meetings': meetings}
 
     @api.put('/v1/settings')
     async def mobile_settings(value: Settings, request: Request, current=Depends(user)):
         async with runtime(current, request) as rt:
             # Android v1 is foreground-only; do not advertise background listening.
+            value.auto_mode = False
             value.life_poll_enabled = False
             value.provider = 'cascade'
             old = rt.store.settings()
@@ -266,11 +287,12 @@ def create_hosted_app(config=None, data_directory=None):
             await rt.agent.decide()
             return value
 
-    async def process(rt, current, request_id, fingerprint, text=None, pcm=None, interaction_source='ambient_capture'):
+    async def process(rt, current, request_id, fingerprint, text=None, pcm=None, interaction_source='ambient_capture', meeting_id=None, segment_index=None):
         with measured(request_id, 'turn'):
-            return await process_turn(rt, current, request_id, fingerprint, text=text, pcm=pcm, interaction_source=interaction_source)
+            return await process_turn(rt, current, request_id, fingerprint, text=text, pcm=pcm, interaction_source=interaction_source,
+                                      meeting_id=meeting_id, segment_index=segment_index)
 
-    async def process_turn(rt, current, request_id, fingerprint, text=None, pcm=None, interaction_source='ambient_capture'):
+    async def process_turn(rt, current, request_id, fingerprint, text=None, pcm=None, interaction_source='ambient_capture', meeting_id=None, segment_index=None):
         try:
             cached = rt.store.mobile_turn(request_id, fingerprint, reserve=False)
         except ValueError as exc:
@@ -279,6 +301,13 @@ def create_hosted_app(config=None, data_directory=None):
         if cached is not None:
             trace(request_id, 'cache', 'hit')
             return cached
+        if meeting_id:
+            if rt.store.settings().mode != 'work' or interaction_source != 'ambient_capture':
+                raise HTTPException(409, '会议录音仅能在工作模式保存')
+            try:
+                rt.store.check_work_segment(meeting_id, segment_index, request_id)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from None
         trace(request_id, 'cache', 'miss')
         if not accounts.consume('usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400):
             raise HTTPException(429, '今日体验额度已用完，请明天再试')
@@ -301,14 +330,19 @@ def create_hosted_app(config=None, data_directory=None):
                 except BaseException:
                     rt.store.fail_mobile_turn(request_id)
                     raise
-            if not text.strip():
+            if not text.strip() and not meeting_id:
                 result = {'text': '', 'response': '没有听清，请靠近麦克风再试一次', 'speak': False}
                 rt.store.finish_mobile_turn(request_id, result)
                 return result
         rt.store.mobile_turn_stage(request_id, 'business')
         try:
             with measured(request_id, 'business'):
-                if interaction_source == 'ambient_capture':
+                if meeting_id:
+                    transcript_id = rt.store.save_work_segment(meeting_id, segment_index, request_id, text)
+                    result = {'text': text, 'transcript_id': transcript_id, 'meeting_id': meeting_id,
+                              'segment_index': segment_index, 'mode': 'work', 'interaction': 'silent_capture',
+                              'response': '', 'memories': [], 'speak': False}
+                elif interaction_source == 'ambient_capture':
                     result = await rt.turn(text[:6000], 'asr' if pcm is not None else 'text')
                 else:
                     result = await rt.turn(text[:6000], 'asr' if pcm is not None else 'text', interaction_source)
@@ -323,12 +357,14 @@ def create_hosted_app(config=None, data_directory=None):
         if not value.text.strip():
             raise HTTPException(422, '请输入内容')
         async with runtime(current, request) as rt:
-            fingerprint = 'text:' + digest(value.text) + (':direct_question' if value.interaction_source == 'direct_question' else '')
+            fingerprint = 'text:' + digest(value.text) + (':' + value.interaction_source if value.interaction_source != 'ambient_capture' else '')
             return await process(rt, current, value.request_id, fingerprint, text=value.text, interaction_source=value.interaction_source)
 
     @api.post('/v1/voice')
     async def mobile_voice(request: Request, request_id: str = Query(pattern=r'^[a-zA-Z0-9-]{16,64}$'),
-                           interaction_source: str = Query(default='ambient_capture', pattern=r'^(direct_question|ambient_capture)$'), current=Depends(user)):
+                           interaction_source: str = Query(default='ambient_capture', pattern=r'^(direct_question|ambient_capture|continuous_call)$'),
+                           meeting_id: str | None = Query(default=None, pattern=r'^[a-zA-Z0-9-]{16,64}$'),
+                           segment_index: int | None = Query(default=None, ge=0, le=100000), current=Depends(user)):
         if not config.speech.asr_ready:
             raise HTTPException(503, '服务器尚未配置语音识别')
         if request.headers.get('content-type', '').split(';')[0] != 'audio/pcm':
@@ -336,9 +372,14 @@ def create_hosted_app(config=None, data_directory=None):
         pcm = await request.body()
         if len(pcm) < 3200 or len(pcm) % 2:
             raise HTTPException(422, '录音太短或不完整，请重新录音')
+        if (meeting_id is None) != (segment_index is None):
+            raise HTTPException(422, '会议编号和片段编号必须同时提供')
         async with runtime(current, request) as rt:
-            fingerprint = 'pcm:' + hashlib.sha256(pcm).hexdigest() + (':direct_question' if interaction_source == 'direct_question' else '')
-            return await process(rt, current, request_id, fingerprint, pcm=pcm, interaction_source=interaction_source)
+            fingerprint = 'pcm:' + hashlib.sha256(pcm).hexdigest() + (':' + interaction_source if interaction_source != 'ambient_capture' else '')
+            if meeting_id:
+                fingerprint += ':meeting:' + meeting_id + ':' + str(segment_index)
+            return await process(rt, current, request_id, fingerprint, pcm=pcm, interaction_source=interaction_source,
+                                 meeting_id=meeting_id, segment_index=segment_index)
 
     @api.websocket('/v1/voice/stream')
     async def mobile_voice_stream(socket: WebSocket):
@@ -348,16 +389,106 @@ def create_hosted_app(config=None, data_directory=None):
             await socket.close(code=4401)
             return
         await socket.accept()
+        socket = CompletionBarrier(socket)
         request_id = socket.query_params.get('request_id', '')
         interaction = socket.query_params.get('interaction_source', 'ambient_capture')
+        reply_audio = socket.query_params.get('reply_audio', '0')
+        engine = socket.query_params.get('engine', 'cascade')
+        duplex = socket.query_params.get('duplex', '0')
+        prepare = socket.query_params.get('prepare', '0')
         reserved = False
+        preparation_owned = False
+        upstream = AsyncExitStack()
+        prepared_native = None
+        prepared_context = None
         rt = None
+
+        @asynccontextmanager
+        async def activated_runtime():
+            async with runtime(current, socket, wait_seconds=5) as value:
+                try:
+                    yield value
+                finally:
+                    # Even a failed activation closes provider transports before
+                    # another request can acquire this account's orchestrator.
+                    await upstream.aclose()
+
         try:
-            if not re.fullmatch(r'[a-zA-Z0-9-]{16,64}', request_id) or interaction not in {'direct_question', 'ambient_capture'}:
+            if not re.fullmatch(r'[a-zA-Z0-9-]{16,64}', request_id) or interaction not in {'direct_question', 'ambient_capture', 'continuous_call'}:
                 raise HTTPException(422, '语音会话参数不正确')
-            if not config.speech.asr_ready:
+            if reply_audio not in {'0', '1'} or (reply_audio == '1' and interaction not in {'direct_question', 'continuous_call'}):
+                raise HTTPException(422, '流式回复仅用于主动 AI 提问')
+            if engine not in {'cascade', 'qwen'} or (engine == 'qwen' and (reply_audio != '1' or interaction not in {'direct_question', 'continuous_call'})):
+                raise HTTPException(422, '千问实时语音仅用于主动 AI 语音对话')
+            if duplex not in {'0', '1'} or (duplex == '1' and (engine != 'qwen' or interaction != 'continuous_call')):
+                raise HTTPException(422, '全双工仅用于通义连续通话')
+            if prepare not in {'0', '1'} or (prepare == '1' and duplex != '1'):
+                raise HTTPException(422, '预连接仅用于全双工通话')
+            if engine == 'qwen' and not config.qwen.ready:
+                raise HTTPException(503, '服务器尚未配置千问实时语音')
+            if engine == 'cascade' and reply_audio == '1' and not config.speech.tts_ready:
+                raise HTTPException(503, '服务器尚未配置语音合成')
+            if engine == 'cascade' and not config.speech.asr_ready:
                 raise HTTPException(503, '服务器尚未配置语音识别')
-            async with runtime(current, socket) as rt:
+            if prepare == '1':
+                preparation_started = time.monotonic()
+                # Read one account snapshot, then release its lock before any
+                # upstream wait. Standby reserves no turn or business quota.
+                if current['id'] in preparing_voice:
+                    raise HTTPException(409, '已有语音连接正在准备')
+                if len(preparing_voice) >= 8:
+                    raise HTTPException(503, '语音准备繁忙，请稍后接通')
+                if not accounts.consume('voice_prepare:' + current['id'], 6, 60):
+                    raise HTTPException(429, '语音准备较频繁，请稍后再试')
+                preparing_voice.add(current['id'])
+                preparation_owned = True
+                async with runtime(current, socket, wait_seconds=5) as snapshot:
+                    if snapshot.store.settings().mode == 'work':
+                        raise HTTPException(409, '工作模式不预连接 AI 语音回复')
+                    prepared_context = (realtime_instructions(snapshot.agent.instructions(directed=True)),
+                                        AssistantTools(snapshot.agent).schemas())
+                def preparation_command(message):
+                    if message['type'] == 'websocket.disconnect':
+                        return 'end'
+                    if message.get('bytes') is not None:
+                        raise HTTPException(422, '接通前不能上传录音')
+                    command = json.loads(message.get('text') or '{}')
+                    if command not in ({'type': 'start'}, {'type': 'end'}):
+                        raise HTTPException(422, '请先主动接通语音')
+                    return command['type']
+
+                opening = asyncio.create_task(upstream.enter_async_context(
+                    api.state.qwen.duplex_session(prepared_context[0], (), prepared_context[1])))
+                control = asyncio.create_task(socket.receive())
+                command = None
+                try:
+                    async with asyncio.timeout(25):
+                        done, _ = await asyncio.wait((opening, control), return_when=asyncio.FIRST_COMPLETED)
+                        if control in done:
+                            command = preparation_command(control.result())
+                            if command == 'end':
+                                return
+                        prepared_native = await opening
+                    await socket.send_json({'type': 'prepared', 'expires_in': 120})
+                    diagnostics.info('voice_prepare request_id=%s ready_ms=%d', request_id,
+                                     (time.monotonic() - preparation_started) * 1000)
+                    if command is None:
+                        async with asyncio.timeout(120):
+                            command = preparation_command(await control)
+                    if command == 'end':
+                        return
+                finally:
+                    for task in (opening, control):
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(opening, control, return_exceptions=True)
+                if not accounts.authenticate(digest(token(socket))):
+                    raise HTTPException(401, '登录已失效')
+                # This transport is now a call, not a standby reservation. A
+                # following preparation can wait for its account cleanup.
+                preparing_voice.discard(current['id'])
+                preparation_owned = False
+            async with activated_runtime() as rt:
                 # A streaming ID is single-use. Recovery reads /v1/turns; no replay
                 # can swap in different audio or charge twice for an uncertain turn.
                 if rt.store.mobile_turn_status(request_id) is not None:
@@ -367,6 +498,52 @@ def create_hosted_app(config=None, data_directory=None):
                 rt.store.mobile_turn(request_id, 'stream:' + interaction)
                 rt.store.mobile_turn_stage(request_id, 'streaming')
                 reserved = True
+                if engine == 'qwen' and rt.store.settings().mode == 'work':
+                    raise HTTPException(409, '工作模式请使用录音转写通道，不开启 AI 语音回复')
+                if duplex == '1':
+                    def charge_turn(billable):
+                        if not accounts.authenticate(digest(token(socket))):
+                            raise HTTPException(401, '登录已失效')
+                        return not billable or accounts.consume('usage:' + current['id'],
+                            int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400)
+                    instructions = realtime_instructions(rt.agent.instructions(directed=True))
+                    history, schemas = rt.conversation_history(), AssistantTools(rt.agent).schemas()
+                    if prepared_native is not None:
+                        native = prepared_native
+                        if prepared_context != (instructions, schemas):
+                            await native.update(instructions=instructions,
+                                tools=[{'type': 'function', **s['function']} for s in schemas])
+                        await native.seed_history(history)
+                    else:
+                        native = await upstream.enter_async_context(
+                            api.state.qwen.duplex_session(instructions, history, schemas))
+                    result = await duplex_call(socket, rt, native, speech, request_id, charge_turn)
+                    rt.store.finish_mobile_turn(request_id, result)
+                    await upstream.aclose()
+                    await socket.send_json({'type': 'call.done'})
+                    return
+                if engine == 'qwen':
+                    async with api.state.qwen.session(realtime_instructions(rt.agent.instructions(directed=True)),
+                            rt.conversation_history(), AssistantTools(rt.agent).schemas()) as native:
+                        async def speech_ended():
+                            await socket.send_json({'type': 'input.speech_end'})
+                        await native.enable_endpoint(speech_ended)
+                        await socket.send_json({'type': 'ready', 'sample_rate': 16000, 'engine': 'qwen'})
+                        with measured(request_id, 'qwen_input'):
+                            text = await transcribe_live(socket, native)
+                        if not accounts.authenticate(digest(token(socket))):
+                            raise HTTPException(401, '登录已失效')
+                        if text.strip():
+                            rt.store.mobile_turn_stage(request_id, 'business')
+                            with measured(request_id, 'qwen_reply'):
+                                await reply_qwen(socket, rt, native, speech, text, interaction,
+                                    lambda result: rt.store.finish_mobile_turn(request_id, result))
+                        else:
+                            result = {'text': '', 'response': '没有听清，请再试一次', 'speak': False}
+                            rt.store.finish_mobile_turn(request_id, result)
+                            await socket.send_json({'type': 'result', 'result': result})
+                            await socket.send_json({'type': 'stream.done'})
+                    return
                 await socket.send_json({'type': 'ready', 'sample_rate': 16000})
                 with measured(request_id, 'live_asr'):
                     text = await transcribe_live(socket, speech)
@@ -377,25 +554,39 @@ def create_hosted_app(config=None, data_directory=None):
                 else:
                     rt.store.mobile_turn_stage(request_id, 'business')
                     with measured(request_id, 'business'):
+                        if reply_audio == '1':
+                            await reply_live(socket, rt, speech, text, interaction,
+                                lambda result: rt.store.finish_mobile_turn(request_id, result))
+                            return
                         result = await rt.turn(text, 'asr', interaction)
                 rt.store.finish_mobile_turn(request_id, result)
                 await socket.send_json({'type': 'result', 'result': result})
+                if reply_audio == '1':
+                    await socket.send_json({'type': 'stream.done'})
         except WebSocketDisconnect:
             pass
         except (HTTPException, ValueError, SpeechProviderError, TimeoutError) as error:
             status = error.status_code if isinstance(error, HTTPException) else 502
-            detail = error.detail if isinstance(error, HTTPException) else '实时识别中断，请检查网络并查询本轮状态后重试'
+            logging.getLogger('uvicorn.error.aidol.mobile').warning(
+                'voice_session request_id=%s failure=%s status=%d', request_id, type(error).__name__, status)
+            detail = error.detail if isinstance(error, HTTPException) else '实时语音中断，请检查网络并查询本轮状态后重试'
             try:
                 await socket.send_json({'type': 'error', 'status': status, 'detail': detail})
             except (WebSocketDisconnect, RuntimeError):
                 pass
         finally:
-            if reserved:
-                rt.store.fail_mobile_turn(request_id)  # completed responses stay completed
             try:
-                await socket.close()
-            except (WebSocketDisconnect, RuntimeError):
-                pass
+                await upstream.aclose()
+            finally:
+                if preparation_owned:
+                    preparing_voice.discard(current['id'])
+                if reserved:
+                    rt.store.fail_mobile_turn(request_id)  # completed responses stay completed
+                try:
+                    await socket.flush()
+                    await socket.close()
+                except (WebSocketDisconnect, RuntimeError):
+                    pass
 
     @api.get('/v1/turns/{request_id}')
     async def mobile_turn_status(request_id: str, request: Request, current=Depends(user)):
@@ -593,6 +784,117 @@ def create_hosted_app(config=None, data_directory=None):
                 raise HTTPException(404, '草稿不存在或已处理')
             return {'ok': True, 'status': action, 'sent': False}
 
+    # Persist pending jobs before returning the raw transcript. GETs resume pending jobs
+    # after a restart; an in-process key prevents duplicate model calls from concurrent polls.
+    work_summaries_running = set()
+    work_summary_slots = asyncio.Semaphore(2)
+
+    async def summarize_work(current, meeting_id):
+        key = (current['id'], meeting_id)
+        store = None
+        try:
+            async with work_summary_slots:
+                found = accounts.user(current['username'])
+                if found is None or found['id'] != current['id']:
+                    return
+                async with runtimes.use(current['id'], wait_seconds=10) as rt:
+                    store = rt.store
+                    meeting = store.work_meeting(meeting_id)
+                    if meeting is None or meeting['summary_status'] != 'pending':
+                        return
+                    rows = meeting['sources']
+                charge = lambda: accounts.consume('usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400)
+                report = await WorkMeetingMinutes(config, charge).generate(rows,
+                    lambda stage, done, total: store.work_summary_progress(meeting_id, stage, done, total))
+                # The network work never holds the account's voice/control lock.
+                found = accounts.user(current['username'])
+                if found is None or found['id'] != current['id']:
+                    return
+                async with runtimes.use(current['id'], wait_seconds=10) as rt:
+                    report['includes_demo'] = False
+                    report['meeting_id'] = meeting_id
+                    report['capture_status'] = meeting['status']
+                    if not rt.store.save_work_summary(meeting_id, report, [row['id'] for row in rows]):
+                        rt.store.fail_work_summary(meeting_id)
+        except asyncio.CancelledError:
+            # Keep the persisted pending job; the next page read resumes it.
+            raise
+        except Exception:
+            if store is not None and Path(store.path).exists():
+                store.fail_work_summary(meeting_id)
+            diagnostics.info('work meeting summary failed')
+        finally:
+            work_summaries_running.discard(key)
+
+    def resume_work_summaries(background, current, meetings):
+        for meeting in meetings:
+            key = (current['id'], meeting['id'])
+            if meeting['summary_status'] == 'pending' and key not in work_summaries_running:
+                work_summaries_running.add(key)
+                background.add_task(summarize_work, current, meeting['id'])
+
+    def read_work_store(current):
+        # SQLite snapshot reads need not wait for ASR's account lock. This lets the
+        # progress page remain usable while another segment is being transcribed.
+        existing = runtimes.items.get(current['id'])
+        if existing is not None:
+            return existing.store
+        path = directory / 'users' / (current['id'] + '.sqlite3')
+        return Store(str(path)) if path.exists() else None
+
+    @api.post('/v1/work-meetings')
+    async def start_work_meeting(value: WorkMeetingStart, request: Request, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            if rt.store.settings().mode != 'work':
+                raise HTTPException(409, '请先切换到工作模式')
+            meeting = rt.store.start_work_meeting(value.meeting_id)
+            if meeting['status'] != 'recording':
+                raise HTTPException(409, '这场会议已结束，请开始新的会议')
+            return meeting
+
+    @api.get('/v1/work-meetings')
+    async def list_work_meetings(request: Request, background: BackgroundTasks, current=Depends(user)):
+        store = read_work_store(current)
+        meetings = store.work_meetings() if store else []
+        resume_work_summaries(background, current, meetings)
+        return {'meetings': meetings}
+
+    @api.get('/v1/work-meetings/{meeting_id}')
+    async def get_work_meeting(meeting_id: str, request: Request, background: BackgroundTasks, current=Depends(user)):
+        store = read_work_store(current)
+        meeting = store.work_meeting(meeting_id) if store else None
+        if meeting is None:
+            raise HTTPException(404, '会议记录不存在')
+        resume_work_summaries(background, current, [meeting])
+        return meeting
+
+    @api.post('/v1/work-meetings/{meeting_id}/finish')
+    async def finish_work_meeting(meeting_id: str, value: WorkMeetingFinish, request: Request, background: BackgroundTasks, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            try:
+                meeting = rt.store.finish_work_meeting(meeting_id, value.segment_count, value.complete)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from None
+            if meeting is None:
+                raise HTTPException(404, '会议记录不存在')
+            resume_work_summaries(background, current, [meeting])
+            return meeting
+
+    @api.post('/v1/work-meetings/{meeting_id}/retry-summary')
+    async def retry_work_meeting(meeting_id: str, request: Request, background: BackgroundTasks, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            meeting = rt.store.work_meeting(meeting_id)
+            if meeting is None:
+                raise HTTPException(404, '会议记录不存在')
+            if not meeting['sources'] or meeting['status'] == 'recording':
+                raise HTTPException(409, '请先结束会议并保存原文')
+            if (current['id'], meeting_id) in work_summaries_running:
+                return meeting
+            rt.store.retry_work_summary(meeting_id)
+            meeting = rt.store.work_meeting(meeting_id)
+            resume_work_summaries(background, current, [meeting])
+            return meeting
+
     @api.post('/v1/meetings')
     async def mobile_meeting(value: MeetingRequest, request: Request, current=Depends(user)):
         async with runtime(current, request, True) as rt:
@@ -621,8 +923,9 @@ def create_hosted_app(config=None, data_directory=None):
     async def mobile_export(request: Request, current=Depends(user)):
         async with runtime(current, request) as rt:
             return {'user': current, 'settings': rt.store.settings().model_dump(), 'memories': rt.store.list('memories', 10000),
-                    'version': 3, 'drafts': rt.store.list('drafts', 10000),
-                    'transcripts': rt.store.list('transcripts', 10000), 'reports': rt.store.all_meeting_reports(), 'tasks': rt.store.list('action_tasks', 10000)}
+                    'version': 4, 'drafts': rt.store.list('drafts', 10000),
+                    'transcripts': rt.store.list('transcripts', 10000), 'reports': rt.store.all_meeting_reports(), 'tasks': rt.store.list('action_tasks', 10000),
+                    'work_meetings': [rt.store.work_meeting(row['id']) for row in rt.store.work_meetings(10000)]}
 
     @api.delete('/v1/data')
     async def mobile_clear(value: ConfirmPassword, request: Request, current=Depends(user)):

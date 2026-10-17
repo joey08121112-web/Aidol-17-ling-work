@@ -1,5 +1,7 @@
 # 聆 · Aidol
 
+语音增量：新版 Android 已接入 Qwen Omni 原生音频输入/音频输出；后端配置 `QWEN_OMNI_API_KEY` 后，主动提问和连续通话自动选用。密钥只保留在后端。配置、工具查询、记忆回执和验收边界见 [千问实时语音](docs/qwen-realtime.md)。
+
 耳机里的随身助手：语音陪伴、工作记录、会议纪要、个人记忆和通勤提醒。项目只维护三个产品模块，放在同一个仓库，通过 `main` 共享源码。
 
 | 模块 | 职责 |
@@ -29,7 +31,7 @@
 
 后端监听 `127.0.0.1:8108`，数据独立保存在 `data/android-local/`。根目录 `start.ps1`、`start.sh`、`start.bat`、`start.command` 也指向此账号后端。`python run.py` 也运行账号 API，但读取 `HOST`、`PORT`、`AIDOL_DATA_DIR`，默认数据目录为 `data/hosted/`；USB 开发优先使用上述专用启动器。健康检查为 `http://127.0.0.1:8108/healthz`。
 
-USB 授权后建立 `adb -s <serial> reverse tcp:8108 tcp:8108`，Android Studio 打开 `android-app/` 并在手机 Run。debug 的“开发测试设置”分别选择音频来源和后端：系统蓝牙兼容 / Rise SDK 麦克风，本地电脑服务 / 远端服务器。本地固定 `http://127.0.0.1:8108`，不提供模拟器入口；本地与远端账号、会话和数据互不复制。
+USB 授权后建立 `adb -s <serial> reverse tcp:8108 tcp:8108`，Android Studio 打开 `android-app/` 并在手机 Run。debug 的“连接设置”分别选择音频来源和后端：唯一音频 Rise SDK 麦克风，本地电脑服务 / 远端服务器。本地固定 `http://127.0.0.1:8108`，不提供模拟器入口；本地与远端账号、会话和数据互不复制。
 
 完整步骤和无 Key 测试范围见 [USB 真机与本地后端测试](docs/android-local-testing.md)。Rise 开发还需按 [M0/M1 交接](docs/android-m0-m1-handoff.md) 提供官方 Word、`demo_6_7.zip` 和固定版本 AAR；这些厂商资料并不是已移除的项目 Demo。换电脑时需包含当前未提交源码，不能只发送旧 HEAD。
 
