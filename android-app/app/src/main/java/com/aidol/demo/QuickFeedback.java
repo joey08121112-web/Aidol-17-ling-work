@@ -10,7 +10,7 @@ import java.util.concurrent.Executors;
 import java.util.function.BooleanSupplier;
 import java.util.function.Predicate;
 
-/** Short, offline UI speech. Shares the verified headset route, never the conversation. */
+/** Short, offline nonverbal UI feedback. Shares the verified headset route, never the conversation. */
 final class QuickFeedback implements AutoCloseable {
     private final Context context;
     private final Predicate<AudioDeviceInfo> outputIdentity;
@@ -28,7 +28,7 @@ final class QuickFeedback implements AutoCloseable {
         this.allowed = allowed;
     }
 
-    // Called on the main thread. A burst keeps only its latest hint; speech never queues.
+    // Called on the main thread. A burst keeps only its latest hint; earcons never queue.
     void say(LocalCue cue) {
         if (pending != null) ui.removeCallbacks(pending);
         pending = null;

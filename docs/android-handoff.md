@@ -260,3 +260,8 @@ adb -s <serial> pull /sdcard/Android/data/com.aidol.app.review/files/visual-revi
 官方约束参考：[位置前台服务](https://developer.android.com/about/versions/14/changes/fgs-types-required)、[位置授权](https://developer.android.com/develop/sensors-and-location/location/permissions)。当前从可见页面启动持续定位服务，不请求“始终允许”位置授权；系统强制停止、撤销授权或厂商省电仍可能中断，界面保留恢复入口。
 
 自动验收使用 `gradle --offline -PaidolCommuteReview testDebugUnitTest lintDebug assembleDebug assembleDebugAndroidTest`，随后运行 `com.aidol.app.debug.test/com.aidol.demo.CommuteInstrumentation`。测试用独立私有偏好与手机内存MockWebServer，公开地点样例；真实手机定位仅送测试内存服务，不调用真实地图供应商、不写用户地址/会议。包含完整180秒熄屏周期及通知停止。实际结果见 acceptance.md。
+
+
+## 2026-10-18 操作语音改为固定耳标
+
+App全部24段固定语音资源替换为280–360ms的无语音单声耳标。生活清亮、工作低柔、通勤轻扬，模式映射固定；其他已有操作提示共用柔和确认音。通勤页主动开始并实际切模式也使用对应耳标。文字状态、正常AI问答、主动朗读、工作/来电采音与通勤定位流程保留；定位及会议导出的静默要求不变。详细声学参数、生成方法与固件边界见[操作提示音](android-audio-prompts.md)。

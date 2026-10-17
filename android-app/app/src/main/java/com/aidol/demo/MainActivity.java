@@ -275,7 +275,13 @@ public final class MainActivity extends Activity {
             });
         connectBackend();
         commutePanel = new CommutePanel(this, () -> api, () -> state, () -> !busy && session == null, () -> visible,
-            this::commutePermissions, () -> { put(settings(), "mode", "commute"); put(settings(), "auto_mode", false); listenMode = VoiceInteraction.CALL; updateStatus(); },
+            this::commutePermissions, () -> {
+                boolean changed = !"commute".equals(mode());
+                put(settings(), "mode", "commute"); put(settings(), "auto_mode", false);
+                JSONObject agent = state.optJSONObject("agent"); if (agent != null) put(agent, "mode", "commute");
+                listenMode = VoiceInteraction.CALL; updateStatus();
+                if (changed && quickFeedback != null) quickFeedback.say(LocalCue.COMMUTE);
+            },
             () -> { startupLocationAttempted = false; handler.post(startupLocationTick); }, () -> scroll);
         if (getIntent().getBooleanExtra("open_commute", false)) tab = 3;
         if (getIntent().getBooleanExtra("open_work_tasks", false)) tab = 2;
