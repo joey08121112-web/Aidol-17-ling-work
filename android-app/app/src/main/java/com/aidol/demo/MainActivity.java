@@ -108,11 +108,11 @@ public final class MainActivity extends Activity {
                 cancelSession(reason);
                 disconnectVoiceService();
                 syncHeadsetControls();
-                if (visible && !isDestroyed()) showApp();
+                if (visible && !isDestroyed()) updateStatus();
             });
             syncHeadsetControls();
             lastNotice = "耳机会话已开启 · 通话可锁屏继续 · 通知可挂断";
-            showApp();
+            updateStatus();
             if (callStartPending) { callStartPending = false; startVoice(); }
         }
         @Override public void onServiceDisconnected(android.content.ComponentName name) {
@@ -160,6 +160,14 @@ public final class MainActivity extends Activity {
     private HostedSession session;
     private boolean busy, recording, visible;
     private int tab, authMode;
+    // Built-once tab contents: a clean tab switch reattaches the cached container instead of
+    // re-running the builder; markTabsDirty() forces a rebuild of stale content on next visit.
+    private final LinearLayout[] tabViews = new LinearLayout[5];
+    private final boolean[] tabDirty = {true, true, true, true, true};
+    private LinearLayout activeCallRow;
+    private final IconView[] navIcons = new IconView[5];
+    private final TextView[] navNames = new TextView[5];
+    private final LinearLayout[] navItems = new LinearLayout[5];
     private String memoryFilter = "", lastNotice = "", lastAnswer = "", lastUser = "";
     private JSONArray lastCitations = new JSONArray(), lastTools = new JSONArray();
     private LinearLayout turnDetails;
@@ -219,7 +227,7 @@ public final class MainActivity extends Activity {
     private final Runnable repeatTick = new Runnable() {
         @Override public void run() {
             if (!repeatArmed || !sessionAvailable() || (tab != 0 && listenMode != VoiceInteraction.CALL) || api.vault.token().isEmpty()) return;
-            if (listenMode == 2 && !"life".equals(mode())) { stopRepeat(); lastNotice = "场景已切换，定时聆听已停止"; showApp(); return; }
+            if (listenMode == 2 && !"life".equals(mode())) { stopRepeat(); lastNotice = "场景已切换，定时聆听已停止"; updateStatus(); return; }
             long remaining = repeatAt - android.os.SystemClock.elapsedRealtime();
             if (session == null && !busy && locationListener == null && !permissionPending && remaining <= 0) { startVoice(); return; }
             if (session == null && !busy && status != null && remaining > 0) setStatusText((listenMode == 2 ? "定时聆听" : InteractionCopy.name(listenMode)) + " · " + Math.max(1, (remaining + 999) / 1000) + " 秒后继续 · 点击停止结束");
@@ -258,6 +266,7 @@ public final class MainActivity extends Activity {
         headsetStatus = null;
         voiceHint = null;
         developmentSummary = null;
+        modeChoices = null; modeHint = null; workClock = null; workMeetingList = null;
         root = column(); root.setBackgroundColor(BG);
         root.setFitsSystemWindows(false);
         setContentView(root);
@@ -336,13 +345,15 @@ public final class MainActivity extends Activity {
             .setPositiveButton("我已妥善保存", (d, w) -> {}).show();
     }
 
+    /** Full screen rebuild: new scaffold, all cached tab contents dropped. Cold paths only
+     *  (first show, account or backend switch); state updates and tab switches use renderTab(). */
     private void showApp() {
         handler.removeCallbacks(workMeetingPoll);
-        workMeetingList = null;
-        boolean restoreComposerFocus = tab == 0 && chatInput != null && chatInput.hasFocus();
-        int draftSelection = chatInput == null ? 0 : chatInput.getSelectionStart();
         if (chatInput != null) chatDraft = chatInput.getText().toString();
-        authError = null; base();
+        authError = null;
+        java.util.Arrays.fill(tabViews, null);
+        java.util.Arrays.fill(tabDirty, true);
+        base();
         LinearLayout head = row(); head.setGravity(Gravity.CENTER_VERTICAL); head.setPadding(dp(24), dp(8), dp(24), dp(4));
         root.addView(head);
         LinearLayout wordmark = column(); head.addView(wordmark, new LinearLayout.LayoutParams(0, -2, 1));
@@ -352,14 +363,11 @@ public final class MainActivity extends Activity {
         avatar.setBackground(ripple(SOFT, 24, LINE)); avatar.setTextColor(ACCENT); avatar.setContentDescription("打开我的空间");
         status = label(root, "", 11, MUTED); status.setPadding(dp(24), 0, dp(24), dp(6));
         status.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
-        if (tab != 0 && repeatArmed && listenMode == VoiceInteraction.CALL) {
-            LinearLayout activeCall = row(); activeCall.setPadding(dp(24), dp(4), dp(24), dp(4)); root.addView(activeCall);
-            button(activeCall, "AI 通话中 · 返回", false, () -> switchTab(0));
-            button(activeCall, "挂断", false, () -> { cancelSession("通话已结束"); showApp(); });
-        }
+        activeCallRow = row(); activeCallRow.setPadding(dp(24), dp(4), dp(24), dp(4)); root.addView(activeCallRow);
+        button(activeCallRow, "AI 通话中 · 返回", false, () -> switchTab(0));
+        button(activeCallRow, "挂断", false, () -> { cancelSession("通话已结束"); markTabsDirty(); renderTab(); });
         scroll = new ScrollView(this); scroll.setFillViewport(true); scroll.setClipToPadding(false); scroll.setVerticalScrollBarEnabled(false);
         root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
-        page = column(); page.setPadding(dp(24), dp(12), dp(24), dp(32)); scroll.addView(page);
         scroll.setOnScrollChangeListener((v, x, y, oldX, oldY) -> {
             if (tab == 0 && v == scroll) {
                 followingConversation = ConversationFeed.shouldFollow(y, page.getHeight(), scroll.getHeight());
@@ -373,21 +381,76 @@ public final class MainActivity extends Activity {
         String[] names = {"对话", "记忆", "工作", "通勤", "我的"};
         for (int i = 0; i < names.length; i++) {
             final int index = i; LinearLayout item = column(); item.setGravity(Gravity.CENTER); item.setPadding(0, dp(7), 0, dp(5));
-            item.setBackground(ripple(tab == i ? SOFT : BG, 18, tab == i ? SOFT : BG));
             item.setSelected(tab == i); item.setFocusable(true);
             item.setMinimumHeight(dp(60)); nav.addView(item, new LinearLayout.LayoutParams(0, -2, 1));
+            navItems[i] = item;
             IconView icon = new IconView(i, tab == i ? INK : MUTED); item.addView(icon, new LinearLayout.LayoutParams(dp(22), dp(22)));
+            navIcons[i] = icon;
             TextView name = label(item, names[i], 11, tab == i ? INK : MUTED); name.setGravity(Gravity.CENTER); name.setPadding(0, dp(4), 0, 0);
+            navNames[i] = name;
             item.setContentDescription(names[i]); item.setOnClickListener(v -> switchTab(index));
         }
-        if (tab == 0) conversation(); else if (tab == 1) memories(); else if (tab == 2) work(); else if (tab == 3) commute(); else profile();
+        updateNavSelection();
+        renderTab();
+    }
+
+    /** Rebuilds only the current tab's content (when stale) and reattaches it; never touches the scaffold. */
+    private void renderTab() {
+        boolean restoreComposerFocus = tab == 0 && chatInput != null && chatInput.hasFocus();
+        int draftSelection = chatInput == null ? 0 : chatInput.getSelectionStart();
+        if (tab == 0 && chatInput != null) chatDraft = chatInput.getText().toString();
+        if (tabDirty[tab] || tabViews[tab] == null) {
+            clearTabFields(tab);
+            if (tab == 0) composer.removeAllViews();
+            LinearLayout fresh = column(); fresh.setPadding(dp(24), dp(12), dp(24), dp(32));
+            page = fresh;
+            if (tab == 0) conversation(); else if (tab == 1) memories(); else if (tab == 2) work(); else if (tab == 3) commute(); else profile();
+            tabViews[tab] = fresh; tabDirty[tab] = false;
+        } else page = tabViews[tab];
+        if (scroll.getChildCount() == 0 || scroll.getChildAt(0) != tabViews[tab]) {
+            scroll.removeAllViews();
+            scroll.addView(tabViews[tab]);
+            if (tab == 0 && session != null) followConversation();
+        }
+        composer.setVisibility(tab == 0 ? View.VISIBLE : View.GONE);
+        updateNavSelection();
         if (restoreComposerFocus && chatInput != null) {
             chatInput.requestFocus(); chatInput.setSelection(Math.max(0, Math.min(draftSelection, chatInput.length())));
         }
+        if (tab != 0) conversationScrollQueued = false;
         updateStatus();
         syncHeadsetControls();
         prepareVoice();
+        handler.removeCallbacks(workMeetingPoll);
         if (tab == 2 && visible) handler.post(workMeetingPoll);
+    }
+
+    /** Fresh server state arrived: every tab's built content is stale, only the visible one re-renders now. */
+    private void markTabsDirty() { java.util.Arrays.fill(tabDirty, true); }
+
+    /** Drop the per-tab view refs of one tab before its builder runs; other tabs keep their cached refs. */
+    private void clearTabFields(int which) {
+        if (which == 0) {
+            diagnosticsView = null; turnDetails = null;
+            voiceButton = null; cancelButton = null; orb = null; chatInput = null;
+            callCaption = null; liveWords = null; content = null; conversationCaptionBox = null; conversationCaptionViews.box = null;
+            liveTurn = null; liveUserBubble = null; liveAssistantBubble = null; conversationStarters = null;
+            conversationScrollQueued = false; headsetStatus = null; voiceHint = null; modeChoices = null; modeHint = null;
+        } else if (which == 2) {
+            workClock = null; workMeetingList = null; workCaptionBox = null; workCaptionViews.box = null;
+        } else if (which == 4) {
+            headsetStatus = null; developmentSummary = null;
+        }
+    }
+
+    private void updateNavSelection() {
+        for (int i = 0; i < navItems.length; i++) {
+            if (navItems[i] == null) continue;
+            navItems[i].setSelected(tab == i);
+            navItems[i].setBackground(ripple(tab == i ? SOFT : BG, 18, tab == i ? SOFT : BG));
+            if (navIcons[i] != null) navIcons[i].setColor(tab == i ? INK : MUTED);
+            if (navNames[i] != null) navNames[i].setTextColor(tab == i ? INK : MUTED);
+        }
     }
 
     private void switchTab(int next) {
@@ -395,7 +458,7 @@ public final class MainActivity extends Activity {
         clearHeadsetGesture();
         boolean keepCall = sessionUsesCapture && session != null || repeatArmed;
         if (session != null && !keepCall) cancelSession("已结束当前操作");
-        if (!keepCall) stopRepeat(); tab = next; if (next == 0) followingConversation = true; hideKeyboard(); showApp();
+        if (!keepCall) stopRepeat(); tab = next; if (next == 0) followingConversation = true; hideKeyboard(); renderTab();
     }
 
     private void conversation() {
@@ -436,7 +499,7 @@ public final class MainActivity extends Activity {
         voiceHint = label(listeningDetails, voiceHintText(), 12, MUTED);
         label(listeningDetails, "生活与通勤：单击开始连续问答，停顿后自动回复，文字和音频逐步返回；再次单击结束。工作：单击录音转写，再次单击结束并保存。双击结束当前会话并切换模式，切换后待机。通话中持续收音，说“小万”可打断 AI 播报。", 12, MUTED);
         button(listeningDetails, lockScreenEnabled() ? "停止锁屏耳机会话" : "开启本次锁屏耳机会话", false, () -> {
-            if (lockScreenEnabled()) { stopLockScreenSession(); showApp(); }
+            if (lockScreenEnabled()) { stopLockScreenSession(); tabDirty[0] = true; renderTab(); }
             else enableLockScreenSession();
         });
         label(listeningDetails, "开启锁屏会话后，AI 通话可在锁屏时继续；通知可随时挂断。通话会持续到挂断；未通话的待命一小时后关闭。关闭 App、来电或断连后需重新开启。定时与记录仅在当前页面运行。", 12, MUTED);
@@ -669,7 +732,7 @@ public final class MainActivity extends Activity {
             if ("completed".equals(result.optString("status")) && completed != null) {
                 acceptBusinessResult(completed);
                 lastNotice = "已找回上次处理结果；未重新提交录音或自动播放";
-                showApp(); refresh();
+                refresh();
             } else {
                 String message = "failed".equals(result.optString("status"))
                     ? "上次请求处理失败，未取得完整结果。请先核对历史；本次查询没有重放请求。"
@@ -756,7 +819,7 @@ public final class MainActivity extends Activity {
         sectionHeader(page, "我的记忆", allMemories.length() + " 条 · " + pinnedCount + " 置顶", "＋ 新记忆", () -> { if (canAct()) editMemory(null); });
         LinearLayout filters = row(); filters.setPadding(dp(3), dp(3), dp(3), dp(3)); filters.setBackground(shape(CARD, 16, CARD)); page.addView(filters);
         String[] keys = {"", "preference", "fact", "task", "trip"}, names = {"全部", "偏好", "事实", "待办", "出行"};
-        for (int i = 0; i < keys.length; i++) { final String key = keys[i]; segment(filters, names[i], memoryFilter.equals(key), () -> { memoryFilter = key; showApp(); }); }
+        for (int i = 0; i < keys.length; i++) { final String key = keys[i]; segment(filters, names[i], memoryFilter.equals(key), () -> { memoryFilter = key; tabDirty[1] = true; renderTab(); }); }
         JSONArray items = array(state, "memories"); int count = 0;
         for (int i = 0; i < items.length(); i++) {
             JSONObject memory = items.optJSONObject(i); if (memory == null || (!memoryFilter.isEmpty() && !memoryFilter.equals(memory.optString("kind")))) continue;
@@ -808,7 +871,7 @@ public final class MainActivity extends Activity {
             if (!canAct()) return; if (value(text).isEmpty()) { text.setError("记忆不能为空"); return; }
             JSONObject payload = json("content", value(text), "kind", kinds[picker.getSelectedItemPosition()], "pinned", memory != null && pinned(memory));
             request(() -> api.json(memory == null ? "POST" : "PUT", "/v1/memories" + (memory == null ? "" : "/" + memory.optString("id")), payload), result -> {
-                dialog.dismiss(); if (memory != null) { clearPrivateSnapshots(); showApp(); } refresh();
+                dialog.dismiss(); if (memory != null) clearPrivateSnapshots(); refresh();
             });
         })); dialog.show();
     }
@@ -1526,11 +1589,11 @@ public final class MainActivity extends Activity {
             LinearLayout controls = row(); intro.addView(controls);
             button(controls, active.workPaused() ? "继续记录" : "暂停", false, () -> {
                 if (session != active) return;
-                if (active.workPaused() ? active.resumeWork() : active.pauseWork()) showApp();
+                if (active.workPaused() ? active.resumeWork() : active.pauseWork()) { tabDirty[2] = true; renderTab(); }
             });
             button(controls, "标记重点", false, () -> {
                 if (session != active) return;
-                if (active.markWork("app")) { feedback("已标记 " + TimeFormat.clock(active.workOffsetMs()), null); showApp(); }
+                if (active.markWork("app")) { feedback("已标记 " + TimeFormat.clock(active.workOffsetMs()), null); tabDirty[2] = true; renderTab(); }
             });
         }
         if (recordingMeeting) {
@@ -1773,7 +1836,7 @@ public final class MainActivity extends Activity {
                     return locationApi.json("GET", "/v1/state", null);
                 }, r -> {
                     if (api != locationApi || !locationToken.equals(api.vault.token())) return;
-                    state = r; lastNotice = "定位已更新 · 可查询当地天气与附近地点"; showApp();
+                    state = r; lastNotice = "定位已更新 · 可查询当地天气与附近地点"; markTabsDirty(); renderTab();
                 });
             }
             @Override public void onProviderEnabled(String p) {}
@@ -1857,7 +1920,7 @@ public final class MainActivity extends Activity {
         dialog.setOnShowListener(v -> { dialog.getButton(-1).setTextColor(RED); dialog.getButton(-1).setOnClickListener(w -> {
             if (!canAct()) return; if (password.length() == 0) { password.setError("请输入密码"); return; }
             request(() -> api.json("DELETE", account ? "/auth/account" : "/v1/data", json("password", password.getText().toString())), r -> {
-                dialog.dismiss(); clearPrivateSnapshots(); if (account) signOut(); else { showApp(); refresh(); }
+                dialog.dismiss(); clearPrivateSnapshots(); if (account) signOut(); else refresh();
             });
         }); }); dialog.show();
     }
@@ -1973,7 +2036,7 @@ public final class MainActivity extends Activity {
                     lastNotice = appliedNotice + (repeatArmed ? "；提示后继续聆听" : "；等待你手动开始");
                     listenMode = "work".equals(appliedMode) ? VoiceInteraction.NOTES : VoiceInteraction.CALL;
                     if (openConversation) tab = 0;
-                    showApp();
+                    markTabsDirty(); renderTab();
 
                     // Commit the real settings result first. Playback cannot undo or repeat that update.
                     if (sessionAvailable() && client == api && change.matches(api, sessionGeneration) && session == null) {
@@ -2012,7 +2075,7 @@ public final class MainActivity extends Activity {
     }
     private void saveModeAndOpenWork() { changeMode("work", true); }
     private void mutate(String method, String path, JSONObject body) { if (canAct()) request(() -> api.json(method, path, body), r -> {
-        if (path.startsWith("/v1/memories/") && ("DELETE".equals(method) || "PUT".equals(method))) { clearPrivateSnapshots(); showApp(); }
+        if (path.startsWith("/v1/memories/") && ("DELETE".equals(method) || "PUT".equals(method))) clearPrivateSnapshots();
         refresh();
     }); }
     private void refresh() {
@@ -2021,7 +2084,7 @@ public final class MainActivity extends Activity {
         // The explicit refresh button clears lastNotice before calling this method.
         final String notice = lastNotice;
         request(() -> api.json("GET", "/v1/state", null), r -> {
-            state = r; lastNotice = notice; showApp();
+            state = r; lastNotice = notice; markTabsDirty(); renderTab();
             handler.post(startupLocationTick);
         });
     }
@@ -2088,7 +2151,7 @@ public final class MainActivity extends Activity {
     private void endVoice() {
         if ("work".equals(mode()) && session != null && sessionUsesCapture) {
             stopRepeat(); session.stopRecording(); lastNotice = "正在结束并保存工作记录…"; updateStatus();
-            if (visible) { tab = 2; showApp(); }  // Also hides pause/mark controls while saving.
+            if (visible) { tab = 2; markTabsDirty(); renderTab(); }  // Also hides pause/mark controls while saving.
             renderWorkMeetings();
         } else cancelSession("会话已结束，单击可重新开始");
     }
@@ -2231,7 +2294,7 @@ public final class MainActivity extends Activity {
                 if (!currentSession(generation)) return;
                 if (!value.optString("id").equals(workCaptionMeetingId)) {
                     workCaptionMeetingId = value.optString("id"); workCaptionList.reset(); conversationCaptionList.reset();
-                    workCaptionStartedAt = value.optString("started_at"); showApp();
+                    workCaptionStartedAt = value.optString("started_at"); markTabsDirty(); renderTab();
                 }
                 JSONArray previous = array(state, "work_meetings"), updated = new JSONArray();
                 updated.put(value);
@@ -2259,7 +2322,7 @@ public final class MainActivity extends Activity {
             @Override public void processing() { if (!currentSession(generation)) return; recording = false; if (voiceButton != null) voiceButton.setText(submittedInteraction == VoiceInteraction.NOTES ? "正在保存…" : "结束会话"); if (callCaption != null) callCaption.setText(submittedInteraction == VoiceInteraction.NOTES ? "正在保存工作记录" : "正在思考 · 单击结束会话"); }
             @Override public void idle() { if (!currentSession(generation)) return; turnSucceeded = listenMode == VoiceInteraction.CALL; if (!turnSucceeded) stopRepeat(); uncertainTurnId = ""; }
             @Override public void recording() { if (!currentSession(generation)) return; recording = true; if (voiceButton != null) voiceButton.setText(listenMode == VoiceInteraction.NOTES ? "结束并保存记录" : "结束会话"); if (callCaption != null) callCaption.setText(InteractionCopy.recording(listenMode, settings().optBoolean("vad_enabled", true))); setStatusText("正在听你说…");
-                if (listenMode == VoiceInteraction.NOTES && visible && tab == 2) showApp(); }  // Show pause/mark controls.
+                if (listenMode == VoiceInteraction.NOTES && visible && tab == 2) { markTabsDirty(); renderTab(); } }  // Show pause/mark controls.
             @Override public void meter(long bytes, double rms) { if (currentSession(generation)) { diagnosticBytes = bytes; diagnosticRms = rms; renderDiagnostics(); if (orb != null) orb.level = (float) Math.min(1, rms * 9);
                 if (workClock != null && workClock.isAttachedToWindow() && session != null && !session.workPaused())
                     workClock.setText("已记录 " + TimeFormat.clock(session.workOffsetMs()) + (session.workMarks() > 0 ? " · 已标记 " + session.workMarks() + " 处" : "")); } }
@@ -2297,7 +2360,7 @@ public final class MainActivity extends Activity {
                     else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                     if (voiceButton != null) voiceButton.setText(InteractionCopy.start(listenMode)); if (cancelButton != null) cancelButton.setVisibility(repeatArmed ? View.VISIBLE : View.GONE); if (orb != null) orb.level = 0;
                     if (api.vault.token().isEmpty()) { showAuth(0); authError.setText("登录已失效，请重新登录"); } else {
-                        if (visible && submittedInteraction == VoiceInteraction.NOTES && !operationCue) { tab = 2; showApp(); }
+                        if (visible && submittedInteraction == VoiceInteraction.NOTES && !operationCue) { tab = 2; markTabsDirty(); renderTab(); }
                         updateStatus(); if (visible && !repeatArmed) refresh();
                     }
                 }
@@ -2431,7 +2494,7 @@ public final class MainActivity extends Activity {
                     stopRepeat();
                     listenMode = VoiceInteraction.CALL;
                     int targetTab = "work".equals(mode()) ? 2 : 0;
-                    if (tab != targetTab) { tab = targetTab; showApp(); }
+                    if (tab != targetTab) { tab = targetTab; markTabsDirty(); renderTab(); }
                     startVoice();
                     break;
                 case STOP_AND_SEND:
@@ -2441,7 +2504,7 @@ public final class MainActivity extends Activity {
                     // No earbud cue: the capture owns the headset audio path while recording.
                     if (session != null && session.markWork("headset")) {
                         feedback("耳机已标记 " + TimeFormat.clock(session.workOffsetMs()), null);
-                        if (visible && tab == 2) showApp();
+                        if (visible && tab == 2) { tabDirty[2] = true; renderTab(); }
                     }
                     break;
                 case INTERRUPT:
@@ -2485,6 +2548,8 @@ public final class MainActivity extends Activity {
     private void updateStatus() {
         setStatusText(busy ? "正在同步…" : lastNotice);
         if (status != null) status.setTextColor(busy ? MUTED : ACCENT);
+        if (activeCallRow != null) activeCallRow.setVisibility(
+            tab != 0 && repeatArmed && listenMode == VoiceInteraction.CALL ? View.VISIBLE : View.GONE);
         if (voiceButton != null && session == null) voiceButton.setText(callStartPending ? "正在接通…" : repeatArmed ? "通话中 · 我在听" : InteractionCopy.start(listenMode));
         if (cancelButton != null) { cancelButton.setVisibility(session != null || repeatArmed || callStartPending ? View.VISIBLE : View.GONE); cancelButton.setText(InteractionCopy.stop(listenMode)); }
         if (callCaption != null && session == null) callCaption.setText(InteractionCopy.ready(listenMode));
@@ -2521,7 +2586,7 @@ public final class MainActivity extends Activity {
                 JSONObject caps = state.optJSONObject("capabilities");
                 availability = caps != null && caps.optBoolean("voice_realtime")
                     ? "千问实时语音已配置（实际通话仍需验证）" : "千问实时语音未配置，请检查电脑后端";
-                showApp();
+                markTabsDirty(); renderTab();
             }
             new AlertDialog.Builder(this).setTitle("后端可达").setMessage(api.serverUrl + "\n" + availability).setPositiveButton("完成", null).show();
         }); });
@@ -2817,9 +2882,11 @@ public final class MainActivity extends Activity {
     }
 
     private final class IconView extends View {
-        final int icon, color; final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        final int icon; final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
         final Path path = new Path();
+        private int color;
         IconView(int i, int c) { super(MainActivity.this); icon = i; color = c; setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO); }
+        void setColor(int c) { color = c; invalidate(); }
         @Override protected void onDraw(Canvas c) { c.save(); c.scale(getWidth() / 24f, getHeight() / 24f); p.setColor(color); p.setStyle(Paint.Style.STROKE); p.setStrokeWidth(1.5f); p.setStrokeCap(Paint.Cap.ROUND);
             if (icon == 0) { c.drawRoundRect(3, 3, 21, 18, 5, 5, p); c.drawLine(7, 18, 7, 22, p); c.drawLine(7, 22, 12, 18, p); c.drawLine(8, 9, 8, 12, p); c.drawLine(12, 7, 12, 14, p); c.drawLine(16, 9, 16, 12, p); }
             else if (icon == 1) { c.drawRoundRect(4, 3, 20, 21, 3, 3, p); c.drawLine(8, 8, 16, 8, p); c.drawLine(8, 12, 16, 12, p); c.drawLine(8, 16, 12, 16, p); }
