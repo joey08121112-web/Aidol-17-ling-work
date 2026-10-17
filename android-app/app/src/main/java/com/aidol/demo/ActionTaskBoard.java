@@ -187,7 +187,8 @@ final class ActionTaskBoard implements AutoCloseable {
             ? "到提醒时间由 App 发系统通知；省电策略可能延迟送达。"
             : "通知尚未开启，待办仍可保存。允许系统通知后才能收到提醒；点此打开通知设置。");
     }
-    void refreshReminders() { observeSession(); notificationsChanged(); ApiClient c = api.get(); if (c == null || c.vault.token().isEmpty()) return;
+    void refreshReminders() { refreshReminders(true); }
+    void refreshReminders(boolean preserveTaskPosition) { observeSession(); notificationsChanged(); ApiClient c = api.get(); if (c == null || c.vault.token().isEmpty()) return;
         long version = mutationVersion;
         execute(client -> client.json("GET", "/v1/tasks", null), result -> {
             if (version != mutationVersion || mutations > 0) return;
@@ -195,7 +196,7 @@ final class ActionTaskBoard implements AutoCloseable {
             sync(latest, true);
             if (!latest.toString().equals(tasks.toString())) {
                 tasks = latest; changed.accept(tasks); updateCount();
-                if (rows != null && rows.isAttachedToWindow()) { Runnable restore = preserveViewport(); rows.removeAllViews(); for (int i = 0; i < tasks.length(); i++) row(tasks.optJSONObject(i), false); emptyState(); restore.run(); }
+                if (rows != null && rows.isAttachedToWindow()) { Runnable restore = preserveTaskPosition ? preserveViewport() : () -> {}; rows.removeAllViews(); for (int i = 0; i < tasks.length(); i++) row(tasks.optJSONObject(i), false); emptyState(); restore.run(); }
             }
         }, () -> {}); }
     @Override public void close() { if (addDialog != null) addDialog.dismiss(); closed = true; worker.shutdownNow(); }

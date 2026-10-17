@@ -56,6 +56,9 @@ public final class MainActivity extends Activity {
     private HeadsetController headset;
     private QuickFeedback quickFeedback;
     private ActionTaskBoard taskBoard;
+    private TextView workRetentionAction, historyRangeAction;
+    private LinearLayout historyReportBox;
+    private RoundedChoiceDialog workOptionsDialog;
     private LinearLayout lastRenderedMeetingList;
     private String lastRenderedMeetingSnapshot = "";
     private ForegroundLocationMonitor locationMonitor;
@@ -1484,24 +1487,65 @@ public final class MainActivity extends Activity {
         } else workCaptionBox = null;
         label(intro, "结束后自动保存原文，再由 AI 整理摘要、决策与待办", 11, MUTED).setGravity(Gravity.CENTER);
         int retention = settings().optInt("work_audio_retention_days", 30);
-        sectionHeader(page, "会议记录", "每次录音独立保存 · 处理进度自动更新",
-            retention == 0 ? "录音：不保存" : "录音保存 " + retention + " 天", () -> {
-            if (!canAct()) return;
-            String[] options = {"不保存录音（只保留文字）", "保存 7 天", "保存 30 天", "保存 90 天", "保存 365 天"}; int[] days = {0, 7, 30, 90, 365};
-            new AlertDialog.Builder(this).setTitle("会议录音保存期限")
-                .setItems(options, (d, w) -> { JSONObject payload = cloneJson(settings()); put(payload, "work_audio_retention_days", days[w]); mutate("PUT", "/v1/settings", payload); })
-                .setNegativeButton("取消", null).show();
-        });
+        workRetentionAction = sectionHeader(page, "会议记录", "每次录音独立保存 · 处理进度自动更新",
+            retention == 0 ? "录音：不保存" : "录音保存 " + retention + " 天", this::showRecordingRetentionOptions);
         label(page, "录音按账号保存在服务器，到期自动删除；缩短期限会立即删除超期录音。文字原文与纪要不受影响。", 11, MUTED);
         workMeetingList = column(); page.addView(workMeetingList); renderWorkMeetings();
-        sectionHeader(page, "历史记录整理", "按时间范围整理较早的工作记录", "选择范围", () -> {
-            if (!canAct()) return;
-            String[] options = {"最近 1 小时", "最近 24 小时", "最近 7 天"}; int[] hours = {1, 24, 168};
-            new AlertDialog.Builder(this).setTitle("选择工作记录范围").setItems(options, (d, w) -> request(() -> api.json("POST", "/v1/meetings", json("hours", hours[w])), result -> refresh())).setNegativeButton("取消", null).show();
-        });
+        historyRangeAction = sectionHeader(page, "历史记录整理", "按时间范围整理较早的工作记录", "选择范围", this::showHistoryRangeOptions);
+        historyReportBox = column(); page.addView(historyReportBox); renderHistoryReport();
+        taskBoard.render(page, array(state, "tasks"), scroll);
+    }
+    private void showRecordingRetentionOptions() {
+        if (!canAct()) return;
+        int current = settings().optInt("work_audio_retention_days", 30);
+        String[] labels = {"不保存录音（只保留文字）", "保存 7 天", "保存 30 天", "保存 90 天", "保存 365 天"};
+        int[] days = {0, 7, 30, 90, 365}; int selected = 2;
+        for (int i = 0; i < days.length; i++) if (days[i] == current) selected = i;
+        workOptionsDialog = new RoundedChoiceDialog(this, "会议录音保存期限", "缩短期限会立即清理超期录音；文字和纪要保留。",
+            labels, selected, "保存设置", index -> {
+                if (!canAct() || days[index] == settings().optInt("work_audio_retention_days", 30)) return;
+                JSONObject payload = cloneJson(settings()); put(payload, "work_audio_retention_days", days[index]);
+                request(() -> api.json("PUT", "/v1/settings", payload), this::applyRecordingRetentionResult);
+            });
+        workOptionsDialog.show();
+    }
+    private void applyRecordingRetentionResult(JSONObject result) {
+        put(state, "settings", result);
+        int days = result.optInt("work_audio_retention_days", 30);
+        if (workRetentionAction != null && workRetentionAction.isAttachedToWindow())
+            workRetentionAction.setText(days == 0 ? "录音：不保存" : "录音保存 " + days + " 天");
+    }
+    private String historyRangeKey() { return "history_hours." + ServerEndpoint.sessionNamespace(api.serverUrl) + "." + api.vault.username(); }
+    private void showHistoryRangeOptions() {
+        if (!canAct()) return;
+        String[] labels = {"最近 1 小时", "最近 24 小时", "最近 7 天"}; int[] hours = {1, 24, 168};
+        JSONObject previous = state.optJSONObject("meeting_report");
+        int selectedHours = getPreferences(MODE_PRIVATE).getInt(historyRangeKey(), previous == null ? 24 : previous.optInt("hours", 24));
+        int selected = 1; for (int i = 0; i < hours.length; i++) if (hours[i] == selectedHours) selected = i;
+        workOptionsDialog = new RoundedChoiceDialog(this, "选择工作记录范围", "选择要整理的历史记录，确认后开始生成纪要。",
+            labels, selected, "开始整理", index -> {
+                if (!canAct()) return;
+                getPreferences(MODE_PRIVATE).edit().putInt(historyRangeKey(), hours[index]).apply();
+                request(() -> api.json("POST", "/v1/meetings", json("hours", hours[index])), this::applyHistoryMeetingReport);
+            });
+        workOptionsDialog.show();
+    }
+    private void applyHistoryMeetingReport(JSONObject result) {
+        put(state, "meeting_report", result);
+        if (tab != 2 || historyReportBox == null || !historyReportBox.isAttachedToWindow()) return;
+        int[] header = new int[2], viewport = new int[2];
+        historyRangeAction.getLocationOnScreen(header); scroll.getLocationOnScreen(viewport);
+        boolean keepTasks = header[1] + historyRangeAction.getHeight() <= viewport[1];
+        Runnable restore = taskBoard == null || !keepTasks ? () -> {} : taskBoard.preserveViewport();
+        renderHistoryReport(); restore.run();
+        if (taskBoard != null) taskBoard.refreshReminders(keepTasks);
+    }
+    private void renderHistoryReport() {
+        if (historyReportBox == null) return;
+        historyReportBox.removeAllViews();
         JSONObject report = state.optJSONObject("meeting_report");
         if (report != null && !report.has("meeting_id")) {
-            LinearLayout summary = card(page);
+            LinearLayout summary = card(historyReportBox);
             badge(summary, "最近纪要 · AI 草稿", WORK, 0xffeef3fc);
             label(summary, date(report.optString("created_at")), 11, MUTED);
             label(summary, report.optString("summary"), 16, INK).setTextIsSelectable(true);
@@ -1521,8 +1565,7 @@ public final class MainActivity extends Activity {
             LinearLayout actions = row(); summary.addView(actions);
             small(actions, "复制纪要", () -> copy("Aidol 会议纪要", report.optString("summary")));
             small(actions, "查看原始记录", () -> showSources(array(report, "sources")));
-        } else empty(page, "下一次讨论，从这里开始", "完成记录后，点击「生成纪要」。\n重点和决策会留在这里，方便回看。");
-        taskBoard.render(page, array(state, "tasks"), scroll);
+        } else empty(historyReportBox, "下一次讨论，从这里开始", "完成记录后，点击「生成纪要」。\n重点和决策会留在这里，方便回看。");
     }
 
     private void commute() {
@@ -2381,7 +2424,7 @@ public final class MainActivity extends Activity {
         else if (listenMode != VoiceInteraction.CALL && session != null && sessionUsesCapture) endVoice();
         stopLocation(); super.onPause();
     }
-    @Override protected void onDestroy() { if (taskBoard != null) taskBoard.close(); if (locationMonitor != null) locationMonitor.close(); if (statusPopup != null) statusPopup.dismiss(); handler.removeCallbacks(automaticHeadsetTick); if (quickFeedback != null) quickFeedback.close(); if (meetingPlayback != null) meetingPlayback.close(); handler.removeCallbacks(workMeetingPlaybackTick); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); super.onDestroy(); }
+    @Override protected void onDestroy() { if (workOptionsDialog != null) workOptionsDialog.dismiss(); if (taskBoard != null) taskBoard.close(); if (locationMonitor != null) locationMonitor.close(); if (statusPopup != null) statusPopup.dismiss(); handler.removeCallbacks(automaticHeadsetTick); if (quickFeedback != null) quickFeedback.close(); if (meetingPlayback != null) meetingPlayback.close(); handler.removeCallbacks(workMeetingPlaybackTick); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); super.onDestroy(); }
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent); setIntent(intent);
         if (intent.getBooleanExtra("open_work_tasks", false) && api != null && !api.vault.token().isEmpty()) switchTab(2);
@@ -2718,7 +2761,7 @@ public final class MainActivity extends Activity {
         TextView value = label(box, number, 36, color); value.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         label(box, caption, 11, MUTED);
     }
-    private void sectionHeader(LinearLayout parent, String title, String subtitle, String actionText, Runnable action) {
+    private TextView sectionHeader(LinearLayout parent, String title, String subtitle, String actionText, Runnable action) {
         LinearLayout header = row(); header.setGravity(Gravity.CENTER_VERTICAL); header.setPadding(0, dp(20), 0, dp(6)); parent.addView(header);
         LinearLayout text = column(); header.addView(text, new LinearLayout.LayoutParams(0, -2, 1));
         TextView heading = label(text, title, 18, INK); heading.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
@@ -2727,7 +2770,9 @@ public final class MainActivity extends Activity {
         if (action != null) {
             TextView link = label(header, actionText, 13, pageAccent()); link.setGravity(Gravity.CENTER); link.setMinHeight(dp(48)); link.setPadding(dp(12), dp(10), 0, dp(10));
             link.setLayoutParams(new LinearLayout.LayoutParams(-2, -2)); link.setBackground(ripple(Color.TRANSPARENT, 12, Color.TRANSPARENT)); link.setFocusable(true); link.setOnClickListener(v -> action.run());
+            return link;
         }
+        return null;
     }
     private GradientDrawable shape(int color, int radius, int border) { GradientDrawable d = new GradientDrawable(); d.setColor(color); d.setCornerRadius(dp(radius)); d.setStroke(dp(1), border); return d; }
     private RippleDrawable ripple(int color, int radius, int border) { return new RippleDrawable(ColorStateList.valueOf(0x180071e3), shape(color, radius, border), shape(Color.WHITE, radius, Color.WHITE)); }
