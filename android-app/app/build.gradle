@@ -14,7 +14,7 @@ android {
         targetSdk 35
         versionCode 2
         versionName '0.2.0'
-        testInstrumentationRunner (project.hasProperty('aidolLocationCacheReview') ? 'com.aidol.demo.LocationCacheInstrumentation' : project.hasProperty('aidolWorkAudioReview') ? 'com.aidol.demo.WorkAudioInstrumentation' : project.hasProperty('aidolWorkFixesReview') ? 'com.aidol.demo.WorkFixesInstrumentation' : 'com.aidol.demo.VisualReviewInstrumentation')
+        testInstrumentationRunner (project.hasProperty('aidolCommuteReview') ? 'com.aidol.demo.CommuteInstrumentation' : project.hasProperty('aidolLocationCacheReview') ? 'com.aidol.demo.LocationCacheInstrumentation' : project.hasProperty('aidolWorkAudioReview') ? 'com.aidol.demo.WorkAudioInstrumentation' : project.hasProperty('aidolWorkFixesReview') ? 'com.aidol.demo.WorkFixesInstrumentation' : 'com.aidol.demo.VisualReviewInstrumentation')
         buildConfigField 'String', 'SERVER_URL', '"' + (project.findProperty('aidolServerUrl') ?: 'https://123.207.219.174:7776') + '"'
     }
     buildFeatures { buildConfig true }

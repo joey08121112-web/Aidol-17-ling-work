@@ -62,6 +62,7 @@ public final class MainActivity extends Activity {
     private LinearLayout lastRenderedMeetingList;
     private String lastRenderedMeetingSnapshot = "";
     private ForegroundLocationMonitor locationMonitor;
+    private CommutePanel commutePanel;
     private TransientStatusPopup statusPopup;
     private TextView maintenanceStatus, meetingMaintenanceStatus;
     private String maintenanceLocationStatus = "定位：等待更新", maintenanceEntry = "app_open";
@@ -273,6 +274,10 @@ public final class MainActivity extends Activity {
                 }
             });
         connectBackend();
+        commutePanel = new CommutePanel(this, () -> api, () -> state, () -> !busy && session == null, () -> visible,
+            this::commutePermissions, () -> { put(settings(), "mode", "commute"); put(settings(), "auto_mode", false); listenMode = VoiceInteraction.CALL; updateStatus(); },
+            () -> { startupLocationAttempted = false; handler.post(startupLocationTick); }, () -> scroll);
+        if (getIntent().getBooleanExtra("open_commute", false)) tab = 3;
         if (getIntent().getBooleanExtra("open_work_tasks", false)) tab = 2;
         if (api.vault.token().isEmpty()) showAuth(0); else { showApp(); refresh(); }
     }
@@ -1660,100 +1665,19 @@ public final class MainActivity extends Activity {
 
     private void commute() {
         pageHeading("通勤");
-        JSONObject agent = state.optJSONObject("agent"), route = agent == null ? null : agent.optJSONObject("route");
-        if (route != null) {
-            sectionHeader(page, "本次路线", "出发前，再确认一下", "", null);
-            LinearLayout routeCard = card(page);
-            if (route.optBoolean("available")) {
-                badge(routeCard, "路线估算", COMMUTE, 0xffedf6f2);
-                LinearLayout metrics = row(); routeCard.addView(metrics); gap(routeCard, 8);
-                metric(metrics, String.valueOf(Math.max(1, Math.round(route.optDouble("eta_seconds") / 60))), "分钟", COMMUTE);
-                metric(metrics, String.format(Locale.CHINA, "%.1f", route.optDouble("distance_meters") / 1000), "公里", INK);
-                label(routeCard, "前往 " + route.optString("destination"), 16, INK); label(routeCard, route.optString("note"), 12, MUTED);
-                JSONArray steps = array(route, "steps");
-                if (steps.length() > 0) {
-                    LinearLayout routeSteps = disclosure(routeCard, "路线详情", steps.length() + " 个路段", false);
-                    for (int i = 0; i < Math.min(steps.length(), 10); i++) { JSONObject step = steps.optJSONObject(i); if (step != null) label(routeSteps, String.format(Locale.CHINA, "%02d   %s", i + 1, step.optString("instruction", step.optString("name", step.toString()))), 14, INK); }
-                    if (steps.length() > 10) small(routeSteps, "查看全部路线", () -> { LinearLayout body = dialogBody(); for (int i = 0; i < steps.length(); i++) { JSONObject step = steps.optJSONObject(i); if (step != null) label(body, (i + 1) + ". " + step.optString("instruction", step.toString()), 14, INK); } scrollDialog("路线详情", body); });
-                }
-            } else label(routeCard, route.optString("reason", "暂时没有可用路线"), 14, MUTED);
+        commutePanel.render(page, scroll);
+    }
+    private boolean commutePermissions(boolean notifications) {
+        if (!visible || permissionPending) return false;
+        java.util.ArrayList<String> missing = new java.util.ArrayList<>();
+        if (!hasLocationPermission()) { missing.add(Manifest.permission.ACCESS_FINE_LOCATION); missing.add(Manifest.permission.ACCESS_COARSE_LOCATION); }
+        if (notifications && Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) missing.add(Manifest.permission.POST_NOTIFICATIONS);
+        if (missing.isEmpty()) {
+            android.location.LocationManager manager = getSystemService(android.location.LocationManager.class);
+            if (Build.VERSION.SDK_INT >= 28 && manager != null && !manager.isLocationEnabled()) { commutePanel.permissionBlocked("请先开启手机系统定位，再开始通勤。"); return false; }
+            return true;
         }
-        boolean hasDestination = settings().has("destination_lon") && !settings().isNull("destination_lon");
-        LinearLayout destination = featureCard(page, 0xffedf6f2);
-        eyebrow(destination, "ON THE WAY  /  在路上", COMMUTE);
-        label(destination, hasDestination ? settings().optString("destination_name", "已选目的地") : "今天，想去哪里？", 23, INK);
-        label(destination, hasDestination ? "目的地已就绪，选择你的出发方式。" : "选好目的地，让出发更从容。", 13, MUTED);
-        LinearLayout searchDestination;
-        if (hasDestination) searchDestination = disclosure(destination, "更换目的地", "", false);
-        else { searchDestination = column(); destination.addView(searchDestination); gap(searchDestination, 14); }
-        LinearLayout searchFields = row(); searchDestination.addView(searchFields);
-        LinearLayout cityField = column(); LinearLayout.LayoutParams cityLayout = new LinearLayout.LayoutParams(dp(80), -2); cityLayout.rightMargin = dp(8); searchFields.addView(cityField, cityLayout);
-        LinearLayout placeField = column(); searchFields.addView(placeField, new LinearLayout.LayoutParams(0, -2, 1));
-        EditText city = field(cityField, "所在城市", "城市", false, 80); city.setSingleLine(true); city.setText(settings().optString("transit_city", "上海"));
-        EditText query = field(placeField, "目的地", "公司、车站、餐厅…", false, 100); query.setSingleLine(true);
-        button(searchDestination, "查找地点", false, () -> {
-            if (!canAct() || value(query).isEmpty()) return; hideKeyboard();
-            request(() -> api.json("GET", "/v1/maps/search?q=" + Uri.encode(value(query)) + "&city=" + Uri.encode(value(city)), null), this::poiResults);
-        });
-        gap(destination, 12); label(destination, "出行方式", 12, MUTED);
-        LinearLayout methods = row(); destination.addView(methods); gap(destination, 5);
-        String[] methodsKeys = {"driving", "walking", "transit", "bicycling"}, methodsNames = {"驾车", "步行", "公共交通", "骑行"};
-        for (int i = 0; i < methodsKeys.length; i++) { String key = methodsKeys[i]; segment(methods, methodsNames[i], key.equals(settings().optString("transport", "driving")), () -> {
-            if (!canAct()) return; JSONObject payload = cloneJson(settings()); put(payload, "transport", key); mutate("PUT", "/v1/settings", payload);
-        }); }
-        button(destination, "定位并更新路线", true, this::locate).setBackground(ripple(COMMUTE, 16, COMMUTE));
-        label(destination, "仅在点击时获取位置 · 路线为规划估算", 11, MUTED).setGravity(Gravity.CENTER);
-        sectionHeader(page, "沿途安排", "给路上的自己，多一点照顾", "", null);
-        LinearLayout around = disclosure(page, "附近与天气", "找个好去处，看看晴雨", false);
-        EditText keyword = input("咖啡、美食、公园…", false, 80); keyword.setText("咖啡"); around.addView(keyword);
-        button(around, "搜索周边 3 km", false, () -> {
-            if (!canAct()) return; JSONObject current = state.optJSONObject("agent"), location = current == null ? null : current.optJSONObject("location");
-            if (location == null) { feedback("请先点击“定位并更新路线”", LocalCue.LOCATION); return; }
-            JSONObject payload = cloneJson(location); put(payload, "keyword", fallback(value(keyword), "美食"));
-            request(() -> api.json("POST", "/v1/maps/nearby", payload), this::poiResults);
-        });
-        button(around, "附近地铁站", false, () -> {
-            if (!canAct()) return;
-            JSONObject nearbyAgent = state.optJSONObject("agent"), location = nearbyAgent == null ? null : nearbyAgent.optJSONObject("location");
-            if (location == null) { feedback("请先点击定位并更新路线", LocalCue.LOCATION); return; }
-            JSONObject payload = cloneJson(location); put(payload, "metro_only", true); put(payload, "radius", 2000);
-            request(() -> api.json("POST", "/v1/maps/nearby", payload), this::poiResults);
-        });
-        button(around, "目的地天气预报", false, () -> {
-            if (!canAct()) return;
-            if (settings().isNull("destination_lon")) { feedback("请先选择目的地", LocalCue.DESTINATION); return; }
-            request(() -> api.json("GET", "/v1/maps/weather?forecast=true", null), weather -> {
-                if (!weather.optBoolean("available")) { showError(weather.optString("reason", "暂无预报")); return; }
-                LinearLayout body = dialogBody(); JSONArray days = array(weather, "forecast");
-                for (int i = 0; i < days.length(); i++) { JSONObject day = days.optJSONObject(i); if (day != null)
-                    label(body, day.optString("date") + "  " + day.optString("dayweather") + " / " + day.optString("nightweather") + "\n" + day.optString("nighttemp") + "–" + day.optString("daytemp") + "°C", 15, INK); }
-                label(body, "高德预报 · " + weather.optString("report_time"), 12, MUTED);
-                scrollDialog(weather.optString("city") + "天气预报", body);
-            });
-        });
-        button(around, "查看目的地天气", false, () -> {
-            if (!canAct()) return; String code = getPreferences(MODE_PRIVATE).getString(weatherPreferenceKey(), "");
-            if (settings().isNull("destination_lon")) { feedback("先从搜索结果选择目的地，即可查询当地天气", LocalCue.DESTINATION); return; }
-            String weatherCode = code.matches("[0-9]{6}") ? code : "";
-            request(() -> api.json("GET", "/v1/maps/weather?city=" + Uri.encode(weatherCode), null), weather -> {
-                if (!weather.optBoolean("available")) { showError(weather.optString("reason", "天气暂不可用")); return; }
-                new AlertDialog.Builder(this).setTitle(weather.optString("city") + "  " + weather.optString("temperature") + "°C")
-                    .setMessage(weather.optString("weather") + "\n" + weather.optString("wind_direction") + "风 " + weather.optString("wind_power") + "级\n湿度 " + weather.optString("humidity") + "%\n\n" + weather.optString("note") + "\n发布时间：" + weather.optString("report_time")).setPositiveButton("知道了", null).show();
-            });
-        });
-        LinearLayout notice = disclosure(page, "到达提醒", "提前准备一句报平安", false);
-        EditText contact = field(notice, "联系人称呼", "例如 同事", false, 100); contact.setText(settings().optString("contact", "同事"));
-        EditText minutes = field(notice, "预计到达前几分钟提醒", "1–60", false, 2); minutes.setInputType(InputType.TYPE_CLASS_NUMBER); minutes.setText(String.valueOf(settings().optInt("arrival_notice_minutes", 5)));
-        button(notice, "保存提醒偏好", false, () -> { if (!canAct()) return; int m; try { m = Integer.parseInt(value(minutes)); } catch (Exception e) { minutes.setError("请输入 1–60"); return; } if (m < 1 || m > 60) { minutes.setError("请输入 1–60"); return; } JSONObject payload = cloneJson(settings()); put(payload, "contact", value(contact)); put(payload, "arrival_notice_minutes", m); mutate("PUT", "/v1/settings", payload); });
-        label(notice, "定位更新后生成草稿，由你复制并发送给联系人。不会自动发送消息。", 11, MUTED);
-        JSONArray drafts = array(state, "drafts"); int pending = 0;
-        for (int i = 0; i < drafts.length(); i++) {
-            JSONObject draft = drafts.optJSONObject(i); if (draft == null || !"pending".equals(draft.optString("status"))) continue; pending++;
-            LinearLayout draftCard = card(page); badge(draftCard, "待发送 · 给" + draft.optString("contact"), COMMUTE, 0xffedf6f2); label(draftCard, draft.optString("text"), 15, INK);
-            LinearLayout actions = row(); draftCard.addView(actions);
-            small(actions, "复制草稿", () -> { if (!canAct()) return; copy("到达提醒草稿", draft.optString("text")); mutate("POST", "/v1/drafts/" + draft.optString("id") + "/copied", json()); });
-            small(actions, "忽略", () -> mutate("POST", "/v1/drafts/" + draft.optString("id") + "/dismissed", json()));
-        }
+        permissionPending = true; requestPermissions(missing.toArray(new String[0]), 8); return false;
     }
 
     private void poiResults(JSONObject result) {
@@ -1822,6 +1746,7 @@ public final class MainActivity extends Activity {
     private void updateStartupLocation() {
         handler.removeCallbacks(startupLocationTick);
         if (!visible || isDestroyed() || api == null || startupLocationAttempted) return;
+        if (CommuteService.running(api)) { locationMonitor.stop(); maintenanceLocationStatus = "定位：通勤后台自动更新"; renderMaintenanceStatus(); return; }
         if (permissionPending) { handler.postDelayed(startupLocationTick, 500); return; }
         if (api.vault.token().isEmpty()) return;
         if (!hasLocationPermission()) {
@@ -1960,6 +1885,7 @@ public final class MainActivity extends Activity {
             mutate("PUT", "/v1/settings", payload);
         });
         LinearLayout privacy = disclosure(page, "账号与隐私", "密码、数据导出与管理", false);
+        button(privacy, "常用地址   ›", false, () -> { if (canAct()) commutePanel.addressBook(); });
         button(privacy, "修改登录密码   ›", false, this::changePassword);
         button(privacy, "导出我的数据   ↗", false, this::export);
         button(privacy, "数据处理说明   ›", false, this::privacyInfo);
@@ -1989,13 +1915,13 @@ public final class MainActivity extends Activity {
 
     private void destructive(boolean account) {
         if (!canAct()) return;
-        LinearLayout body = dialogBody(); label(body, account ? "账号和全部个人数据将永久删除，无法恢复。" : "将删除所有对话、记忆、会议纪要及待办；账号与设置保留。此操作无法撤销。", 14, RED);
+        LinearLayout body = dialogBody(); label(body, account ? "账号和全部个人数据将永久删除，无法恢复。" : "将删除所有对话、记忆、会议纪要及待办；账号、设置与常用地址保留。此操作无法撤销。", 14, RED);
         EditText password = field(body, "输入登录密码确认", "当前密码", true, 128);
         AlertDialog dialog = new AlertDialog.Builder(this).setTitle(account ? "永久注销账号" : "清空我的数据").setView(body).setNegativeButton("取消", null).setPositiveButton(account ? "永久注销" : "确认清空", null).create();
         dialog.setOnShowListener(v -> { dialog.getButton(-1).setTextColor(RED); dialog.getButton(-1).setOnClickListener(w -> {
             if (!canAct()) return; if (password.length() == 0) { password.setError("请输入密码"); return; }
             request(() -> api.json("DELETE", account ? "/auth/account" : "/v1/data", json("password", password.getText().toString())), r -> {
-                dialog.dismiss(); clearLocationCache(); TaskReminders.clear(this); getSharedPreferences("meeting_edit_drafts", MODE_PRIVATE).edit().clear().apply(); clearPrivateSnapshots(); if (account) signOut(); else { showApp(); refresh(); }
+                dialog.dismiss(); if (commutePanel != null) commutePanel.reset(); clearLocationCache(); TaskReminders.clear(this); getSharedPreferences("meeting_edit_drafts", MODE_PRIVATE).edit().clear().apply(); clearPrivateSnapshots(); if (account) signOut(); else { showApp(); refresh(); }
             });
         }); }); dialog.show();
     }
@@ -2108,6 +2034,7 @@ public final class MainActivity extends Activity {
                     JSONObject agent = state.optJSONObject("agent"); if (agent == null) agent = new JSONObject();
                     put(agent, "mode", appliedMode); put(state, "agent", agent);
                     diagnosticError = "无";
+                    if (commutePanel != null) commutePanel.modeChanged(appliedMode);
                     String appliedNotice = "已切换" + modeName(appliedMode);
                     lastNotice = appliedNotice + (repeatArmed ? "；提示后继续聆听" : "；等待你手动开始");
                     listenMode = "work".equals(appliedMode) ? VoiceInteraction.NOTES : VoiceInteraction.CALL;
@@ -2176,7 +2103,7 @@ public final class MainActivity extends Activity {
                 if (authError != null || !(e instanceof ApiClient.ApiException) || ((ApiClient.ApiException) e).status != 409) showError(lastNotice); } }); }
         });
     }
-    private void signOut() { TaskReminders.clear(this); getSharedPreferences("meeting_edit_drafts", MODE_PRIVATE).edit().clear().apply(); clearVoicePreparation(); preparationAttemptAt = -60000; if (quickFeedback != null) quickFeedback.stop(); chatDraft = ""; stopLockScreenSession(); cancelSession(""); clearPrivateSnapshots(); api.vault.clear(); clearLocationCache(); syncHeadsetControls(); state = new JSONObject(); lastNotice = ""; showAuth(0); }
+    private void signOut() { if (commutePanel != null) commutePanel.reset(); TaskReminders.clear(this); getSharedPreferences("meeting_edit_drafts", MODE_PRIVATE).edit().clear().apply(); clearVoicePreparation(); preparationAttemptAt = -60000; if (quickFeedback != null) quickFeedback.stop(); chatDraft = ""; stopLockScreenSession(); cancelSession(""); clearPrivateSnapshots(); api.vault.clear(); clearLocationCache(); syncHeadsetControls(); state = new JSONObject(); lastNotice = ""; showAuth(0); }
     private boolean canAct() { if (busy || session != null || locationListener != null) { feedback("上一项操作正在进行，请稍候", LocalCue.BUSY); return false; } return true; }
 
     private boolean lockScreenEnabled() { return voiceService != null && voiceService.enabled(); }
@@ -2494,6 +2421,14 @@ public final class MainActivity extends Activity {
             if (visible) enableLockScreenSession();
             return;
         }
+        if (code == 8) {
+            permissionPending = false;
+            boolean granted = grants.length > 0 && hasLocationPermission();
+            for (int i = 0; i < permissions.length && i < grants.length; i++)
+                if (Manifest.permission.POST_NOTIFICATIONS.equals(permissions[i]) && grants[i] != PackageManager.PERMISSION_GRANTED) granted = false;
+            if (commutePanel != null) commutePanel.permissionResult(granted);
+            return;
+        }
         if (code == 5) {
             permissionPending = false;
             if (hasLocationPermission()) handler.post(startupLocationTick);
@@ -2515,6 +2450,7 @@ public final class MainActivity extends Activity {
     }
     @Override protected void onResume() {
         super.onResume(); visible = true; syncHeadsetControls();
+        if (commutePanel != null) commutePanel.resume();
         automaticHeadsetSuppressed = false;
         enterMaintenance("app_open");
         prepareVoice();
@@ -2525,6 +2461,7 @@ public final class MainActivity extends Activity {
     }
     private void stopRepeat() { repeatArmed = false; continuingCall = false; handler.removeCallbacks(repeatTick); if (session == null) getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON); }
     @Override protected void onPause() {
+        if (commutePanel != null) commutePanel.pause();
         handler.removeCallbacks(automaticHeadsetTick);
         if (locationMonitor != null) locationMonitor.stop();
         if (statusPopup != null) statusPopup.dismiss();
@@ -2536,9 +2473,10 @@ public final class MainActivity extends Activity {
         else if (listenMode != VoiceInteraction.CALL && session != null && sessionUsesCapture && !session.recordsWorkCalls()) endVoice();
         stopLocation(); super.onPause();
     }
-    @Override protected void onDestroy() { if (meetingDeleteDialog != null) meetingDeleteDialog.dismiss(); if (workOptionsDialog != null) workOptionsDialog.dismiss(); if (taskBoard != null) taskBoard.close(); if (locationMonitor != null) locationMonitor.close(); if (statusPopup != null) statusPopup.dismiss(); handler.removeCallbacks(automaticHeadsetTick); if (quickFeedback != null) quickFeedback.close(); if (meetingPlayback != null) meetingPlayback.close(); handler.removeCallbacks(workMeetingPlaybackTick); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); super.onDestroy(); }
+    @Override protected void onDestroy() { if (commutePanel != null) commutePanel.close(); if (meetingDeleteDialog != null) meetingDeleteDialog.dismiss(); if (workOptionsDialog != null) workOptionsDialog.dismiss(); if (taskBoard != null) taskBoard.close(); if (locationMonitor != null) locationMonitor.close(); if (statusPopup != null) statusPopup.dismiss(); handler.removeCallbacks(automaticHeadsetTick); if (quickFeedback != null) quickFeedback.close(); if (meetingPlayback != null) meetingPlayback.close(); handler.removeCallbacks(workMeetingPlaybackTick); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); super.onDestroy(); }
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent); setIntent(intent);
+        if (intent.getBooleanExtra("open_commute", false) && api != null && !api.vault.token().isEmpty()) switchTab(3);
         if (intent.getBooleanExtra("open_work_tasks", false) && api != null && !api.vault.token().isEmpty()) switchTab(2);
     }
     @Override public void onBackPressed() { if (session != null) { endVoice(); return; } if (!api.vault.token().isEmpty() && tab != 0) { switchTab(0); return; } if (api.vault.token().isEmpty() && authMode != 0) { showAuth(0); return; } super.onBackPressed(); }
@@ -2724,7 +2662,7 @@ public final class MainActivity extends Activity {
                     return;
                 }
                 chatDraft = ""; if (chatInput != null) chatInput.setText("");
-                clearLocationCache(); clearPrivateSnapshots(); connectBackend(); state = new JSONObject(); tab = 0; lastNotice = "";
+                if (commutePanel != null) commutePanel.reset(); clearLocationCache(); clearPrivateSnapshots(); connectBackend(); state = new JSONObject(); tab = 0; lastNotice = "";
                 diagnosticInput = "尚未录音"; diagnosticOutput = "尚未播放"; diagnosticRequest = "尚未请求"; diagnosticSession = "尚未开始"; diagnosticStage = "空闲"; diagnosticError = "无"; diagnosticRms = 0; diagnosticBytes = 0;
                 if (api.vault.token().isEmpty()) showAuth(0); else { showApp(); refresh(); }
             }).show();

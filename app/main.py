@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException, Request, Query, WebSocket, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .config import Config
-from .domain import Settings, LocationInput, MemoryInput, SpeechInput, NearbyInput
+from .domain import Settings, Mode, LocationInput, MemoryInput, SpeechInput, NearbyInput
 from .domain import MeetingRequest, RecallRequest, TaskStatusInput, MemoryUpdate
 from .providers.volc_speech import VolcSpeechProvider, SpeechProviderError, pcm_to_wav
 from .providers.qwen_realtime import QwenRealtimeProvider
@@ -32,6 +32,8 @@ from .services.qwen_voice import reply_qwen, realtime_instructions
 from .services.duplex_voice import duplex_call
 from .services.assistant_tools import AssistantTools
 from .services.commute import ROUTE_FIELDS, commute_destination
+from .services.commute_journeys import PlacePoint, SavedAddressInput, CommuteStart, CommuteRefresh, refresh_journey
+from .services.maps import MapService
 from .providers.bocha import BochaSearch
 
 
@@ -337,6 +339,11 @@ def create_hosted_app(config=None, data_directory=None):
 
     @api.post('/auth/logout')
     def logout(request: Request, current=Depends(user)):
+        store = read_work_store(current)
+        if store:
+            journey = store.commute_journey()
+            if journey.get('active'):
+                store.stop_commute(journey['id'])
         accounts.logout(digest(token(request)))
         return {'ok': True}
 
@@ -409,6 +416,10 @@ def create_hosted_app(config=None, data_directory=None):
             if any(getattr(old, key) != getattr(value, key) for key in ROUTE_FIELDS):
                 rt.agent.route, rt.agent.commute, rt.agent.last_route, rt.agent.last_notice = None, None, 0, 0
             rt.store.save_settings(value)
+            if value.mode != 'commute':
+                journey = rt.store.commute_journey()
+                if journey.get('active'):
+                    rt.store.stop_commute(journey['id'])
             rt.store.purge_work_audio()
             await rt.agent.decide()
             return value
@@ -925,6 +936,64 @@ def create_hosted_app(config=None, data_directory=None):
         store = read_work_store(current)
         return {'records': store.location_records(limit) if store else []}
 
+    def commute_store(current):
+        return read_work_store(current) or Store(str(directory / 'users' / (current['id'] + '.sqlite3')))
+
+    @api.get('/v1/saved-addresses')
+    async def address_book(current=Depends(user)):
+        return {'addresses': commute_store(current).saved_addresses()}
+
+    @api.put('/v1/saved-addresses/{address_id}')
+    async def save_address(address_id: str, value: SavedAddressInput, current=Depends(user)):
+        if not re.fullmatch(r'[a-zA-Z0-9-]{1,64}', address_id):
+            raise HTTPException(422, '地址标识无效')
+        try:
+            return commute_store(current).save_address(address_id, value.model_dump())
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+
+    @api.delete('/v1/saved-addresses/{address_id}')
+    async def delete_address(address_id: str, current=Depends(user)):
+        if not commute_store(current).delete_address(address_id):
+            raise HTTPException(404, '地址不存在')
+        return {'ok': True}
+
+    @api.get('/v1/commute')
+    async def current_commute(current=Depends(user)):
+        return commute_store(current).commute_journey()
+
+    @api.post('/v1/commute')
+    async def start_commute(value: CommuteStart, request: Request, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            try:
+                payload = value.model_dump(exclude={'journey_id'})
+                journey = rt.store.start_commute({'id': value.journey_id, **payload})
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from None
+            if journey.get('active'):
+                settings = rt.store.settings()
+                settings.mode, settings.auto_mode = Mode.commute, False
+                rt.store.save_settings(settings)
+                await rt.agent.decide()
+            return journey
+
+    @api.post('/v1/commute/{journey_id}/refresh')
+    async def update_commute(journey_id: str, value: CommuteRefresh, current=Depends(user)):
+        try:
+            return await refresh_journey(commute_store(current), MapService(config), journey_id, value,
+                lambda: accounts.consume('usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400))
+        except LookupError:
+            raise HTTPException(404, '通勤已结束或不存在') from None
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+
+    @api.delete('/v1/commute/{journey_id}')
+    async def end_commute(journey_id: str, current=Depends(user)):
+        result = commute_store(current).stop_commute(journey_id)
+        if result is None:
+            raise HTTPException(404, '通勤不存在')
+        return result
+
     @api.post('/v1/maps/nearby')
     async def mobile_nearby(value: NearbyInput, request: Request, current=Depends(user)):
         async with runtime(current, request, True) as rt:
@@ -932,6 +1001,16 @@ def create_hosted_app(config=None, data_directory=None):
                 return await rt.agent.maps.nearby(value, value.keyword, value.radius, value.metro_only)
             except Exception:
                 raise HTTPException(502, '周边查询暂不可用，请稍后再试')
+
+    @api.post('/v1/maps/weather-at')
+    async def weather_at_address(value: PlacePoint, request: Request, forecast: bool = False, current=Depends(user)):
+        async with runtime(current, request, True) as rt:
+            try:
+                if value.adcode:
+                    return await rt.agent.maps.weather(value.adcode, forecast)
+                return await rt.agent.maps.weather_at(value.longitude, value.latitude, forecast)
+            except Exception:
+                raise HTTPException(502, '天气暂不可用，请稍后重试') from None
 
     @api.get('/v1/maps/weather')
     async def mobile_weather(request: Request, city: str = Query(default='', pattern=r'^([0-9]{6})?$'), forecast: bool = False, current=Depends(user)):
@@ -947,6 +1026,10 @@ def create_hosted_app(config=None, data_directory=None):
                 return await rt.agent.maps.weather_at(destination['longitude'], destination['latitude'], forecast)
             except Exception:
                 raise HTTPException(502, '天气查询暂不可用，请稍后再试')
+
+    @api.get('/v1/drafts')
+    async def current_drafts(current=Depends(user)):
+        return {'drafts': commute_store(current).list('drafts', 30)}
 
     @api.post('/v1/drafts/{draft_id}/{action}')
     async def mobile_draft(draft_id: str, action: str, request: Request, current=Depends(user)):
@@ -1345,6 +1428,7 @@ def create_hosted_app(config=None, data_directory=None):
         async with runtime(current, request) as rt:
             return {'user': current, 'settings': rt.store.settings().model_dump(), 'memories': rt.store.list('memories', 10000),
                     'version': 4, 'drafts': rt.store.list('drafts', 10000),
+                    'saved_addresses': rt.store.saved_addresses(), 'commute': rt.store.commute_journey(),
                     'location_records': rt.store.location_records(10000),
                     'transcripts': rt.store.list('transcripts', 10000), 'reports': rt.store.all_meeting_reports(), 'tasks': rt.store.list('action_tasks', 10000),
                     'work_meetings': [rt.store.work_meeting(row['id']) for row in rt.store.work_meetings(10000)]}

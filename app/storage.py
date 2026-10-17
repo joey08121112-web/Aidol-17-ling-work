@@ -14,6 +14,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from .domain import Settings
+from .commute_storage import CommuteStorage
 from .search import index_text, query_terms, is_non_assertion
 
 
@@ -114,7 +115,7 @@ def _wall_clock(anchor, events):
                               + sum((length for at, length in pauses if at <= offset_ms), timedelta(0))).isoformat(timespec='seconds')
 
 
-class Store:
+class Store(CommuteStorage):
     def __init__(self, path: str):
         self.path = path
         # users/<uuid>.sqlite3 keeps its meeting audio in users/<uuid>/work-audio/<meeting>/.
@@ -123,6 +124,7 @@ class Store:
         with self.connect() as db:
             db.executescript("""
                 PRAGMA journal_mode=WAL;
+                CREATE TABLE IF NOT EXISTS commute_data (key TEXT PRIMARY KEY, payload TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS memories (
                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, content TEXT NOT NULL,
@@ -283,7 +285,16 @@ class Store:
     def settings(self) -> Settings:
         with self.connect() as db:
             row = db.execute("SELECT value FROM settings WHERE id=1").fetchone()
-        return Settings.model_validate_json(row[0]) if row else Settings()
+            addresses = self._commute_read(db, 'addresses', None)
+        value = Settings.model_validate_json(row[0]) if row else Settings()
+        if addresses is not None:
+            for key in ['home', 'work']:
+                place = next((a for a in addresses if a['tag'] == key), None)
+                setattr(value, key + '_lon', place['longitude'] if place else None)
+                setattr(value, key + '_lat', place['latitude'] if place else None)
+                setattr(value, key + '_name', place['name'] if place else ('家' if key == 'home' else '公司'))
+                setattr(value, key + '_city', place['city'] if place else '')
+        return value
 
     def save_settings(self, value: Settings):
         with self.connect() as db:
@@ -485,6 +496,7 @@ class Store:
 
     def clear(self):
         with self.connect() as db:
+            db.execute("DELETE FROM commute_data WHERE key='journey'")
             for table in ("work_meeting_deletions", "action_task_dismissals", "location_records", "work_audio_uploads", "work_utterances", "work_meeting_events", "work_meeting_segments", "work_meetings", "memories", "transcripts", "events", "drafts", "processed", "meeting_reports", "action_tasks", "mobile_turns", "recall_exclusions"):
                 db.execute(f"DELETE FROM {table}")
         shutil.rmtree(self.audio_root, ignore_errors=True)

@@ -22,7 +22,7 @@ import org.json.JSONObject;
 
 /** Foreground-only location work. Never uses the voice worker, audio focus or mode APIs. */
 final class ForegroundLocationMonitor implements AutoCloseable {
-    interface Listener { void status(String message); void updated(); }
+    interface Listener { void status(String message); void updated(); default void fixed(LocationSnapshot value) {} }
     private final Context context;
     private final Listener listener;
     private final Handler ui = new Handler(Looper.getMainLooper());
@@ -72,6 +72,7 @@ final class ForegroundLocationMonitor implements AutoCloseable {
                 if (fix != this || !current(client, token, current) || !usable(location)) return;
                 clearFix();
                 MeetingLocationCache.remember(context, client, token, location);
+                listener.fixed(MeetingLocationCache.from(location));
                 listener.status("定位：正在记录");
                 try {
                     long age = SystemClock.elapsedRealtimeNanos() - location.getElapsedRealtimeNanos();

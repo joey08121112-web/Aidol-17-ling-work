@@ -363,3 +363,18 @@ Android 实际播放排空后发送 `{"type":"playback.done","turn":N}`，后端
 - AI 纪要保留整场任务、人物观点、冲突、事件、议题、决策、待确认，并结合可选的 `chapters/highlights`；章节时间由服务端依据句子计算，非逐字摘录的重点丢弃。Android 全屏会议页及 Markdown 导出包含这些内容和对应时间引用。
 
 以上是本地源码/协议整合，真实服务配额、长会议、实体耳机和远端部署另行验收，见 [工作日志](work-log-2026-10-17.md)。
+
+
+## 2026-10-18 常用地址与主动通勤
+
+全部接口沿用 Bearer 账号鉴权，数据位于账号 SQLite，互不共享。
+
+- `GET /v1/saved-addresses` 返回 `{addresses:[...]}`；`PUT /v1/saved-addresses/{id}` 保存，`DELETE` 删除。地址字段为 `tag: home/work/school/custom`、`name/address/city`、有限且合法的 GCJ-02 `longitude/latitude`、可选六位 `adcode`。家/公司/学校各一个，自定义可多个，总数最多40。客户端先调用既有 geocode 或手机定位后的 reverse，再保存结果；CRUD、重新选用、仅改名称/标签都不调用地图服务。修改城市或地址后必须重新定位。既有 home/work 设置无查询迁入，常用地址成为对应设置的权威值。
+- `POST /v1/commute` 接收 `journey_id`（16–64位字母数字或连字符）、`origin_mode: gps/fixed`、`origin`（fixed必填、gps为空）、`destination`、`transport: driving/walking/transit/bicycling`。起终点均为上述地址字段，标签可省略。明确开始才建立 active 通勤并切换通勤模式；工作录音中拒绝。相同 ID/内容幂等，不同内容409；已结束的同 ID 不重新开始。开始另一通勤前需结束当前通勤。
+- `GET /v1/commute` 返回本账号最近一趟通勤或 `{}`。返回 `id/active/origin_mode/origin/destination/transport/started_at/route/error/updated_at` 等状态；route沿用地图路线协议，含耗时、距离、步骤与来源提示。保存地址后再修改/删除地址不会改写已开始旅程快照。
+- `POST /v1/commute/{id}/refresh` 接收唯一 `request_id`；gps模式同时提交 `location:{longitude,latitude,accuracy,source:'gps',observed_at}`，要求有时区、两分钟内、精度<=200米。fixed模式禁止提交手机位置，以已保存GCJ-02起点计算，公共交通使用保存城市，不重复坐标转换/城市反查。正常30秒最短间隔，进行中45秒租约，每次供应商调用最长35秒，计入账号每日查询额度。GPS坐标仍按原地图适配流程转换。网络失败保留上次路线并明确 error；停止、清空或新旅程后到达的旧结果不能覆盖当前状态。刷新不占用语音会话锁。
+- `DELETE /v1/commute/{id}` 结束，重复结束相同旅程安全；不存在404。切换到非通勤模式也结束。服务端不自行采集设备位置，Android在前台服务内每180秒提交。
+- `POST /v1/maps/weather-at?forecast=false` 接收已保存地址，优先复用adcode查询天气；历史地址无adcode时才按坐标反查。`GET /v1/drafts` 返回最近30条草稿；GPS通勤进入提醒时间范围时每趟生成一次到达草稿，仍需用户复制发送。fixed路线不据此推断实际到达。
+- 导出补充 `saved_addresses/commute`；清空业务数据删除旅程和位置记录，保留账号设置及常用地址；删除账号移除全部数据。手机断网结束时立即停止定位，私有队列在下次登录进入后补发结束，开始新旅程前先处理该队列。
+
+保存地址消除的是重复地址解析查询；实时路线、天气和周边查询仍需联网地图 API。公共交通数据为线路规划/计划时刻，不表示实时车辆位置。

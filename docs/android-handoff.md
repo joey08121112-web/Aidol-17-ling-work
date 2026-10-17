@@ -245,3 +245,18 @@ adb -s <serial> pull /sdcard/Android/data/com.aidol.app.review/files/visual-revi
 `ForegroundLocationMonitor` 和手动定位在上传前写入 `MeetingLocationCache`，采用私有 SharedPreferences，按服务和登录会话隔离，保留实际获取时间；账号退出/清空/切换服务清理。`LocationSnapshot` 校验24小时有效期及200米精度。`HostedSession` 通过 Activity 可见状态及系统亮屏/锁定状态限制 `MeetingStartLocation`：前台可最多等待3秒新定位，后台只读App/系统缓存，缺失不阻塞录音。前台180秒刷新、无定位弹窗、地址失败30秒×3次重试均保留。
 
 会议快照追加 `observed_at/cached`，后端解析地址与生成报告保留元数据，页面与Markdown导出明确显示缓存获取时间。验收 runner 使用 `-PaidolLocationCacheReview` 构建，`LocationCacheInstrumentation` 的 `phase=seed/verify` 分两次进程运行；仅独立测试命名空间私有存储和公开测试坐标，不写用户会议，不调用真实地图或模型。实际结果见 acceptance.md。
+
+
+## 2026-10-18 通勤地址与锁屏刷新（本地）
+
+`CommutePanel` 接管通勤页和“我的 → 账号与隐私 → 常用地址”。支持家、公司、学校和多个自定义地点；地址解析一次保存坐标，名字/标签单独修改不解析。城市/详细地址修改会使旧坐标失效，确认新结果后才能保存。起点可选手机当前位置、常用地址或搜索地址，目的地同样可选；固定起点路线始终使用选定地址，界面明确标为耗时估算。
+
+新增弹窗统一使用 `EditorUi` / `RoundedChoiceDialog`：圆角边框、选中强调、进入和选择动画；局部更新路线卡片，保存/关闭弹窗不重建底层页面。地址、路线、天气、附近地点、出行方式及到达提醒共用该样式。位置更新沿用无弹窗策略。
+
+用户明确选择“开始通勤后锁屏也继续更新”。`CommuteService` 为独立 location 类型前台服务，必须由可见 Activity 在定位和通知授权后启动，保持“通勤进行中”通知及“结束通勤”动作。后台每180秒读取手机定位、记录并更新路线；GPS路线只接受近期准确点，失败显示状态并重试，不把旧会议缓存冒充当前位置。使用有超时并定期续期的部分唤醒锁，结束释放定位监听、网络请求和唤醒锁。服务 START_NOT_STICKY，被强制关闭或进程终止后不会偷偷重启，重新进入明确显示“继续通勤”。仅在本次通勤运行期间扩展后台定位；未开始通勤时保留原有仅前台3分钟刷新，会议缓存行为不变。
+
+通勤不申请音频焦点、不打开麦克风、不改动 Rise 协议。启动时拒绝正在进行的工作采音；切换非通勤模式、退出账号、清空数据、切换服务器和通知结束均停止。服务按服务器/账号会话隔离；离线结束先停本机，队列下次联网补发；旧路线结果不能恢复已结束旅程。Activity仅销毁/切后台不会结束主动通勤。
+
+官方约束参考：[位置前台服务](https://developer.android.com/about/versions/14/changes/fgs-types-required)、[位置授权](https://developer.android.com/develop/sensors-and-location/location/permissions)。当前从可见页面启动持续定位服务，不请求“始终允许”位置授权；系统强制停止、撤销授权或厂商省电仍可能中断，界面保留恢复入口。
+
+自动验收使用 `gradle --offline -PaidolCommuteReview testDebugUnitTest lintDebug assembleDebug assembleDebugAndroidTest`，随后运行 `com.aidol.app.debug.test/com.aidol.demo.CommuteInstrumentation`。测试用独立私有偏好与手机内存MockWebServer，公开地点样例；真实手机定位仅送测试内存服务，不调用真实地图供应商、不写用户地址/会议。包含完整180秒熄屏周期及通知停止。实际结果见 acceptance.md。
