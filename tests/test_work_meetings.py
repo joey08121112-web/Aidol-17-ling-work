@@ -301,9 +301,10 @@ async def test_minutes_model_payload_and_unsupported_citations_fall_back_to_visi
     finish_reason = 'stop'
     assert '后来的更正或撤销优先' in payloads[0]['messages'][0]['content']
     output['tasks'][0]['owner'] = '不存在的人'
-    fallback = await WorkMeetingMinutes(config).generate(rows)
-    assert fallback['extraction'] == 'rules_fallback'
-    assert '原文' in fallback['notice'] and fallback['source_ids'] == ['0']
+    repaired = await WorkMeetingMinutes(config).generate(rows)
+    assert repaired['extraction'] == 'llm' and repaired['tasks'][0]['owner'] == ''
+    assert repaired['metadata_omissions'] == ['task_owner']
+    assert '原文' in repaired['notice'] and repaired['source_ids'] == ['0']
     output['tasks'][0]['owner'] = '小林'
     output['open_questions'][0]['source_ids'] = ['other-meeting']
     assert (await WorkMeetingMinutes(config).generate(rows))['extraction'] == 'rules_fallback'

@@ -1798,10 +1798,11 @@ public final class MainActivity extends Activity {
         super.onActivityResult(request, result, data);
         if (request != 20 && request != 21) return;
         String notice = request == 21 ? exportNotice : "数据已导出";
+        LocalCue cue = request == 21 ? null : LocalCue.EXPORTED;
         byte[] payload = exportData; exportData = null;
         if (result != RESULT_OK || data == null || payload == null) return;
         Uri uri = data.getData();
-        worker.execute(() -> { try (OutputStream output = getContentResolver().openOutputStream(uri)) { if (output == null) throw new Exception("文件无法写入"); output.write(payload); runOnUiThread(() -> feedback(notice, LocalCue.EXPORTED)); } catch (Exception e) { runOnUiThread(() -> showError("导出失败，请选择其他保存位置")); } });
+        worker.execute(() -> { try (OutputStream output = getContentResolver().openOutputStream(uri)) { if (output == null) throw new Exception("文件无法写入"); output.write(payload); runOnUiThread(() -> feedback(notice, cue)); } catch (Exception e) { runOnUiThread(() -> showError("导出失败，请选择其他保存位置")); } });
     }
 
     private void privacyInfo() {
