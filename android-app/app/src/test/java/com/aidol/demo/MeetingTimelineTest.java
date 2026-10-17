@@ -71,4 +71,12 @@ public class MeetingTimelineTest {
         assertFalse(MeetingTimeline.audioPlayable(new JSONObject().put("audio", new JSONObject().put("status", "expired"))));
         assertFalse(MeetingTimeline.audioPlayable(new JSONObject()));
     }
+    @Test public void speakersAreListedInOrderOfFirstAppearance() throws Exception {
+        JSONObject meeting = meeting();
+        meeting.getJSONArray("utterances").getJSONObject(0).put("speaker", "说话人2");
+        meeting.getJSONArray("utterances").getJSONObject(1).put("speaker", "说话人1").put("wall_at", "2026-10-17T06:00:01+00:00");
+        MeetingTimeline timeline = new MeetingTimeline(meeting);
+        assertEquals(List.of("说话人1", "说话人2"), timeline.speakers());  // t1.0 (说话人1) speaks first, at 200 ms.
+        assertEquals("2026-10-17T06:00:01+00:00", timeline.sentence("t1.0").wallTime);
+    }
 }

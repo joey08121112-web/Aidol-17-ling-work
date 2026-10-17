@@ -23,6 +23,50 @@ WORK_SEGMENT_MS = 20000  # Older clients cut fixed 20 s segments and send no off
 PCM_BYTES_PER_MS = 32    # 16 kHz mono PCM16.
 
 
+_SENTENCE_END = re.compile(r'[^。！？!?；;\n]+[。！？!?；;]*')
+_NOT_SPOKEN = re.compile(r'[\s，,。！？!?；;：:、“”"‘’（）()《》…—-]')
+
+
+def _split_sentences(body, start, end, words):
+    """Split one ASR utterance at sentence punctuation.
+
+    Pieces are timed from word timings when the provider sends words matching the text;
+    otherwise times are interpolated by character share (an estimate)."""
+    pieces = [piece.strip() for piece in _SENTENCE_END.findall(body) if piece.strip()]
+    merged = []
+    for piece in pieces:  # A lone "嗯。" stays with its neighbour instead of becoming a line.
+        if merged and len(_NOT_SPOKEN.sub('', piece)) < 2:
+            merged[-1] += piece
+        else:
+            merged.append(piece)
+    if len(merged) <= 1:
+        return [(start, end, body)]
+    sizes = [len(_NOT_SPOKEN.sub('', piece)) for piece in merged]
+    total = sum(sizes)
+    timed = []
+    for word in words or ():
+        if isinstance(word, dict) and type(word.get('start_time')) is int and type(word.get('end_time')) is int:
+            for _ in _NOT_SPOKEN.sub('', str(word.get('text') or '')):
+                timed.append((word['start_time'], word['end_time']))
+    rows, consumed = [], 0
+    for piece, size in zip(merged, sizes):
+        if len(timed) == total and size:
+            piece_start, piece_end = timed[consumed][0], timed[consumed + size - 1][1]
+        else:
+            piece_start = start + (end - start) * consumed // max(total, 1)
+            piece_end = start + (end - start) * (consumed + size) // max(total, 1)
+        consumed += size
+        rows.append((piece_start, max(piece_start, piece_end), piece))
+    return rows
+
+
+def speaker_label(item):
+    """Provider speaker cluster ("0", "1", ...) to a display label; '' when not reported."""
+    additions = item.get('additions') if isinstance(item, dict) else None
+    value = str((additions or {}).get('speaker_id', '')).strip()
+    return f'说话人{int(value) + 1}' if value.isdigit() else ''
+
+
 def _utterance_rows(transcript_id, offset_ms, duration_ms, text, utterances):
     """Normalise ASR sentences onto the meeting timeline; fall back to one segment-wide sentence."""
     rows = []
@@ -34,12 +78,34 @@ def _utterance_rows(transcript_id, offset_ms, duration_ms, text, utterances):
             continue
         if duration_ms:
             start, end = min(start, duration_ms), min(end, duration_ms)
-        rows.append((start, end, body))
-    if not rows:
-        rows = [(0, duration_ms, text.strip())]
+        speaker = speaker_label(item)
+        rows.extend((*piece, speaker) for piece in _split_sentences(body, start, end, item.get('words')))
+    if not rows and text.strip():
+        rows = [(*piece, '') for piece in _split_sentences(text.strip(), 0, duration_ms, None)]
     rows.sort(key=lambda row: row[0])
-    return [(f'{transcript_id}.{ordinal}', ordinal, offset_ms + start, offset_ms + end, body)
-            for ordinal, (start, end, body) in enumerate(rows)]
+    return [(f'{transcript_id}.{ordinal}', ordinal, offset_ms + start, offset_ms + end, body, speaker)
+            for ordinal, (start, end, body, speaker) in enumerate(rows)]
+
+
+def _wall_clock(anchor, events):
+    """Timeline offset -> wall-clock ISO time: anchor + offset + every pause that ended before it."""
+    try:
+        base = datetime.fromisoformat(anchor)
+    except (TypeError, ValueError):
+        return lambda offset_ms: None
+    pauses, paused = [], None
+    for event in events:
+        try:
+            moment = datetime.fromisoformat(event['created_at'])
+        except (TypeError, ValueError):
+            continue
+        if event['kind'] == 'pause':
+            paused = (event['offset_ms'], moment)
+        elif event['kind'] == 'resume' and paused:
+            pauses.append((paused[0], max(timedelta(0), moment - paused[1])))
+            paused = None
+    return lambda offset_ms: (base + timedelta(milliseconds=offset_ms)
+                              + sum((length for at, length in pauses if at <= offset_ms), timedelta(0))).isoformat(timespec='seconds')
 
 
 class Store:
@@ -122,6 +188,11 @@ class Store:
                        "transcript_id TEXT NOT NULL, segment_index INTEGER NOT NULL, ordinal INTEGER NOT NULL, "
                        "start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, text TEXT NOT NULL)")
             db.execute("CREATE INDEX IF NOT EXISTS work_utterance_order ON work_utterances(meeting_id, start_ms)")
+            if 'speaker' not in {row['name'] for row in db.execute('PRAGMA table_info(work_utterances)')}:
+                db.execute("ALTER TABLE work_utterances ADD COLUMN speaker TEXT NOT NULL DEFAULT ''")
+            if 'audio_anchor_at' not in meeting_columns:
+                # Wall-clock time of timeline offset 0 (first recorded sample), for clock times to the second.
+                db.execute("ALTER TABLE work_meetings ADD COLUMN audio_anchor_at TEXT")
             db.execute("CREATE TABLE IF NOT EXISTS work_meeting_events (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, "
                        "kind TEXT NOT NULL, offset_ms INTEGER NOT NULL, origin TEXT NOT NULL, created_at TEXT NOT NULL)")
             # One transactional migration indexes existing history, then triggers keep
@@ -409,7 +480,7 @@ class Store:
             return [dict(row) for row in db.execute(
                 "SELECT m.*,json_extract(r.payload,'$.title') AS title,json_extract(r.payload,'$.summary') AS summary, "
                 "(SELECT count(*) FROM work_meeting_segments s JOIN transcripts t ON t.id=s.transcript_id "
-                "WHERE s.meeting_id=m.id) AS transcript_count, "
+                "WHERE s.meeting_id=m.id) + (SELECT count(DISTINCT u.transcript_id) FROM work_utterances u JOIN transcripts t ON t.id=u.transcript_id WHERE u.meeting_id=m.id AND u.segment_index=-1) AS transcript_count, "
                 "(SELECT COALESCE(max(COALESCE(s.offset_ms,s.segment_index*?)+s.duration_ms),0) FROM work_meeting_segments s "
                 "WHERE s.meeting_id=m.id) AS duration_ms FROM work_meetings m LEFT JOIN meeting_reports r ON r.id=m.report_id "
                 "ORDER BY m.started_at DESC LIMIT ?", (WORK_SEGMENT_MS, limit))]
@@ -420,19 +491,25 @@ class Store:
             row = db.execute("SELECT * FROM work_meetings WHERE id=?", (meeting_id,)).fetchone()
             if row is None:
                 return None
+            # Segment-recognised text plus live-caption sentences (segment_index -1), in timeline order.
             sources = [dict(item) for item in db.execute(
                 "SELECT t.*,s.segment_index,COALESCE(s.offset_ms,s.segment_index*?) AS offset_ms,s.duration_ms "
-                "FROM work_meeting_segments s JOIN transcripts t ON t.id=s.transcript_id "
-                "WHERE s.meeting_id=? ORDER BY s.segment_index", (WORK_SEGMENT_MS, meeting_id))]
+                "FROM work_meeting_segments s JOIN transcripts t ON t.id=s.transcript_id WHERE s.meeting_id=? "
+                "UNION ALL SELECT t.*,NULL,min(u.start_ms),max(u.end_ms)-min(u.start_ms) FROM work_utterances u "
+                "JOIN transcripts t ON t.id=u.transcript_id WHERE u.meeting_id=? AND u.segment_index=-1 GROUP BY t.id "
+                "ORDER BY offset_ms", (WORK_SEGMENT_MS, meeting_id, meeting_id))]
             utterances = [dict(item) for item in db.execute(
-                "SELECT u.id,u.transcript_id,u.segment_index,u.start_ms,u.end_ms,u.text FROM work_utterances u "
-                "JOIN transcripts t ON t.id=u.transcript_id WHERE u.meeting_id=? ORDER BY u.segment_index,u.ordinal", (meeting_id,))]
+                "SELECT u.id,u.transcript_id,u.segment_index,u.start_ms,u.end_ms,u.text,u.speaker FROM work_utterances u "
+                "JOIN transcripts t ON t.id=u.transcript_id WHERE u.meeting_id=? ORDER BY u.start_ms,u.ordinal", (meeting_id,))]
             events = [dict(item) for item in db.execute(
                 "SELECT id,kind,offset_ms,origin,created_at FROM work_meeting_events WHERE meeting_id=? "
                 "ORDER BY offset_ms,created_at", (meeting_id,))]
             audio = db.execute("SELECT count(*) AS total,COALESCE(sum(audio_bytes>0),0) AS kept,COALESCE(sum(audio_bytes),0) AS bytes "
                                "FROM work_meeting_segments WHERE meeting_id=?", (meeting_id,)).fetchone()
             report = db.execute("SELECT payload FROM meeting_reports WHERE id=?", (row['report_id'],)).fetchone()
+        clock = _wall_clock(row['audio_anchor_at'] or row['started_at'], events)
+        for item in utterances:
+            item['wall_at'] = clock(item['start_ms'])
         status = row['audio_status'] if row['audio_status'] in ('expired', 'deleted') else (
             'none' if not audio['bytes'] else 'saved' if audio['kept'] == audio['total'] else 'partial')
         expires = None
@@ -440,6 +517,9 @@ class Store:
             expires = (datetime.fromisoformat(row['ended_at']) + timedelta(days=retention)).isoformat()
         return {**dict(row), 'sources': sources, 'transcript_count': len(sources),
                 'received_segments': audio['total'], 'utterances': utterances, 'events': events,
+                'speakers': sorted({item['speaker'] for item in utterances if item['speaker']},
+                                   key=lambda label: int(label[3:]) if label[3:].isdigit() else 0),
+                'audio_started_at': row['audio_anchor_at'] or row['started_at'],
                 'audio': {'status': status, 'bytes': audio['bytes'], 'segments_with_audio': audio['kept'],
                           'retention_days': retention, 'expires_at': expires},
                 'report': json.loads(report['payload']) if report else None}
@@ -477,7 +557,7 @@ class Store:
             raise ValueError('会议片段编号已被使用')
 
     def save_work_segment(self, meeting_id, segment_index, request_id, text, *, offset_ms=None, duration_ms=0,
-                          utterances=(), audio=None):
+                          utterances=(), audio=None, recognized=True):
         """Persist ASR evidence and session membership in the same transaction, including silence receipts.
 
         Audio is written after the rows commit; a failed write keeps the text and records no audio."""
@@ -495,14 +575,26 @@ class Store:
                     raise ValueError('会议片段编号已被使用')
                 return existing['transcript_id']
             keep_audio = keep_audio and row['audio_status'] not in ('expired', 'deleted')
+            if recognized:
+                # Server recognition is the fallback when live captions missed part of this segment:
+                # its text replaces any live sentences that started inside the segment.
+                stale = [item[0] for item in db.execute(
+                    "SELECT transcript_id FROM work_utterances WHERE meeting_id=? AND segment_index=-1 GROUP BY transcript_id "
+                    "HAVING min(start_ms)>=? AND min(start_ms)<?", (meeting_id, offset, offset + max(duration_ms, 1)))]
+                for stale_id in stale:
+                    db.execute("DELETE FROM work_utterances WHERE transcript_id=?", (stale_id,))
+                    db.execute("DELETE FROM transcripts WHERE id=?", (stale_id,))
             transcript_id = uuid4().hex if text.strip() else None
             if transcript_id:
                 db.execute("INSERT INTO transcripts(id,speaker,text,mode,source,created_at,interaction_source) VALUES(?,?,?,?,?,?,?)",
                            (transcript_id, '现场发言（未分离声纹）', text, 'work', 'asr', now(), 'ambient_capture'))
-                db.executemany("INSERT INTO work_utterances VALUES(?,?,?,?,?,?,?,?)",
-                               [(uid, meeting_id, transcript_id, segment_index, ordinal, start, end, body)
-                                for uid, ordinal, start, end, body in
+                db.executemany("INSERT INTO work_utterances(id,meeting_id,transcript_id,segment_index,ordinal,start_ms,end_ms,text,speaker) "
+                               "VALUES(?,?,?,?,?,?,?,?,?)",
+                               [(uid, meeting_id, transcript_id, segment_index, ordinal, start, end, body, speaker)
+                                for uid, ordinal, start, end, body, speaker in
                                 _utterance_rows(transcript_id, offset, duration_ms, text, utterances)])
+            db.execute("UPDATE work_meetings SET audio_anchor_at=? WHERE id=? AND audio_anchor_at IS NULL",
+                       ((datetime.now(timezone.utc) - timedelta(milliseconds=offset + duration_ms)).isoformat(), meeting_id))
             db.execute("INSERT INTO work_meeting_segments(meeting_id,segment_index,request_id,transcript_id,offset_ms,duration_ms,audio_bytes) "
                        "VALUES(?,?,?,?,?,?,?)", (meeting_id, segment_index, request_id, transcript_id, offset, duration_ms,
                                                  len(audio) if keep_audio else 0))
@@ -518,6 +610,32 @@ class Store:
                     db.execute("UPDATE work_meeting_segments SET audio_bytes=0 WHERE meeting_id=? AND segment_index=?",
                                (meeting_id, segment_index))
         return transcript_id
+
+    def anchor_work_audio(self, meeting_id, offset_ms):
+        """First live audio frame: record when timeline offset 0 was, if not yet known."""
+        with self.connect() as db:
+            db.execute("UPDATE work_meetings SET audio_anchor_at=? WHERE id=? AND audio_anchor_at IS NULL",
+                       ((datetime.now(timezone.utc) - timedelta(milliseconds=offset_ms)).isoformat(), meeting_id))
+
+    def save_live_sentence(self, meeting_id, text, start_ms, end_ms, words=(), speaker=''):
+        """Persist one final live-caption utterance (split at sentence ends) while the meeting records."""
+        if not text.strip():
+            return []
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute("SELECT status FROM work_meetings WHERE id=?", (meeting_id,)).fetchone()
+            if row is None or row['status'] != 'recording':
+                raise ValueError('会议不存在或已结束')
+            transcript_id = uuid4().hex
+            db.execute("INSERT INTO transcripts(id,speaker,text,mode,source,created_at,interaction_source) VALUES(?,?,?,?,?,?,?)",
+                       (transcript_id, speaker or '现场发言（未分离声纹）', text, 'work', 'asr', now(), 'ambient_capture'))
+            rows = [(f'{transcript_id}.{ordinal}', ordinal, start, end, body)
+                    for ordinal, (start, end, body) in enumerate(_split_sentences(text, start_ms, end_ms, words))]
+            db.executemany("INSERT INTO work_utterances(id,meeting_id,transcript_id,segment_index,ordinal,start_ms,end_ms,text,speaker) "
+                           "VALUES(?,?,?,?,?,?,?,?,?)",
+                           [(uid, meeting_id, transcript_id, -1, ordinal, start, end, body, speaker) for uid, ordinal, start, end, body in rows])
+        return [{'id': uid, 'transcript_id': transcript_id, 'start_ms': start, 'end_ms': end, 'text': body, 'speaker': speaker}
+                for uid, _, start, end, body in rows]
 
     def work_audio(self, meeting_id, start_ms, end_ms):
         """PCM16 for [start_ms, end_ms) of the meeting timeline; gaps without audio are silence."""
@@ -613,7 +731,9 @@ class Store:
                 indices = [row[0] for row in db.execute(
                     "SELECT segment_index FROM work_meeting_segments WHERE meeting_id=? ORDER BY segment_index", (meeting_id,))]
                 count = db.execute("SELECT count(*) FROM work_meeting_segments s JOIN transcripts t ON t.id=s.transcript_id "
-                                   "WHERE s.meeting_id=?", (meeting_id,)).fetchone()[0]
+                                   "WHERE s.meeting_id=?", (meeting_id,)).fetchone()[0] + db.execute(
+                    "SELECT count(DISTINCT transcript_id) FROM work_utterances WHERE meeting_id=? AND segment_index=-1",
+                    (meeting_id,)).fetchone()[0]
                 intact = complete and indices == list(range(expected_segments))
                 status = 'saved' if intact and count else 'empty' if intact else 'partial'
                 error = '' if status == 'saved' else '没有识别到可保存的讲话' if status == 'empty' else '录音或上传未完整结束，仅保留已确认保存的原文'

@@ -26,4 +26,18 @@ public class TimeFormatTest {
         assertEquals("59:59", TimeFormat.clock(3_599_000));
         assertEquals("1:00:01", TimeFormat.clock(3_601_000));
     }
+    @Test public void clockAndDayOfIsoTimestampsInLocalZone() {
+        assertEquals("14:03:05", TimeFormat.clockOf("2026-10-17T06:03:05+00:00", SHANGHAI));
+        assertEquals("2026-10-17 星期六", TimeFormat.dayOf("2026-10-17T06:03:05+00:00", SHANGHAI));
+        assertEquals("2026-10-19 星期一", TimeFormat.dayOf("2026-10-18T17:00:00+00:00", SHANGHAI));
+        assertEquals("", TimeFormat.clockOf("", SHANGHAI));
+        assertEquals("", TimeFormat.dayOf("bad", SHANGHAI));
+    }
+    @Test public void referenceStyleDatesAndPositions() {
+        assertEquals("00:00:41", TimeFormat.hms(41_999));
+        assertEquals("01:02:05", TimeFormat.hms(3_725_000));
+        assertEquals("2026年9月4日（周五）", TimeFormat.chineseDay("2026-09-04T01:59:00+00:00", SHANGHAI));
+        assertEquals("09:59", TimeFormat.hourMinute("2026-09-04T01:59:30+00:00", SHANGHAI));
+        assertEquals("GMT+08", TimeFormat.gmt(SHANGHAI));
+    }
 }

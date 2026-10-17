@@ -34,6 +34,9 @@ public final class HostedSession {
         default void processing() {}
         default void submitted(String requestId) {}
         default void meeting(JSONObject meeting) {}
+        /** Live captions: final sentences (saved by the server) and the current interim text. */
+        default void captionFinals(org.json.JSONArray sentences) {}
+        default void captionPartial(String text) {}
         void result(JSONObject result);
         void recording();
         void meter(long bytes, double rms);
@@ -132,6 +135,10 @@ public final class HostedSession {
     private volatile int workMarks;
     // Pause/resume/mark receipts are posted in order, off the segment-upload worker.
     private final ExecutorService workEvents = Executors.newSingleThreadExecutor(r -> new Thread(r, "aidol-work-events"));
+    // Streaming ASR is the main source of meeting text; segments then upload audio only.
+    private volatile WorkLiveCaptions live;
+    private volatile boolean liveWanted;
+    private final Runnable liveReconnect = this::reconnectLive;
     public String workMeetingId() { return workRecording && workMeetingStarted ? sessionId : ""; }
     public boolean workSaving() { return workRecording && workStopping.get(); }
     public boolean workPaused() { WorkAudioBuffer buffer = workBuffer; return buffer != null && buffer.paused(); }
@@ -145,6 +152,7 @@ public final class HostedSession {
         try {
             long offset = buffer.pause();
             if (offset < 0) return false;
+            WorkLiveCaptions current = live; if (current != null) current.pause();
             postWorkEvent("pause", offset, "app");
             status("已暂停 · 不记录、不上传；点“继续”恢复");
             return true;
@@ -155,6 +163,7 @@ public final class HostedSession {
         if (!activeWorkCapture() || buffer == null) return false;
         long offset = buffer.resume();
         if (offset < 0) return false;
+        WorkLiveCaptions current = live; if (current != null) current.resume(offset);
         postWorkEvent("resume", offset, "app");
         status("已继续记录");
         return true;
@@ -433,6 +442,8 @@ public final class HostedSession {
             complete = true;
         } finally {
             captureActive = false; capture.close(); releaseCaptureFocus();
+            liveWanted = false; ui.removeCallbacks(liveReconnect);
+            WorkLiveCaptions current = live; if (current != null) current.close();
             // Let queued marks/pauses land before finish; the server rejects them afterwards.
             workEvents.shutdown();
             try { workEvents.awaitTermination(8, TimeUnit.SECONDS); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
@@ -454,6 +465,13 @@ public final class HostedSession {
         workBuffer = new WorkAudioBuffer();
         check();
         if (workStopping.get()) { workBuffer.finish(); return; }
+        // Open live captions first (up to 3 s) so the first words are captioned, not recognised twice.
+        liveWanted = true; startLive(0);
+        for (long waitUntil = LiveCoverage.now() + 3000; LiveCoverage.now() < waitUntil; ) {
+            WorkLiveCaptions current = live;
+            if (current == null || current.healthy() || workStopping.get() || failure != null) break;
+            check(); end.await(50, TimeUnit.MILLISECONDS);
+        }
         captureActive = true; requestCaptureFocus();
         if (workStopping.get()) { captureActive = false; workBuffer.finish(); return; }
         ui.postDelayed(startupTimeout, 12000);
@@ -467,7 +485,11 @@ public final class HostedSession {
             public void pcm(byte[] pcm) {
                 if (cancelled.get() || !captureActive) return;
                 try {
-                    workBuffer.append(pcm);
+                    // Only audio the buffer kept (not paused) is captioned, so both share one timeline.
+                    if (workBuffer.append(pcm)) {
+                        WorkLiveCaptions current = live;
+                        if (current != null && !current.audio(pcm)) scheduleLiveReconnect();
+                    }
                     long now = SystemClock.elapsedRealtime();
                     if (now - lastMeter > 300) {
                         lastMeter = now; long size = workBuffer.size(); double rms = AudioFrames.rms(pcm);
@@ -477,26 +499,87 @@ public final class HostedSession {
             }
             public void error(String message) { workFailure(message); }
         });
+        boolean liveClosed = false, liveConfirmed = false;
         while (true) {
             check();
             if (failure != null) throw new IOException(failure);
-            WorkAudioBuffer.Segment segment = workBuffer.poll();
+            WorkAudioBuffer.Segment segment = workBuffer.peek();
+            boolean captureEnded = workBuffer.ended();
+            if (captureEnded && !liveClosed) {
+                // Ask the server to save the last live sentences before deciding the tail segments.
+                liveClosed = true; liveWanted = false; ui.removeCallbacks(liveReconnect);
+                WorkLiveCaptions current = live;
+                long since = current == null ? Long.MAX_VALUE : current.healthySince();
+                liveConfirmed = current != null && current.end(10_000);
+                liveEndedHealthySince = liveConfirmed ? since : Long.MAX_VALUE;
+            }
+            if (segment != null && !LiveCoverage.settled(segment.endedAt, LiveCoverage.now(), captureEnded)) {
+                end.await(100, TimeUnit.MILLISECONDS); continue;
+            }
             if (segment != null) {
+                workBuffer.poll();
+                WorkLiveCaptions current = live;
+                boolean covered = captureEnded
+                    ? LiveCoverage.covered(segment.startedAt, liveEndedHealthySince, liveConfirmed)
+                    : current != null && LiveCoverage.covered(segment.startedAt, current.healthySince(), current.healthy());
                 requestId = UUID.randomUUID().toString();
                 String segmentId = requestId; post(() -> listener.submitted(segmentId));
                 int segmentIndex = workSegmentCount++;
                 try {
                     JSONObject result = new JSONObject(new String(request("/v1/voice?request_id=" + segmentId
                         + "&interaction_source=ambient_capture&meeting_id=" + sessionId + "&segment_index=" + segmentIndex
-                        + "&offset_ms=" + segment.offsetMs, segment.pcm, "audio/pcm"), StandardCharsets.UTF_8));
+                        + "&offset_ms=" + segment.offsetMs + (covered ? "&recognize=0" : ""), segment.pcm, "audio/pcm"),
+                        StandardCharsets.UTF_8));
                     check();
-                    post(() -> { listener.transcript(result.optString("text")); listener.result(result); });
+                    // Server-recognised fallback text joins the captions as final text.
+                    String fallbackText = result.optString("text");
+                    org.json.JSONArray fallback = new org.json.JSONArray();
+                    if (!fallbackText.isEmpty()) fallback.put(new JSONObject().put("text", fallbackText).put("start_ms", segment.offsetMs)
+                        .put("clock", TimeFormat.clockAt(System.currentTimeMillis() - Math.max(0, workBuffer.offsetMs() - segment.offsetMs))));
+                    post(() -> {
+                        if (fallback.length() > 0) listener.captionFinals(fallback);
+                        listener.result(result);
+                    });
                 } catch (Exception error) {
                     throw new IOException("工作记录未完整保存；请查看历史确认已提交部分。" + error.getMessage(), error);
                 }
             } else if (workBuffer.complete()) break;
             else end.await(100, TimeUnit.MILLISECONDS);
         }
+    }
+    private volatile long liveEndedHealthySince = Long.MAX_VALUE;
+    private void startLive(long offsetMs) {
+        if (!liveWanted || cancelled.get()) return;
+        WorkLiveCaptions previous = live; if (previous != null) previous.close();
+        live = WorkLiveCaptions.connect(api, sessionId, offsetMs, new WorkLiveCaptions.Listener() {
+            public void partial(String text) { post(() -> listener.captionPartial(text)); }
+            public void finals(org.json.JSONArray sentences) {
+                // Clock time of each sentence's start: now minus the recorded audio since it began.
+                WorkAudioBuffer buffer = workBuffer;
+                long now = System.currentTimeMillis(), recorded = buffer == null ? 0 : buffer.offsetMs();
+                for (int i = 0; i < sentences.length(); i++) {
+                    JSONObject sentence = sentences.optJSONObject(i);
+                    if (sentence == null) continue;
+                    try { sentence.put("clock", TimeFormat.clockAt(now - Math.max(0, recorded - sentence.optLong("start_ms")))); }
+                    catch (org.json.JSONException ignored) { /* Display only. */ }
+                }
+                post(() -> listener.captionFinals(sentences));
+            }
+            public void failed(String message) { status(message); scheduleLiveReconnect(); }
+        });
+    }
+    private void scheduleLiveReconnect() {
+        if (!liveWanted || cancelled.get()) return;
+        ui.removeCallbacks(liveReconnect); ui.postDelayed(liveReconnect, 1500);
+    }
+    /** A new socket starts at the current recorded offset; the missed audio's segment falls back to the server. */
+    private void reconnectLive() {
+        WorkLiveCaptions current = live;
+        if (!liveWanted || cancelled.get() || workStopping.get() || current != null && current.healthy()) return;
+        WorkAudioBuffer buffer = workBuffer;
+        startLive(buffer == null ? 0 : buffer.offsetMs());
+        WorkLiveCaptions started = live;
+        if (started != null && buffer != null && buffer.paused()) started.pause();
     }
     private void startCapture() throws Exception {
         synchronized (captureStartLock) { check(); captureActive = true; }
@@ -765,6 +848,7 @@ public final class HostedSession {
         if (duplex != null) duplex.cancel();
         events.invalidate(); captureActive = false; turn.cancel(); clearCaptureTimers(); end.countDown();
         if (upload != null) upload.cancel();
+        liveWanted = false; WorkLiveCaptions current = live; if (current != null) current.close();
         if (pending != null) pending.cancel(); cancelPlayer();
         capture.close();
         releaseCaptureFocus();

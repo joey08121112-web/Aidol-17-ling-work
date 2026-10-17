@@ -8,7 +8,8 @@ import pytest
 
 from app.providers.volc_speech import AsrResult
 from app.domain import Mode
-from app.services.work_meetings import WorkMeetingMinutes, _batches
+from app.services.work_meetings import WorkMeetingMinutes, _batches, attach_times
+from app.storage import _split_sentences
 
 
 @pytest.fixture
@@ -19,7 +20,7 @@ def work(client, runtime, config, monkeypatch):
     runtime.store.save_settings(settings)
     words = ['我们决定采用蓝色方案。小林负责周五交设计稿。']
 
-    async def transcribe(chunks):
+    async def transcribe(chunks, **_):
         async for _ in chunks:
             pass
         yield AsrResult(words[0], final=True)
@@ -219,7 +220,12 @@ async def test_minutes_model_payload_and_unsupported_citations_fall_back_to_visi
     rows = [source(0, '小林负责周五提交设计稿。下一次是否采用红色还没确定。')]
     output = {'title': '设计讨论', 'summary': '周五提交设计稿，颜色待定。', 'decisions': [],
               'tasks': [{'content': '提交设计稿', 'owner': '小林', 'due': '周五', 'source_ids': ['0']}],
-              'topics': [], 'open_questions': [{'text': '是否用红色', 'source_ids': ['0']}]}
+              'topics': [], 'open_questions': [{'text': '是否用红色', 'source_ids': ['0']}],
+              'chapters': [{'title': '设计稿安排', 'summary': '周五交稿', 'source_ids': ['0']},
+                           {'title': '超长' * 20, 'summary': '', 'source_ids': ['0']},          # Dropped: title too long.
+                           {'title': '别的会', 'summary': '', 'source_ids': ['other-meeting']}],  # Dropped: unknown id.
+              'highlights': [{'text': '小林负责周五提交设计稿', 'source_ids': ['0']},
+                             {'text': '小林保证周五一定完成', 'source_ids': ['0']}]}            # Dropped: not verbatim.
     payloads = []
     class FakeClient:
         def __init__(self, **kwargs): pass
@@ -233,6 +239,9 @@ async def test_minutes_model_payload_and_unsupported_citations_fall_back_to_visi
     result = await WorkMeetingMinutes(config).generate(rows)
     assert result['extraction'] == 'llm'
     assert result['open_questions'][0]['source_ids'] == ['0']
+    assert [c['title'] for c in result['chapters']] == ['设计稿安排']
+    assert [h['text'] for h in result['highlights']] == ['小林负责周五提交设计稿']
+    assert '逐字摘录' in payloads[0]['messages'][0]['content']
     assert payloads[0]['response_format'] == {'type': 'json_object'}
     assert '后来的更正或撤销优先' in payloads[0]['messages'][0]['content']
     output['tasks'][0]['owner'] = '不存在的人'
@@ -249,7 +258,7 @@ def timed(work, monkeypatch):
     """ASR that reports two timed sentences per segment, like Volc show_utterances."""
     client, runtime, words, calls = work
 
-    async def transcribe(chunks):
+    async def transcribe(chunks, **_):
         async for _ in chunks:
             pass
         yield AsrResult('先说预算。再定排期。', final=True, utterances=(
@@ -293,8 +302,10 @@ def test_old_clients_without_offsets_and_untimed_asr_still_get_times(work):
     upload(client, meeting_id, 0)
     upload(client, meeting_id, 1)
     detail = finish(client, meeting_id, 2)
+    # Untimed text is split at sentence ends with times estimated by character share.
     assert [(u['start_ms'], u['end_ms'], u['text']) for u in detail['utterances']] == [
-        (0, 100, words[0]), (20000, 20100, words[0])]
+        (0, 50, '我们决定采用蓝色方案。'), (50, 100, '小林负责周五交设计稿。'),
+        (20000, 20050, '我们决定采用蓝色方案。'), (20050, 20100, '小林负责周五交设计稿。')]
     assert client.post('/v1/voice', params={'request_id': uuid4().hex, 'offset_ms': 0},
                        content=b'\0' * 3200, headers={'Content-Type': 'audio/pcm'}).status_code == 422
 
@@ -386,3 +397,175 @@ def test_pause_resume_and_marks_are_idempotent_and_only_while_recording(work):
                            json={**mark, 'event_id': uuid4().hex}).status_code == 200
     finally:
         client.portal.call(runtime.lock.release)
+
+
+def test_sentence_split_uses_word_times_or_estimates_and_keeps_tiny_fillers():
+    words = [{'text': ch, 'start_time': i * 100, 'end_time': i * 100 + 90} for i, ch in enumerate('先说预算再定排期')]
+    assert _split_sentences('先说预算。再定排期。', 0, 800, words) == [(0, 390, '先说预算。'), (400, 790, '再定排期。')]
+    # Words that do not match the text fall back to character-share estimates.
+    assert _split_sentences('先说预算。再定排期。', 0, 800, words[:3]) == [(0, 400, '先说预算。'), (400, 800, '再定排期。')]
+    assert _split_sentences('好的。嗯。下一步', 0, 600, None) == [(0, 300, '好的。嗯。'), (300, 600, '下一步')]
+    assert _split_sentences('没有句号的一句话', 5, 9, None) == [(5, 9, '没有句号的一句话')]
+
+
+def test_chapter_and_highlight_times_come_from_cited_sentences():
+    meeting = {'sources': [{'id': 'old', 'offset_ms': 20000}],
+               'utterances': [{'id': 't.0', 'start_ms': 300}, {'id': 't.1', 'start_ms': 9000}]}
+    report = attach_times({'chapters': [{'title': '后', 'source_ids': ['t.1']}, {'title': '前', 'source_ids': ['t.1', 't.0']},
+                                        {'title': '旧', 'source_ids': ['old']}, {'title': '无', 'source_ids': ['gone']}],
+                           'highlights': [{'text': 'x', 'source_ids': ['t.1']}]}, meeting)
+    assert [(c['title'], c['start_ms']) for c in report['chapters']] == [('前', 300), ('后', 9000), ('旧', 20000), ('无', None)]
+    assert report['highlights'][0]['start_ms'] == 9000
+
+
+def u(text, start, end, definite):
+    return {'text': text, 'start_time': start, 'end_time': end, 'definite': definite}
+
+
+@pytest.fixture
+def live(work, monkeypatch):
+    """Scripted streaming ASR: each upstream run pops a plan of results keyed by chunk count / 'end'."""
+    client, runtime, words, calls = work
+    plans, runs = [], []
+
+    async def stream(chunks, **options):
+        plan = plans.pop(0)
+        runs.append(0)
+        async for _ in chunks:
+            runs[-1] += 1
+            for result in plan.get(runs[-1], []):
+                yield result
+        for result in plan.get('end', []):
+            yield result
+
+    monkeypatch.setattr(client.app.state.speech, 'stream_asr', stream)
+    return client, runtime, plans, runs, calls
+
+
+def receive_until(ws, kind):
+    seen = []
+    while True:
+        message = ws.receive_json()
+        seen.append(message)
+        if message['type'] == kind:
+            return seen
+
+
+def test_live_captions_stream_partials_and_save_final_sentences_on_the_timeline(live):
+    client, runtime, plans, runs, calls = live
+    meeting_id = start(client)
+    plans.append({1: [AsrResult('先说', utterances=(u('先说', 0, 60, False),))],
+                  2: [AsrResult('先说预算。再定排期。下一', utterances=(u('先说预算。再定排期。', 0, 180, True), u('下一', 190, 200, False)))],
+                  'end': [AsrResult('', final=True, utterances=(u('先说预算。再定排期。', 0, 180, True), u('下一步。', 190, 200, False)))]})
+    plans.append({1: [AsrResult('继续。', utterances=(u('继续。', 10, 90, True),))], 'end': [AsrResult('', final=True)]})
+    headers = {'Authorization': client.headers['Authorization']}
+    with client.websocket_connect(f'/v1/work-meetings/{meeting_id}/live?offset_ms=0', headers=headers) as ws:
+        assert ws.receive_json() == {'type': 'ready', 'offset_ms': 0}
+        ws.send_bytes(b'\0' * 3200)
+        ws.send_bytes(b'\0' * 3200)
+        ws.send_text(json.dumps({'type': 'pause'}))
+        seen = receive_until(ws, 'paused')
+        assert seen[0] == {'type': 'partial', 'text': '先说', 'start_ms': 0}
+        finals = [s for m in seen if m['type'] == 'final' for s in m['sentences']]
+        assert [(s['text'], s['start_ms'], s['end_ms']) for s in finals] == [
+            ('先说预算。', 0, 90), ('再定排期。', 90, 180), ('下一步。', 190, 200)]  # Last one flushed by the pause.
+        assert seen[-1] == {'type': 'paused', 'offset_ms': 200}
+        ws.send_text(json.dumps({'type': 'resume', 'offset_ms': 5000}))  # Recorded time jumps only by recorded PCM.
+        ws.send_bytes(b'\0' * 3200)
+        ws.send_text(json.dumps({'type': 'end'}))
+        seen = receive_until(ws, 'done')
+        assert [s['start_ms'] for m in seen if m['type'] == 'final' for s in m['sentences']] == [5010]
+        assert seen[-1] == {'type': 'done', 'offset_ms': 5100}
+    assert runs == [2, 1]
+    # The 20 s segment carries audio only: no second recognition, no request quota.
+    response = client.post('/v1/voice', params={'request_id': uuid4().hex, 'meeting_id': meeting_id, 'segment_index': 0,
+                                                'offset_ms': 0, 'recognize': 0},
+                           content=b'\1\0' * 3200, headers={'Content-Type': 'audio/pcm'})
+    assert response.status_code == 200 and response.json()['text'] == ''
+    detail = finish(client, meeting_id)
+    assert detail['status'] == 'saved' and detail['audio']['status'] == 'saved'
+    assert [x['text'] for x in detail['utterances']] == ['先说预算。', '再定排期。', '下一步。', '继续。']
+    assert len(detail['sources']) == 3 and detail['transcript_count'] == 3
+    assert [row['id'] for row in calls[0]] == [x['id'] for x in detail['utterances']]  # Minutes cite live sentences.
+    assert client.get('/v1/work-meetings').json()['meetings'][0]['transcript_count'] == 3
+
+
+def test_segment_fallback_recognition_replaces_live_sentences_in_its_range(live, monkeypatch):
+    client, runtime, plans, runs, calls = live
+    meeting_id = start(client)
+    runtime.store.save_live_sentence(meeting_id, '只听到一半', 1000, 1500)
+    runtime.store.save_live_sentence(meeting_id, '下一段的话', 21000, 21500)
+
+    async def segment_asr(chunks, **_):
+        async for _ in chunks:
+            pass
+        yield AsrResult('完整的第一段。', final=True, utterances=(u('完整的第一段。', 0, 900, True),))
+
+    monkeypatch.setattr(client.app.state.speech, 'stream_asr', segment_asr)
+    # A 2 s segment [0, 2000) with server recognition (recognize defaults to 1).
+    assert pcm_upload(client, meeting_id, 0, b'\0' * 64000, offset_ms=0).status_code == 200
+    texts = [x['text'] for x in client.get('/v1/work-meetings/' + meeting_id).json()['utterances']]
+    assert texts == ['完整的第一段。', '下一段的话']
+
+
+def test_live_socket_rejects_bad_auth_ended_meetings_and_reports_provider_failure(live, monkeypatch):
+    client, runtime, plans, runs, calls = live
+    from starlette.websockets import WebSocketDisconnect
+    from app.providers.volc_speech import SpeechProviderError
+    meeting_id = start(client)
+    with pytest.raises(WebSocketDisconnect) as denied:
+        with client.websocket_connect(f'/v1/work-meetings/{meeting_id}/live', headers={'Authorization': 'Bearer nope'}):
+            pass
+    assert denied.value.code == 4401
+
+    async def broken(chunks, **_):
+        async for _ in chunks:
+            raise SpeechProviderError('upstream gone')
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(client.app.state.speech, 'stream_asr', broken)
+    headers = {'Authorization': client.headers['Authorization']}
+    with client.websocket_connect(f'/v1/work-meetings/{meeting_id}/live', headers=headers) as ws:
+        ws.receive_json()
+        ws.send_bytes(b'\0' * 3200)
+        ws.send_bytes(b'\0' * 3200)
+        message = ws.receive_json()
+        assert message['type'] == 'error' and '整段识别' in message['message']
+    finish(client, meeting_id, 0)
+    with pytest.raises(WebSocketDisconnect) as ended:
+        with client.websocket_connect(f'/v1/work-meetings/{meeting_id}/live', headers=headers):
+            pass
+    assert ended.value.code == 4409
+    with pytest.raises(ValueError):
+        runtime.store.save_live_sentence(meeting_id, '结束后的话', 0, 10)
+
+
+def test_live_speakers_and_clock_times_to_the_second_skip_pauses(live):
+    client, runtime, plans, runs, calls = live
+    from app.storage import speaker_label, _wall_clock
+    assert speaker_label({'additions': {'speaker_id': '1'}}) == '说话人2'
+    assert speaker_label({'additions': {}}) == speaker_label({}) == ''
+    meeting_id = start(client)
+    first = dict(u('大家好。', 0, 900, True), additions={'speaker_id': '0'})
+    second = dict(u('我建议推迟。', 1000, 1900, True), additions={'speaker_id': '1'})
+    plans.append({1: [AsrResult('', utterances=(first,))], 2: [AsrResult('', utterances=(first, second))], 'end': [AsrResult('', final=True)]})
+    headers = {'Authorization': client.headers['Authorization']}
+    with client.websocket_connect(f'/v1/work-meetings/{meeting_id}/live', headers=headers) as ws:
+        ws.receive_json()
+        ws.send_bytes(b'\0' * 32000)
+        ws.send_bytes(b'\0' * 32000)
+        ws.send_text(json.dumps({'type': 'end'}))
+        seen = receive_until(ws, 'done')
+    assert [(s['speaker'], s['text']) for m in seen if m['type'] == 'final' for s in m['sentences']] == [
+        ('说话人1', '大家好。'), ('说话人2', '我建议推迟。')]
+    detail = client.get('/v1/work-meetings/' + meeting_id).json()
+    assert detail['speakers'] == ['说话人1', '说话人2']
+    assert [row['speaker'] for row in detail['sources']] == ['说话人1', '说话人2']  # The minutes see speaker labels.
+    assert detail['audio_started_at'] and all(len(x['wall_at']) == 25 for x in detail['utterances'])  # ...T14:03:12+00:00
+    # A 5-minute pause at 1000 ms pushes later sentences' clock times, not earlier ones.
+    clock = _wall_clock('2026-10-17T06:00:00+00:00', [
+        {'kind': 'pause', 'offset_ms': 1000, 'created_at': '2026-10-17T06:00:01+00:00'},
+        {'kind': 'resume', 'offset_ms': 1000, 'created_at': '2026-10-17T06:05:01+00:00'}])
+    assert clock(500) == '2026-10-17T06:00:00+00:00'
+    assert clock(1000) == '2026-10-17T06:05:01+00:00'
+    assert clock(62_000) == '2026-10-17T06:06:02+00:00'

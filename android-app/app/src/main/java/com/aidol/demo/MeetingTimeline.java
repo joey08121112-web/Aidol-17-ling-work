@@ -17,9 +17,14 @@ final class MeetingTimeline {
         final long startMs;
         final long endMs;      // Sentence end on the timeline; 0 when unknown.
         final String text;
-        final String wallTime; // Server time of pause/resume/mark events.
+        final String wallTime; // Server time of pause/resume/mark events; clock time of a sentence's start.
+        final String speaker;  // "说话人1" etc. from speaker clustering; "" when not separated.
         Entry(Kind kind, String id, long startMs, long endMs, String text, String wallTime) {
-            this.kind = kind; this.id = id; this.startMs = startMs; this.endMs = endMs; this.text = text; this.wallTime = wallTime;
+            this(kind, id, startMs, endMs, text, wallTime, "");
+        }
+        Entry(Kind kind, String id, long startMs, long endMs, String text, String wallTime, String speaker) {
+            this.kind = kind; this.id = id; this.startMs = startMs; this.endMs = endMs; this.text = text;
+            this.wallTime = wallTime; this.speaker = speaker;
         }
     }
 
@@ -37,7 +42,8 @@ final class MeetingTimeline {
         java.util.HashSet<String> timed = new java.util.HashSet<>();
         if (utterances != null) for (int i = 0; i < utterances.length(); i++) {
             JSONObject item = utterances.optJSONObject(i); if (item == null) continue;
-            Entry entry = new Entry(Entry.Kind.SENTENCE, item.optString("id"), item.optLong("start_ms"), item.optLong("end_ms"), item.optString("text"), "");
+            Entry entry = new Entry(Entry.Kind.SENTENCE, item.optString("id"), item.optLong("start_ms"), item.optLong("end_ms"),
+                item.optString("text"), item.optString("wall_at"), item.optString("speaker"));
             sentences.add(entry);
             transcriptOfSentence.put(entry.id, item.optString("transcript_id"));
             timed.add(item.optString("transcript_id"));
@@ -110,5 +116,12 @@ final class MeetingTimeline {
         for (Entry entry : sentences) if (entry.startMs <= positionMs) found = entry;
         // Silence after a sentence's known end highlights nothing.
         return found == null || found.endMs > found.startMs && positionMs >= found.endMs ? null : found;
+    }
+
+    /** Distinct speaker labels in order of first appearance. */
+    List<String> speakers() {
+        List<String> labels = new ArrayList<>();
+        for (Entry entry : sentences) if (!entry.speaker.isEmpty() && !labels.contains(entry.speaker)) labels.add(entry.speaker);
+        return labels;
     }
 }

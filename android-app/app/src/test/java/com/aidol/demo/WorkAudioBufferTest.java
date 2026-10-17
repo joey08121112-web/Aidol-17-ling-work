@@ -65,4 +65,23 @@ public class WorkAudioBufferTest {
         assertFalse(buffer.paused());
         assertEquals(-1, buffer.pause());
     }
+    @Test public void segmentsCarryStartAndCloseTimesAndPausedAudioIsReportedAsDiscarded() throws Exception {
+        long[] clock = {1000};
+        WorkAudioBuffer buffer = new WorkAudioBuffer(() -> clock[0]);
+        assertTrue(buffer.append(new byte[32000]));
+        clock[0] = 2000;
+        assertTrue(buffer.append(new byte[WorkAudioBuffer.SEGMENT_BYTES - 32000]));  // Closes segment 0 at t=2000.
+        assertTrue(buffer.append(new byte[3200]));                                    // Segment 1 starts at t=2000.
+        WorkAudioBuffer.Segment first = buffer.peek();
+        assertSame(first, buffer.poll());
+        assertEquals(1000, first.startedAt); assertEquals(2000, first.endedAt);
+        clock[0] = 3000;
+        buffer.pause();
+        assertFalse(buffer.append(new byte[3200]));  // Not buffered, so it must not be captioned either.
+        WorkAudioBuffer.Segment flushed = buffer.poll();
+        assertEquals(2000, flushed.startedAt); assertEquals(3000, flushed.endedAt);
+        assertFalse(buffer.ended());
+        buffer.finish();
+        assertTrue(buffer.ended());
+    }
 }

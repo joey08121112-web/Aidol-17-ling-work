@@ -166,12 +166,25 @@ public final class MainActivity extends Activity {
     private AlertDialog sourceDialog;
     private LinearLayout workMeetingList, workMeetingDetail;
     private String openWorkMeetingId = "", workMeetingDetailSnapshot = "", workMeetingJumpId = "";
-    private boolean workMeetingShowOriginal, workMeetingSyncError;
-    private TextView workMeetingDetailStatus, workClock;
+    private boolean workMeetingSyncError, workMeetingAudioPlayable, meetingSeeking;
+    private TextView workClock, meetingTitle, meetingMeta;
+    private LinearLayout workCaptionBox, conversationCaptionBox;
+    // Live captions of the meeting being recorded: final sentences in ink, the interim text in grey.
+    private final java.util.ArrayList<SpeakerParagraphs.Sentence> workCaptionSentences = new java.util.ArrayList<>();
+    private String workCaptionPartial = "", workCaptionMeetingId = "", workCaptionStartedAt = "";
+    private String workMeetingAudioText = "";
+    private android.app.Dialog meetingPage;
+    private ScrollView meetingScroll;
+    private LinearLayout meetingNav;
+    private android.widget.SeekBar meetingSeek;
+    private final java.util.LinkedHashMap<String, View> meetingSections = new java.util.LinkedHashMap<>();
     private boolean workMeetingPollInFlight;
     private MeetingPlayback meetingPlayback;
     private MeetingTimeline workMeetingTimeline;
     private final java.util.HashMap<String, TextView> workMeetingLines = new java.util.HashMap<>();
+    // Sentence -> character range in its paragraph, and the spans currently marking playing / jumped sentences.
+    private final java.util.HashMap<String, int[]> workMeetingRanges = new java.util.HashMap<>();
+    private final Object[] playingMark = new Object[1], jumpMark = new Object[1];
     private String workMeetingPlayingId = "";
     private LinearLayout workMeetingPlayer;
     private TextView workMeetingPlayerStatus;
@@ -234,7 +247,7 @@ public final class MainActivity extends Activity {
         diagnosticsView = null;
         turnDetails = null;
         voiceButton = null; cancelButton = null; orb = null; chatInput = null;
-        callCaption = null; liveWords = null; content = null;
+        callCaption = null; liveWords = null; content = null; workCaptionBox = null; conversationCaptionBox = null;
         liveTurn = null; liveUserBubble = null; liveAssistantBubble = null; conversationStarters = null;
         conversationScrollQueued = false;
         headsetStatus = null;
@@ -425,6 +438,10 @@ public final class MainActivity extends Activity {
             renderDiagnostics(); button(diagnosticCard, "连接设置", false, this::showDevelopmentSettings);
         }
         gap(page, 12);
+        if ("work".equals(mode())) {
+            conversationTranscript();
+            content = column(); page.addView(content);  // Keeps the shared live-turn plumbing valid.
+        } else {
         LinearLayout histHead = row(); histHead.setGravity(Gravity.CENTER_VERTICAL); page.addView(histHead);
         TextView historyTitle = label(histHead, "最近对话", 17, INK); histHead.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
         if (!settings().optBoolean("retain_transcripts", true)) label(histHead, "不保存转写", 10, MUTED);
@@ -447,6 +464,7 @@ public final class MainActivity extends Activity {
         }
         if (!settings().optBoolean("retain_transcripts", true))
             for (ConversationFeed.Line line : conversationFeed.unsaved()) chatBubble(content, line.assistant, line.text, line.time);
+        }
         renderLiveTurn();
         turnDetails = column(); page.addView(turnDetails); renderTurnDetails();
         LinearLayout inputRow = row(); inputRow.setGravity(Gravity.CENTER_VERTICAL); composer.addView(inputRow);
@@ -464,6 +482,77 @@ public final class MainActivity extends Activity {
         if (session != null) followConversation();
     }
 
+    /**
+     * Work mode on the 对话 page: the meeting's text record in the reference layout — a ruled meta
+     * block (topic, date and time range, speakers) and speaker paragraphs that grow while recording.
+     */
+    private void conversationTranscript() {
+        boolean live = session != null && sessionUsesCapture && "work".equals(mode());
+        JSONArray meetings = array(state, "work_meetings");
+        JSONObject latest = meetings.length() > 0 ? meetings.optJSONObject(0) : null;
+        boolean showLatest = !live && workCaptionSentences.isEmpty() && latest != null;
+        TextView heading = label(page, "文字记录", 20, INK); heading.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        java.time.ZoneId zone = java.time.ZoneId.systemDefault();
+        String started = showLatest ? latest.optString("started_at") : workCaptionStartedAt;
+        String ended = showLatest ? latest.optString("ended_at") : "";
+        String title = showLatest && !latest.isNull("title") ? fallback(latest.optString("title"), "会议记录") : live ? "本次会议（记录中）" : "本次会议";
+        java.util.LinkedHashSet<String> speakers = new java.util.LinkedHashSet<>();
+        for (SpeakerParagraphs.Sentence sentence : workCaptionSentences) if (!sentence.speaker.isEmpty()) speakers.add(SpeakerParagraphs.name(sentence.speaker));
+        LinearLayout meta = metaBlock(page);
+        label(meta, "录音主题：" + title, 14, MUTED);
+        if (!started.isEmpty()) label(meta, "录音时间：" + TimeFormat.chineseDay(started, zone) + " " + TimeFormat.hourMinute(started, zone)
+            + " - " + (live ? "进行中" : fallback(TimeFormat.hourMinute(ended, zone), "…")) + "（" + TimeFormat.gmt(zone) + "）", 14, MUTED);
+        if (!showLatest) label(meta, "说话人：" + (speakers.isEmpty() ? (live ? "按声音自动区分中" : "未区分") : String.join("、", speakers)), 14, MUTED);
+        if (showLatest) {
+            // Show the latest meeting's text record inline; a new recording replaces it with live captions.
+            LinearLayout box = column(); page.addView(box);
+            String latestId = latest.optString("id");
+            if (latestMeetingDetail != null && latestId.equals(latestMeetingDetail.optString("id"))) renderLatestMeeting(box, latestMeetingDetail);
+            else {
+                label(box, "正在加载最近一场会议的文字记录…", 13, MUTED);
+                ApiClient client = api;
+                worker.execute(() -> {
+                    JSONObject detail = null;
+                    try { detail = client.json("GET", "/v1/work-meetings/" + Uri.encode(latestId), null); } catch (Exception ignored) {}
+                    JSONObject loaded = detail;
+                    runOnUiThread(() -> {
+                        if (loaded == null || client != api) { if (box.isAttachedToWindow()) { box.removeAllViews(); label(box, "文字记录暂未加载，下拉刷新或点下面查看。", 13, MUTED); } return; }
+                        latestMeetingDetail = loaded;
+                        if (box.isAttachedToWindow()) renderLatestMeeting(box, loaded);
+                    });
+                });
+            }
+            button(page, "查看本场纪要、章节与回放", false, () -> openWorkMeeting(latestId));
+            return;
+        }
+        conversationCaptionBox = column(); conversationCaptionBox.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        page.addView(conversationCaptionBox);
+        renderWorkCaption();
+        if (!live && !workCaptionMeetingId.isEmpty())
+            button(page, "查看本场纪要、章节与回放", false, () -> openWorkMeeting(workCaptionMeetingId));
+    }
+    private JSONObject latestMeetingDetail;
+    private void renderLatestMeeting(LinearLayout box, JSONObject meeting) {
+        box.removeAllViews();
+        java.util.List<SpeakerParagraphs.Sentence> sentences = new java.util.ArrayList<>();
+        for (MeetingTimeline.Entry entry : new MeetingTimeline(meeting).sentences())
+            sentences.add(new SpeakerParagraphs.Sentence(entry.id, entry.speaker, entry.startMs, entry.text));
+        java.util.List<SpeakerParagraphs.Paragraph> paragraphs = SpeakerParagraphs.build(sentences);
+        if (paragraphs.isEmpty()) { label(box, "这场会议没有保存到文字。", 13, MUTED); return; }
+        for (SpeakerParagraphs.Paragraph paragraph : paragraphs) {
+            StringBuilder text = new StringBuilder();
+            for (SpeakerParagraphs.Sentence sentence : paragraph.sentences) text.append(sentence.text);
+            transcriptParagraph(box, paragraph.header(), text).setTextIsSelectable(true);
+        }
+    }
+    /** A quiet block with a thin rule on the left, like the reference header. */
+    private LinearLayout metaBlock(LinearLayout parent) {
+        LinearLayout ruled = row(); LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, -2); p.setMargins(0, dp(8), 0, dp(8));
+        parent.addView(ruled, p);
+        View rule = new View(this); rule.setBackgroundColor(LINE); ruled.addView(rule, new LinearLayout.LayoutParams(dp(3), -1));
+        LinearLayout lines = column(); lines.setPadding(dp(12), 0, 0, 0); ruled.addView(lines, new LinearLayout.LayoutParams(0, -2, 1));
+        return lines;
+    }
     private TextView chatBubble(LinearLayout parent, boolean assistant, String text, String time) {
         LinearLayout bubble = card(parent); bubble.setBackground(shape(assistant ? CARD : 0xffeef5ff, 22, assistant ? CARD : 0xffeef5ff));
         LinearLayout.LayoutParams bubbleParams = (LinearLayout.LayoutParams) bubble.getLayoutParams();
@@ -786,78 +875,161 @@ public final class MainActivity extends Activity {
             });
         });
     }
+    /** Full-screen meeting page: header, section navigation, one scrolling body and a persistent player bar. */
     private void openWorkMeeting(String meetingId) {
         if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; }
-        openWorkMeetingId = meetingId; workMeetingDetailSnapshot = ""; workMeetingShowOriginal = true;
-        workMeetingDetail = dialogBody(); label(workMeetingDetail, "正在加载会议原文…", 14, MUTED);
-        scrollDialog("会议记录", workMeetingDetail);
-        sourceDialog.setOnDismissListener(d -> {
-            openWorkMeetingId = ""; workMeetingDetail = null; workMeetingDetailStatus = null;
-            workMeetingPlayer = null; workMeetingPlayerStatus = null; workMeetingTimeline = null; workMeetingLines.clear(); workMeetingPlayingId = "";
-            meetingPlayback.stop();
+        if (meetingPage != null) meetingPage.dismiss();
+        openWorkMeetingId = meetingId; workMeetingDetailSnapshot = "";
+        LinearLayout shell = column(); shell.setBackgroundColor(BG);
+        shell.setOnApplyWindowInsetsListener((v, insets) -> {
+            v.setPadding(insets.getSystemWindowInsetLeft(), insets.getSystemWindowInsetTop(),
+                insets.getSystemWindowInsetRight(), insets.getSystemWindowInsetBottom());
+            return insets.consumeSystemWindowInsets();
         });
+        LinearLayout header = row(); header.setGravity(Gravity.CENTER_VERTICAL); header.setPadding(dp(4), dp(6), dp(16), dp(2)); shell.addView(header);
+        TextView back = label(header, "‹", 30, INK); back.setGravity(Gravity.CENTER);
+        back.setLayoutParams(new LinearLayout.LayoutParams(dp(48), dp(48))); back.setContentDescription("返回会议列表");
+        back.setBackground(ripple(BG, 24, BG)); back.setFocusable(true); back.setOnClickListener(v -> { if (meetingPage != null) meetingPage.dismiss(); });
+        LinearLayout titles = column(); header.addView(titles, new LinearLayout.LayoutParams(0, -2, 1));
+        meetingTitle = label(titles, "会议记录", 20, INK); meetingTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        meetingTitle.setMaxLines(2); meetingTitle.setEllipsize(TextUtils.TruncateAt.END);
+        meetingMeta = label(titles, "", 12, MUTED);
+        TextView save = label(header, "保存", 14, ACCENT); save.setGravity(Gravity.CENTER); save.setMinHeight(dp(48));
+        save.setPadding(dp(12), 0, dp(4), 0); save.setBackground(ripple(BG, 12, BG)); save.setFocusable(true);
+        save.setContentDescription("把本场会议纪要和原文保存为文件"); save.setOnClickListener(v -> saveMeetingFile());
+        android.widget.HorizontalScrollView navScroll = new android.widget.HorizontalScrollView(this);
+        navScroll.setHorizontalScrollBarEnabled(false);
+        meetingNav = row(); meetingNav.setPadding(dp(16), dp(4), dp(16), dp(8)); navScroll.addView(meetingNav); shell.addView(navScroll);
+        meetingScroll = new ScrollView(this);
+        workMeetingDetail = column(); workMeetingDetail.setPadding(dp(20), dp(4), dp(20), dp(24));
+        meetingScroll.addView(workMeetingDetail); shell.addView(meetingScroll, new LinearLayout.LayoutParams(-1, 0, 1));
+        label(workMeetingDetail, "正在加载会议…", 14, MUTED);
+        workMeetingPlayer = column(); workMeetingPlayer.setPadding(dp(16), dp(8), dp(16), dp(10));
+        workMeetingPlayer.setBackground(shape(CARD, 0, LINE)); shell.addView(workMeetingPlayer);
+        meetingPage = new android.app.Dialog(this, android.R.style.Theme_DeviceDefault_Light_NoActionBar);
+        meetingPage.setContentView(shell);
+        android.app.Dialog page = meetingPage;
+        meetingPage.setOnDismissListener(d -> {
+            if (meetingPage != page) return;
+            meetingPage = null; meetingScroll = null; meetingNav = null; meetingTitle = null; meetingMeta = null; meetingSeek = null;
+            openWorkMeetingId = ""; workMeetingDetail = null; workMeetingAudioText = "";
+            workMeetingPlayer = null; workMeetingPlayerStatus = null; workMeetingTimeline = null; workMeetingLines.clear(); workMeetingPlayingId = "";
+            meetingSections.clear(); meetingPlayback.stop(); workMeetingOpen = null;
+        });
+        meetingPage.show();
         handler.removeCallbacks(workMeetingPoll); handler.post(workMeetingPoll);
     }
     private void renderWorkMeetingDetail(JSONObject meeting) {
         if (workMeetingDetail == null || !meeting.optString("id").equals(openWorkMeetingId)) return;
-        if (workMeetingDetailStatus != null) workMeetingDetailStatus.setText(workMeetingProgress(meeting));
         JSONObject report = meeting.optJSONObject("report");
         JSONArray sources = array(meeting, "sources");
         MeetingTimeline timeline = new MeetingTimeline(meeting);
+        boolean playable = MeetingTimeline.audioPlayable(meeting);
+        if (meetingTitle != null) meetingTitle.setText(report == null ? "本次会议" : fallback(report.optString("title"), "本次会议"));
+        workMeetingOpen = meeting;
+        if (meetingMeta != null) {
+            String started = meeting.optString("audio_started_at", meeting.optString("started_at"));
+            String ended = TimeFormat.clockOf(meeting.optString("ended_at"));
+            java.util.List<String> speakers = timeline.speakers();
+            meetingMeta.setText(TimeFormat.dayOf(started) + " · " + TimeFormat.clockOf(started) + (ended.isEmpty() ? "" : "–" + ended)
+                + " · 时长 " + TimeFormat.clock(timeline.audioEndMs()) + "\n"
+                + (speakers.isEmpty() ? "未区分说话人" : speakers.size() + " 位说话人") + " · " + timeline.sentences().size() + " 句 · "
+                + workMeetingProgress(meeting));
+        }
         String snapshot = json("sources", sources, "report", report, "summary_status", meeting.optString("summary_status"),
-            "error", meeting.optString("error"), "original", workMeetingShowOriginal, "utterances", array(meeting, "utterances"),
+            "status", meeting.optString("status"), "error", meeting.optString("error"), "utterances", array(meeting, "utterances"),
             "events", array(meeting, "events"), "audio", meeting.optJSONObject("audio")).toString();
         if (snapshot.equals(workMeetingDetailSnapshot)) return;
-        workMeetingDetailSnapshot = snapshot; workMeetingDetail.removeAllViews();
-        workMeetingTimeline = timeline; workMeetingLines.clear(); workMeetingPlayingId = ""; workMeetingPlayer = null; workMeetingPlayerStatus = null;
-        boolean playable = MeetingTimeline.audioPlayable(meeting);
+        workMeetingDetailSnapshot = snapshot; workMeetingDetail.removeAllViews(); meetingSections.clear();
+        workMeetingTimeline = timeline; workMeetingLines.clear(); workMeetingRanges.clear(); workMeetingPlayingId = "";
+        playingMark[0] = null; jumpMark[0] = null;
         if (!playable && meeting.optString("id").equals(meetingPlayback.meetingId())) meetingPlayback.stop();
-        label(workMeetingDetail, report == null ? "本次会议" : report.optString("title", "本次会议"), 19, INK);
-        label(workMeetingDetail, date(meeting.optString("started_at")), 11, MUTED);
-        workMeetingDetailStatus = label(workMeetingDetail, workMeetingProgress(meeting), 13, WORK);
+        workMeetingAudioText = meetingAudioText(meeting); workMeetingAudioPlayable = playable;
         if (!meeting.optString("error").isEmpty()) label(workMeetingDetail, meeting.optString("error"), 13, MUTED);
-        LinearLayout tabs = row(); workMeetingDetail.addView(tabs);
-        segment(tabs, "原始文稿", workMeetingShowOriginal, () -> { workMeetingShowOriginal = true; renderWorkMeetingDetail(meeting); });
-        segment(tabs, "AI 纪要", !workMeetingShowOriginal, () -> { workMeetingShowOriginal = false; renderWorkMeetingDetail(meeting); });
-        workMeetingAudio(meeting);
-        if (workMeetingShowOriginal) {
-            label(workMeetingDetail, "按录音时间显示语音识别原文，未经 AI 改写；时间为录音内时长（不含暂停）；未区分说话人身份。", 12, MUTED);
-            if (timeline.sentences().isEmpty()) label(workMeetingDetail, "暂无已保存原文；录音转写后会陆续显示。", 14, MUTED);
-            StringBuilder raw = new StringBuilder();
-            TextView jumpTarget = null;
-            for (MeetingTimeline.Entry entry : timeline.entries) {
-                switch (entry.kind) {
-                    case PAUSE: label(workMeetingDetail, "‖ 暂停 " + TimeFormat.clock(entry.startMs) + " · " + date(entry.wallTime), 12, MUTED); break;
-                    case RESUME: label(workMeetingDetail, "▶ 继续 · " + date(entry.wallTime), 12, MUTED); break;
-                    case MARK: label(workMeetingDetail, "★ 重点标记 " + TimeFormat.clock(entry.startMs), 12, WORK); break;
-                    default:
-                        LinearLayout sentence = row(); workMeetingDetail.addView(sentence);
-                        TextView line = label(sentence, "[" + TimeFormat.clock(entry.startMs) + "] " + entry.text, 15, INK);
-                        line.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
-                        line.setTextIsSelectable(true); workMeetingLines.put(entry.id, line);
-                        if (playable) playFromHere(sentence, meeting, entry.startMs, timeline, null);
-                        if (entry.id.equals(workMeetingJumpId)) { line.setBackground(shape(0xffeef3fc, 8, 0xffeef3fc)); jumpTarget = line; }
-                        if (raw.length() > 0) raw.append("\n");
-                        raw.append("[").append(TimeFormat.clock(entry.startMs)).append("] ").append(entry.text);
-                }
-            }
-            if (raw.length() > 0) button(workMeetingDetail, "复制本次会议原文", false, () -> copy("会议原文", raw.toString()));
-            updateMeetingHighlight();
-            if (jumpTarget != null) {
-                TextView target = jumpTarget; workMeetingJumpId = "";
-                target.post(() -> { if (target.getParent() == workMeetingDetail && workMeetingDetail.getParent() instanceof ScrollView)
-                    ((ScrollView) workMeetingDetail.getParent()).smoothScrollTo(0, Math.max(0, target.getTop() - dp(12))); });
-            }
-        } else if (report != null) {
-            label(workMeetingDetail, report.optString("notice", "AI 整理稿，请结合原文核对。"), 12, MUTED);
-            label(workMeetingDetail, "会议摘要", 16, INK);
+
+        // Reference header: topic, date and time range with zone, speakers and length, in a ruled block.
+        java.time.ZoneId zone = java.time.ZoneId.systemDefault();
+        String recordedFrom = meeting.optString("audio_started_at", meeting.optString("started_at"));
+        java.util.List<String> speakerNames = new java.util.ArrayList<>();
+        for (String label : timeline.speakers()) speakerNames.add(SpeakerParagraphs.name(label));
+        LinearLayout meta = metaBlock(workMeetingDetail);
+        label(meta, "录音主题：" + (report == null ? "本次会议" : fallback(report.optString("title"), "本次会议")), 14, MUTED);
+        label(meta, "录音时间：" + TimeFormat.chineseDay(recordedFrom, zone) + " " + TimeFormat.hourMinute(recordedFrom, zone) + " - "
+            + ("recording".equals(meeting.optString("status")) ? "进行中" : fallback(TimeFormat.hourMinute(meeting.optString("ended_at"), zone), "…"))
+            + "（" + TimeFormat.gmt(zone) + "）", 14, MUTED);
+        label(meta, "录音时长：" + TimeFormat.hms(timeline.audioEndMs()) + " · " + timeline.sentences().size() + " 句", 14, MUTED);
+        label(meta, "说话人：" + (speakerNames.isEmpty() ? "未区分" : String.join("、", speakerNames)), 14, MUTED);
+        meetingSection("总结", "总结");
+        if (report == null) label(workMeetingDetail, workMeetingProgress(meeting) + "。原文可先在下方查看，AI 整理完成后自动更新。", 14, MUTED);
+        else {
             label(workMeetingDetail, report.optString("summary"), 15, INK).setTextIsSelectable(true);
-            meetingItems(workMeetingDetail, "讨论要点", array(report, "topics"), meeting, timeline, false);
-            meetingItems(workMeetingDetail, "已确认决策", array(report, "decisions"), meeting, timeline, false);
-            meetingItems(workMeetingDetail, "行动待办", array(report, "tasks"), meeting, timeline, true);
-            meetingItems(workMeetingDetail, "待确认事项", array(report, "open_questions"), meeting, timeline, false);
-            meetingMarks(meeting, timeline);
-        } else label(workMeetingDetail, "原文可以先看，AI 整理完成后这里会自动更新。", 14, MUTED);
+            JSONArray topics = array(report, "topics");
+            for (int i = 0; i < topics.length(); i++) {
+                JSONObject topic = topics.optJSONObject(i); if (topic == null) continue;
+                label(workMeetingDetail, "• " + topic.optString("text"), 14, INK).setTextIsSelectable(true);
+                meetingEvidence(meeting, timeline, array(topic, "source_ids"));
+            }
+            label(workMeetingDetail, report.optString("notice", "AI 整理稿，请结合原文核对。")
+                + " 摘要已自动保存在本场记录中；点右上角“保存”可连同原文存为文件。", 11, MUTED);
+        }
+        if (report != null) {
+            meetingSection("章节", "智能章节");
+            JSONArray chapters = array(report, "chapters");
+            if (!report.has("chapters")) label(workMeetingDetail, "这份纪要生成时还没有章节功能，点页面底部“重新生成 AI 纪要”即可补上。", 13, MUTED);
+            else if (chapters.length() == 0) label(workMeetingDetail, "内容较短，未划分章节。", 13, MUTED);
+            for (int i = 0; i < chapters.length(); i++) {
+                JSONObject chapter = chapters.optJSONObject(i); if (chapter == null) continue;
+                MeetingTimeline.Entry first = firstCited(timeline, array(chapter, "source_ids"));
+                long at = chapter.isNull("start_ms") || !chapter.has("start_ms") ? (first == null ? 0 : first.startMs) : chapter.optLong("start_ms");
+                LinearLayout card = card(workMeetingDetail); card.setPadding(dp(14), dp(10), dp(14), dp(10));
+                LinearLayout top = row(); top.setGravity(Gravity.CENTER_VERTICAL); card.addView(top);
+                badge(top, TimeFormat.clock(at), WORK, 0xffeef3fc);
+                TextView heading = label(top, chapter.optString("title"), 15, INK); heading.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+                if (!chapter.optString("summary").isEmpty()) label(card, chapter.optString("summary"), 13, MUTED);
+                String target = first == null ? null : first.id;
+                card.setFocusable(true); card.setContentDescription("章节 " + TimeFormat.clock(at) + "，" + chapter.optString("title"));
+                card.setOnClickListener(v -> seekOrJump(meeting, timeline, at, target));
+            }
+            meetingSection("决策", "关键决策");
+            meetingItems(workMeetingDetail, array(report, "decisions"), meeting, timeline, false);
+            meetingSection("待办", "行动待办");
+            meetingItems(workMeetingDetail, array(report, "tasks"), meeting, timeline, true);
+        }
+        meetingSection("重点", "重点");
+        meetingMarks(meeting, timeline, report == null ? new JSONArray() : array(report, "highlights"));
+        if (report != null && array(report, "open_questions").length() > 0) {
+            meetingSection("待确认", "待确认事项");
+            meetingItems(workMeetingDetail, array(report, "open_questions"), meeting, timeline, false);
+        }
+
+        meetingSection("原文", "文字记录");
+        label(workMeetingDetail, "语音识别原文，未经 AI 改写；说话人按声音自动区分，不代表真实身份。"
+            + (playable ? "点任意一句从那里播放。" : ""), 11, MUTED);
+        if (timeline.sentences().isEmpty()) label(workMeetingDetail, "暂无已保存原文；录音转写后会陆续显示。", 14, MUTED);
+        StringBuilder raw = new StringBuilder();
+        java.util.List<SpeakerParagraphs.Sentence> run = new java.util.ArrayList<>();
+        for (MeetingTimeline.Entry entry : timeline.entries) {
+            if (entry.kind == MeetingTimeline.Entry.Kind.SENTENCE) {
+                run.add(new SpeakerParagraphs.Sentence(entry.id, entry.speaker, entry.startMs, entry.text));
+                String wall = TimeFormat.clockOf(entry.wallTime);
+                if (raw.length() > 0) raw.append("\n");
+                raw.append("[").append(wall.isEmpty() ? TimeFormat.hms(entry.startMs) : wall).append("] ")
+                    .append(entry.speaker.isEmpty() ? "" : SpeakerParagraphs.name(entry.speaker) + "：").append(entry.text);
+                continue;
+            }
+            meetingParagraphs(run, meeting, timeline, playable); run.clear();
+            switch (entry.kind) {
+                case PAUSE: label(workMeetingDetail, "‖ 暂停 " + TimeFormat.hms(entry.startMs) + " · " + date(entry.wallTime), 12, MUTED); break;
+                case RESUME: label(workMeetingDetail, "▶ 继续 · " + date(entry.wallTime), 12, MUTED); break;
+                default: label(workMeetingDetail, "★ 重点标记 " + TimeFormat.hms(entry.startMs), 12, WORK); break;
+            }
+        }
+        meetingParagraphs(run, meeting, timeline, playable);
+        gap(workMeetingDetail, 12);
+        if (raw.length() > 0) {
+            button(workMeetingDetail, "保存为文件（纪要 + 原文）", true, this::saveMeetingFile);
+            button(workMeetingDetail, "复制本次会议原文", false, () -> copy("会议原文", raw.toString()));
+        }
         String summaryStatus = meeting.optString("summary_status");
         if ("recording".equals(meeting.optString("status")) && (session == null || !openWorkMeetingId.equals(session.workMeetingId()))) {
             label(workMeetingDetail, "若录音已经中断，可结束本场并整理已上传的片段；未上传的音频无法恢复。", 12, MUTED);
@@ -878,67 +1050,149 @@ public final class MainActivity extends Activity {
                     handler.removeCallbacks(workMeetingPoll); handler.post(workMeetingPoll);
                 });
             });
-    }
-    private void meetingItems(LinearLayout parent, String title, JSONArray items, JSONObject meeting, MeetingTimeline timeline, boolean tasks) {
-        label(parent, title, 16, INK);
-        if (items.length() == 0) label(parent, "暂无明确记录", 13, MUTED);
-        for (int i = 0; i < items.length(); i++) {
-            JSONObject item = items.optJSONObject(i); if (item == null) continue;
-            label(parent, "• " + item.optString(tasks ? "content" : "text"), 14, INK).setTextIsSelectable(true);
-            if (tasks) label(parent, "负责人：" + fallback(item.optString("owner"), "未明确") + " · 截止：" + fallback(item.optString("due"), "未提及"), 12, MUTED);
-            JSONArray ids = array(item, "source_ids");
-            LinearLayout evidence = disclosure(parent, "查看原文依据", ids.length() + " 处 · 点击跳到原文", false);
-            for (int k = 0; k < ids.length(); k++) {
-                MeetingTimeline.Entry cited = timeline.sentence(ids.optString(k));
-                if (cited == null) continue;
-                LinearLayout citation = row(); evidence.addView(citation);
-                TextView line = label(citation, "[" + TimeFormat.clock(cited.startMs) + "] " + cited.text + "  →", 13, ACCENT);
-                line.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
-                line.setMinHeight(dp(44)); line.setFocusable(true); line.setContentDescription("跳到原文 " + TimeFormat.clock(cited.startMs) + "，" + cited.text);
-                line.setOnClickListener(v -> jumpToSentence(meeting, cited.id));
-                if (MeetingTimeline.audioPlayable(meeting)) playFromHere(citation, meeting, cited.startMs, timeline, cited.id);
-            }
-        }
-    }
-    private void meetingMarks(JSONObject meeting, MeetingTimeline timeline) {
-        label(workMeetingDetail, "我的标记", 16, INK);
-        if (timeline.marks().isEmpty()) { label(workMeetingDetail, "录音时点“标记重点”，这里会列出标记时刻的原文", 13, MUTED); return; }
-        for (MeetingTimeline.Entry mark : timeline.marks()) {
-            MeetingTimeline.Entry at = timeline.sentenceAt(mark.startMs);
-            LinearLayout markRow = row(); workMeetingDetail.addView(markRow);
-            TextView line = label(markRow, "★ " + TimeFormat.clock(mark.startMs) + (at == null ? " · 该时刻没有识别到讲话" : " · " + at.text + "  →"), 14, at == null ? MUTED : ACCENT);
-            line.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
-            if (at != null) { line.setMinHeight(dp(44)); line.setFocusable(true); line.setOnClickListener(v -> jumpToSentence(meeting, at.id)); }
-            // Start at the sentence being spoken when marked, so the moment is heard in context.
-            if (MeetingTimeline.audioPlayable(meeting))
-                playFromHere(markRow, meeting, at == null ? mark.startMs : Math.min(mark.startMs, at.startMs), timeline, at == null ? null : at.id);
-        }
-    }
-    /** Citations open the original-text tab scrolled to, and highlighting, the cited sentence. */
-    private void jumpToSentence(JSONObject meeting, String sentenceId) {
-        workMeetingJumpId = sentenceId; workMeetingShowOriginal = true; workMeetingDetailSnapshot = "";
-        renderWorkMeetingDetail(meeting);
-    }
-    private void workMeetingAudio(JSONObject meeting) {
-        JSONObject audio = meeting.optJSONObject("audio"); if (audio == null) return;
-        String status = audio.optString("status");
-        String text = "saved".equals(status) || "partial".equals(status)
-            ? ("partial".equals(status) ? "录音部分已保存" : "录音已保存") + " · " + String.format(java.util.Locale.ROOT, "%.1f MB", audio.optLong("bytes") / 1048576.0)
-                + (audio.isNull("expires_at") ? " · 结束后开始计算保存期限" : " · 保存至 " + date(audio.optString("expires_at")))
-            : "expired".equals(status) ? "录音已过保存期限并删除；文字原文保留" : "deleted".equals(status) ? "录音已删除；文字原文保留"
-            : "未保存录音（保存期限设为不保存，或录音保存失败）";
-        label(workMeetingDetail, text, 12, MUTED);
-        if (MeetingTimeline.audioPlayable(meeting)) {
-            workMeetingPlayer = column(); workMeetingDetail.addView(workMeetingPlayer);
-            renderMeetingPlayer(meeting.optString("id"));
-        }
-        if (("saved".equals(status) || "partial".equals(status)) && !"recording".equals(meeting.optString("status")))
+        JSONObject audio = meeting.optJSONObject("audio");
+        String audioStatus = audio == null ? "" : audio.optString("status");
+        if (("saved".equals(audioStatus) || "partial".equals(audioStatus)) && !"recording".equals(meeting.optString("status")))
             small(workMeetingDetail, "删除本场录音（保留文字）", () -> confirm("删除本场录音", "录音删除后无法恢复，文字原文与纪要会保留。", () -> {
                 if (meeting.optString("id").equals(meetingPlayback.meetingId())) meetingPlayback.stop();
                 request(() -> api.json("DELETE", "/v1/work-meetings/" + Uri.encode(meeting.optString("id")) + "/audio", null), r -> {
                     workMeetingDetailSnapshot = ""; renderWorkMeetingDetail(r);
                 });
             }));
+        renderMeetingPlayer(meeting.optString("id"));
+        updateMeetingHighlight();
+        if (!workMeetingJumpId.isEmpty()) { String jump = workMeetingJumpId; workMeetingJumpId = ""; scrollToSentence(jump); }
+    }
+    /** Speaker paragraphs whose sentences stay individually tappable (play from there) and highlightable. */
+    private void meetingParagraphs(java.util.List<SpeakerParagraphs.Sentence> sentences, JSONObject meeting, MeetingTimeline timeline, boolean playable) {
+        for (SpeakerParagraphs.Paragraph paragraph : SpeakerParagraphs.build(sentences)) {
+            android.text.SpannableStringBuilder text = new android.text.SpannableStringBuilder();
+            TextView body = transcriptParagraph(workMeetingDetail, paragraph.header(), "");
+            for (SpeakerParagraphs.Sentence sentence : paragraph.sentences) {
+                int start = text.length(); text.append(sentence.text);
+                workMeetingLines.put(sentence.id, body); workMeetingRanges.put(sentence.id, new int[]{start, text.length()});
+                if (!playable) continue;
+                long at = sentence.startMs; String id = sentence.id;
+                text.setSpan(new android.text.style.ClickableSpan() {
+                    @Override public void onClick(View widget) { seekOrJump(meeting, timeline, at, id); }
+                    @Override public void updateDrawState(android.text.TextPaint paint) { paint.setColor(INK); paint.setUnderlineText(false); }
+                }, start, text.length(), 0);
+            }
+            body.setText(text, TextView.BufferType.SPANNABLE);
+            if (playable) { body.setMovementMethod(android.text.method.LinkMovementMethod.getInstance()); body.setHighlightColor(Color.TRANSPARENT); }
+            else body.setTextIsSelectable(true);
+        }
+    }
+    /** Background on one sentence inside its paragraph; null colour clears it. */
+    private void markSentence(String id, Integer colour, Object[] holder) {
+        TextView view = workMeetingLines.get(id); int[] range = workMeetingRanges.get(id);
+        if (view == null || range == null || !(view.getText() instanceof android.text.Spannable)) return;
+        android.text.Spannable text = (android.text.Spannable) view.getText();
+        if (holder[0] != null) text.removeSpan(holder[0]);
+        holder[0] = null;
+        if (colour == null || range[1] > text.length()) return;
+        holder[0] = new android.text.style.BackgroundColorSpan(colour);
+        text.setSpan(holder[0], range[0], range[1], android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+    }
+    /** Pixel offset of a sentence within the scrolling body. */
+    private int sentenceTop(String id) {
+        TextView view = workMeetingLines.get(id); int[] range = workMeetingRanges.get(id);
+        if (view == null) return -1;
+        android.text.Layout layout = view.getLayout();
+        int line = layout == null || range == null ? 0 : layout.getLineForOffset(Math.min(range[0], Math.max(0, view.getText().length() - 1)));
+        return view.getTop() + (layout == null ? 0 : layout.getLineTop(line));
+    }
+    /** A section heading that the navigation row scrolls to. */
+    private void meetingSection(String nav, String title) {
+        TextView heading = label(workMeetingDetail, title, 18, INK);
+        heading.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL)); heading.setPadding(0, dp(18), 0, dp(4));
+        if (Build.VERSION.SDK_INT >= 28) heading.setAccessibilityHeading(true);
+        meetingSections.put(nav, heading);
+        if (meetingNav == null) return;
+        if (meetingSections.size() == 1) meetingNav.removeAllViews();
+        TextView chip = label(meetingNav, nav, 13, INK); chip.setGravity(Gravity.CENTER);
+        chip.setPadding(dp(14), dp(8), dp(14), dp(8)); chip.setMinHeight(dp(40)); chip.setBackground(ripple(CARD, 18, CARD));
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-2, -2); p.rightMargin = dp(8); chip.setLayoutParams(p);
+        chip.setFocusable(true); chip.setContentDescription("跳到" + title);
+        chip.setOnClickListener(v -> { if (meetingScroll != null) meetingScroll.smoothScrollTo(0, Math.max(0, heading.getTop() - dp(4))); });
+    }
+    private static MeetingTimeline.Entry firstCited(MeetingTimeline timeline, JSONArray ids) {
+        MeetingTimeline.Entry first = null;
+        for (int k = 0; k < ids.length(); k++) {
+            MeetingTimeline.Entry cited = timeline.sentence(ids.optString(k));
+            if (cited != null && (first == null || cited.startMs < first.startMs)) first = cited;
+        }
+        return first;
+    }
+    private void meetingItems(LinearLayout parent, JSONArray items, JSONObject meeting, MeetingTimeline timeline, boolean tasks) {
+        if (items.length() == 0) label(parent, "暂无明确记录", 13, MUTED);
+        for (int i = 0; i < items.length(); i++) {
+            JSONObject item = items.optJSONObject(i); if (item == null) continue;
+            label(parent, (tasks ? "☐ " : "• ") + item.optString(tasks ? "content" : "text"), 15, INK).setTextIsSelectable(true);
+            if (tasks) label(parent, "负责人：" + fallback(item.optString("owner"), "未明确") + " · 截止：" + fallback(item.optString("due"), "未提及"), 12, MUTED);
+            meetingEvidence(meeting, timeline, array(item, "source_ids"));
+        }
+    }
+    /** Compact "依据" links: the cited sentence's time and opening words; tap to jump (and play when saved). */
+    private void meetingEvidence(JSONObject meeting, MeetingTimeline timeline, JSONArray ids) {
+        for (int k = 0; k < ids.length() && k < 3; k++) {
+            MeetingTimeline.Entry cited = timeline.sentence(ids.optString(k));
+            if (cited == null) continue;
+            String excerpt = cited.text.length() > 28 ? cited.text.substring(0, 28) + "…" : cited.text;
+            TextView link = label(workMeetingDetail, "↳ 依据 " + TimeFormat.clock(cited.startMs) + " · " + excerpt, 12, ACCENT);
+            link.setMinHeight(dp(40)); link.setPadding(dp(12), dp(2), 0, dp(2)); link.setFocusable(true);
+            link.setContentDescription("跳到原文 " + TimeFormat.clock(cited.startMs) + "，" + cited.text);
+            link.setOnClickListener(v -> seekOrJump(meeting, timeline, cited.startMs, cited.id));
+        }
+    }
+    private void meetingMarks(JSONObject meeting, MeetingTimeline timeline, JSONArray highlights) {
+        if (timeline.marks().isEmpty() && highlights.length() == 0) {
+            label(workMeetingDetail, "录音时点“标记重点”或在耳机上双击，这里会列出标记时刻；AI 也会摘出关键原话。", 13, MUTED); return;
+        }
+        for (MeetingTimeline.Entry mark : timeline.marks()) {
+            MeetingTimeline.Entry at = timeline.sentenceAt(mark.startMs);
+            TextView line = label(workMeetingDetail, "★ 我的标记 " + TimeFormat.clock(mark.startMs) + (at == null ? " · 该时刻没有识别到讲话" : " · " + at.text), 14, at == null ? MUTED : INK);
+            if (at == null) continue;
+            line.setMinHeight(dp(44)); line.setFocusable(true); line.setBackground(ripple(BG, 8, BG));
+            // Start at the sentence being spoken when marked, so the moment is heard in context.
+            long start = Math.min(mark.startMs, at.startMs);
+            line.setOnClickListener(v -> seekOrJump(meeting, timeline, start, at.id));
+        }
+        for (int i = 0; i < highlights.length(); i++) {
+            JSONObject quote = highlights.optJSONObject(i); if (quote == null) continue;
+            MeetingTimeline.Entry cited = firstCited(timeline, array(quote, "source_ids"));
+            TextView line = label(workMeetingDetail, "“" + quote.optString("text") + "”" + (cited == null ? "" : "  " + TimeFormat.clock(cited.startMs)), 14, INK);
+            line.setPadding(dp(10), dp(6), 0, dp(6));
+            if (cited == null) continue;
+            line.setMinHeight(dp(44)); line.setFocusable(true); line.setBackground(ripple(BG, 8, BG));
+            line.setOnClickListener(v -> seekOrJump(meeting, timeline, cited.startMs, cited.id));
+        }
+    }
+    /** Every timed link: scroll to its sentence, and play from that moment when the recording is saved. */
+    private void seekOrJump(JSONObject meeting, MeetingTimeline timeline, long startMs, String sentenceId) {
+        if (sentenceId != null) scrollToSentence(sentenceId);
+        if (MeetingTimeline.audioPlayable(meeting)) playMeetingAudio(meeting.optString("id"), startMs, timeline);
+    }
+    private void jumpToSentence(JSONObject meeting, String sentenceId) { scrollToSentence(sentenceId); }
+    private void scrollToSentence(String sentenceId) {
+        TextView target = workMeetingLines.get(sentenceId);
+        if (target == null || meetingScroll == null) return;
+        target.post(() -> {
+            if (meetingScroll == null) return;
+            meetingScroll.smoothScrollTo(0, Math.max(0, sentenceTop(sentenceId) - dp(48)));
+            if (sentenceId.equals(workMeetingPlayingId)) return;
+            markSentence(sentenceId, 0xffeef3fc, jumpMark);
+            target.postDelayed(() -> markSentence(sentenceId, null, jumpMark), 1600);
+        });
+    }
+    private String meetingAudioText(JSONObject meeting) {
+        JSONObject audio = meeting.optJSONObject("audio"); if (audio == null) return "";
+        String status = audio.optString("status");
+        return "saved".equals(status) || "partial".equals(status)
+            ? ("partial".equals(status) ? "录音部分已保存" : "录音已保存") + " · " + String.format(java.util.Locale.ROOT, "%.1f MB", audio.optLong("bytes") / 1048576.0)
+                + (audio.isNull("expires_at") ? " · 结束后开始计算保存期限" : " · 保存至 " + date(audio.optString("expires_at")))
+            : "expired".equals(status) ? "录音已过保存期限并删除；文字原文保留" : "deleted".equals(status) ? "录音已删除；文字原文保留"
+            : "recording".equals(meeting.optString("status")) ? "录音进行中，结束后可回放" : "未保存录音（保存期限设为不保存，或录音保存失败）";
     }
     /** Meeting audio plays only on the verified headset and never alongside a capture or call. */
     private boolean canPlayMeetingAudio() {
@@ -957,44 +1211,62 @@ public final class MainActivity extends Activity {
         if (quickFeedback != null) quickFeedback.stop();
         meetingPlayback.play(api, meetingId, startMs, timeline.audioEndMs());
     }
-    /** "Play from here" beside a sentence; citations and marks also open the original text at it. */
-    private void playFromHere(LinearLayout parent, JSONObject meeting, long startMs, MeetingTimeline timeline, String jumpId) {
-        TextView v = label(parent, "从这里播放", 12, ACCENT);
-        v.setGravity(Gravity.CENTER); v.setMinHeight(dp(48)); v.setPadding(dp(8), dp(4), dp(2), dp(4));
-        v.setBackground(ripple(Color.TRANSPARENT, 12, Color.TRANSPARENT)); v.setFocusable(true);
-        v.setContentDescription("从 " + TimeFormat.clock(startMs) + " 播放会议录音");
-        v.setOnClickListener(w -> {
-            playMeetingAudio(meeting.optString("id"), startMs, timeline);
-            if (jumpId != null && meetingPlayback.active()) jumpToSentence(meeting, jumpId);
-        });
-    }
+    /** The persistent bottom bar: play/pause, position, seek and stop; audio status when nothing can play. */
     private void renderMeetingPlayer(String meetingId) {
         LinearLayout bar = workMeetingPlayer; if (bar == null) return;
-        bar.removeAllViews(); workMeetingPlayerStatus = null;
+        bar.removeAllViews(); workMeetingPlayerStatus = null; meetingSeek = null;
+        MeetingTimeline timeline = workMeetingTimeline;
+        if (timeline == null || !workMeetingAudioPlayable) { label(bar, workMeetingAudioText.isEmpty() ? "正在加载录音信息…" : workMeetingAudioText, 12, MUTED); return; }
         boolean ours = meetingId.equals(meetingPlayback.meetingId());
         MeetingPlayback.State playback = ours ? meetingPlayback.state() : MeetingPlayback.State.IDLE;
-        if (playback == MeetingPlayback.State.IDLE) {
-            String error = ours ? meetingPlayback.error() : "";
-            label(bar, error.isEmpty() ? "点句子旁的“从这里播放”收听录音；只在已连接的耳机中播放。" : "录音播放已停止：" + error, 12, error.isEmpty() ? MUTED : RED);
-            MeetingTimeline timeline = workMeetingTimeline;
-            if (timeline != null) small(bar, "▶ 从头播放录音", () -> playMeetingAudio(meetingId, 0, timeline));
-            return;
-        }
-        workMeetingPlayerStatus = label(bar, meetingPlayerText(), 13, WORK);
-        LinearLayout controls = row(); bar.addView(controls);
-        button(controls, playback == MeetingPlayback.State.PAUSED ? "继续播放" : "暂停", false, () -> {
-            if (meetingPlayback.state() == MeetingPlayback.State.PAUSED) { if (canAct() && canPlayMeetingAudio()) meetingPlayback.resume(api); }
-            else meetingPlayback.pause();
+        long end = timeline.audioEndMs();
+        LinearLayout controls = row(); controls.setGravity(Gravity.CENTER_VERTICAL); bar.addView(controls);
+        boolean running = playback == MeetingPlayback.State.PLAYING || playback == MeetingPlayback.State.LOADING;
+        TextView toggle = label(controls, running ? "❚❚" : "▶", 18, BG); toggle.setGravity(Gravity.CENTER);
+        toggle.setLayoutParams(new LinearLayout.LayoutParams(dp(48), dp(48))); toggle.setBackground(ripple(WORK, 24, WORK));
+        toggle.setFocusable(true); toggle.setContentDescription(running ? "暂停播放" : "播放会议录音");
+        toggle.setOnClickListener(v -> {
+            MeetingPlayback.State now = meetingId.equals(meetingPlayback.meetingId()) ? meetingPlayback.state() : MeetingPlayback.State.IDLE;
+            if (now == MeetingPlayback.State.PLAYING || now == MeetingPlayback.State.LOADING) meetingPlayback.pause();
+            else if (now == MeetingPlayback.State.PAUSED) { if (canAct() && canPlayMeetingAudio()) meetingPlayback.resume(api); }
+            else playMeetingAudio(meetingId, 0, timeline);
         });
-        button(controls, "停止", false, meetingPlayback::stop);
+        LinearLayout middle = column(); middle.setPadding(dp(10), 0, dp(6), 0); controls.addView(middle, new LinearLayout.LayoutParams(0, -2, 1));
+        String error = ours && playback == MeetingPlayback.State.IDLE ? meetingPlayback.error() : "";
+        workMeetingPlayerStatus = label(middle, playback == MeetingPlayback.State.IDLE
+            ? (error.isEmpty() ? "0:00 / " + TimeFormat.clock(end) + " · 点任意一句可从那里播放" : "播放已停止：" + error)
+            : meetingPlayerText() + " / " + TimeFormat.clock(end), 12, error.isEmpty() ? MUTED : RED);
+        android.widget.SeekBar seek = new android.widget.SeekBar(this);
+        seek.setMax((int) Math.min(Integer.MAX_VALUE, Math.max(1, end)));
+        seek.setProgress((int) Math.min(end, ours ? meetingPlayback.positionMs() : 0));
+        seek.setContentDescription("播放进度");
+        seek.setOnSeekBarChangeListener(new android.widget.SeekBar.OnSeekBarChangeListener() {
+            public void onProgressChanged(android.widget.SeekBar s, int progress, boolean user) {
+                if (user && workMeetingPlayerStatus != null) workMeetingPlayerStatus.setText("跳到 " + TimeFormat.clock(progress) + " / " + TimeFormat.clock(end));
+            }
+            public void onStartTrackingTouch(android.widget.SeekBar s) { meetingSeeking = true; }
+            public void onStopTrackingTouch(android.widget.SeekBar s) {
+                meetingSeeking = false;
+                MeetingTimeline.Entry at = timeline.sentenceAt(s.getProgress());
+                if (at != null) scrollToSentence(at.id);
+                playMeetingAudio(meetingId, s.getProgress(), timeline);
+            }
+        });
+        middle.addView(seek, new LinearLayout.LayoutParams(-1, dp(32)));
+        meetingSeek = seek;
+        if (playback != MeetingPlayback.State.IDLE) {
+            TextView stop = label(controls, "■", 16, INK); stop.setGravity(Gravity.CENTER);
+            stop.setLayoutParams(new LinearLayout.LayoutParams(dp(44), dp(48))); stop.setFocusable(true); stop.setContentDescription("停止播放");
+            stop.setBackground(ripple(CARD, 22, CARD)); stop.setOnClickListener(v -> meetingPlayback.stop());
+        }
     }
     private String meetingPlayerText() {
         String at = TimeFormat.clock(meetingPlayback.positionMs());
         String notice = meetingPlayback.notice().isEmpty() ? "" : " · " + meetingPlayback.notice();
         switch (meetingPlayback.state()) {
-            case LOADING: return "正在连接耳机并加载录音 · " + at + notice;
+            case LOADING: return "正在连接耳机 " + at + notice;
             case PLAYING: return "正在播放 " + at + notice;
-            case PAUSED: return "已暂停于 " + at;
+            case PAUSED: return "已暂停 " + at;
             default: return "";
         }
     }
@@ -1006,7 +1278,11 @@ public final class MainActivity extends Activity {
         if (meetingPlayback.active()) handler.postDelayed(workMeetingPlaybackTick, 250);
     }
     private void tickMeetingPlayback() {
-        if (workMeetingPlayerStatus != null) workMeetingPlayerStatus.setText(meetingPlayerText());
+        MeetingTimeline timeline = workMeetingTimeline;
+        if (workMeetingPlayerStatus != null && !meetingSeeking && timeline != null)
+            workMeetingPlayerStatus.setText(meetingPlayerText() + " / " + TimeFormat.clock(timeline.audioEndMs()));
+        if (meetingSeek != null && !meetingSeeking && meetingPlayback.meetingId().equals(openWorkMeetingId))
+            meetingSeek.setProgress((int) Math.min(meetingSeek.getMax(), meetingPlayback.positionMs()));
         updateMeetingHighlight();
         if (meetingPlayback.active()) handler.postDelayed(workMeetingPlaybackTick, 250);
     }
@@ -1018,11 +1294,62 @@ public final class MainActivity extends Activity {
             if (playing != null) id = playing.id;
         }
         if (id.equals(workMeetingPlayingId)) return;
-        TextView previous = workMeetingLines.get(workMeetingPlayingId);
-        if (previous != null) previous.setBackground(null);
+        String previous = workMeetingPlayingId;
+        markSentence(previous, null, playingMark);
         workMeetingPlayingId = id;
-        TextView current = workMeetingLines.get(id);
-        if (current != null) current.setBackground(shape(0xffdde8fb, 8, WORK));
+        if (id.isEmpty()) return;
+        markSentence(id, 0xffdde8fb, playingMark);
+        // Follow the voice only while the reader is following it (the previous sentence was on screen).
+        if (meetingScroll != null && !previous.isEmpty() && meetingPlayback.state() == MeetingPlayback.State.PLAYING) {
+            int view = meetingScroll.getScrollY(), height = meetingScroll.getHeight();
+            int before = sentenceTop(previous), now = sentenceTop(id);
+            boolean following = before >= view && before <= view + height;
+            if (following && now > view + height - dp(96)) meetingScroll.smoothScrollTo(0, Math.max(0, now - dp(96)));
+        }
+    }
+
+    /** Live captions in the reference layout, on the work page (recent part) and the 对话 page (all). */
+    private void renderWorkCaption() {
+        if (workCaptionBox != null) {
+            renderCaptions(workCaptionBox, 80);
+            if (workCaptionBox.getParent() instanceof ScrollView) {
+                ScrollView inner = (ScrollView) workCaptionBox.getParent();
+                inner.post(() -> inner.fullScroll(View.FOCUS_DOWN));
+            }
+        }
+        if (conversationCaptionBox != null) { renderCaptions(conversationCaptionBox, Integer.MAX_VALUE); followConversation(); }
+    }
+    private void renderCaptions(LinearLayout box, int maxSentences) {
+        box.removeAllViews();
+        java.util.List<SpeakerParagraphs.Sentence> recent = workCaptionSentences.subList(
+            Math.max(0, workCaptionSentences.size() - maxSentences), workCaptionSentences.size());
+        java.util.List<SpeakerParagraphs.Paragraph> paragraphs = SpeakerParagraphs.build(recent);
+        if (paragraphs.isEmpty() && workCaptionPartial.isEmpty()) {
+            label(box, session != null && sessionUsesCapture && "work".equals(mode())
+                ? "正在聆听，开始说话后这里会实时显示说话人和文字…" : "开始会议记录后，这里会实时显示“说话人 1 / 说话人 2”、时间和文字。", 14, MUTED);
+            return;
+        }
+        TextView last = null;
+        for (SpeakerParagraphs.Paragraph paragraph : paragraphs) {
+            StringBuilder text = new StringBuilder();
+            for (SpeakerParagraphs.Sentence sentence : paragraph.sentences) text.append(sentence.text);
+            last = transcriptParagraph(box, paragraph.header(), text);
+        }
+        if (!workCaptionPartial.isEmpty()) {
+            // Interim words stay grey at the end of the last paragraph until the server confirms them.
+            if (last == null) last = transcriptParagraph(box, "正在识别", new StringBuilder());
+            android.text.SpannableStringBuilder grey = new android.text.SpannableStringBuilder(last.getText());
+            int start = grey.length(); grey.append(workCaptionPartial);
+            grey.setSpan(new android.text.style.ForegroundColorSpan(MUTED), start, grey.length(), 0);
+            last.setText(grey);
+        }
+    }
+    /** Reference layout: small grey "说话人 1  00:00:41" header above a readable paragraph. */
+    private TextView transcriptParagraph(LinearLayout parent, String header, CharSequence text) {
+        TextView head = label(parent, header, 13, MUTED); head.setPadding(0, dp(14), 0, dp(2));
+        TextView body = label(parent, "", 17, INK); body.setText(text);
+        body.setLineSpacing(dp(6), 1.05f); body.setPadding(0, 0, 0, dp(6));
+        return body;
     }
     private void work() {
         pageHeading("工作");
@@ -1058,6 +1385,18 @@ public final class MainActivity extends Activity {
                 if (active.markWork("app")) { feedback("已标记 " + TimeFormat.clock(active.workOffsetMs()), null); showApp(); }
             });
         }
+        if (recordingMeeting) {
+            LinearLayout captions = card(page);
+            label(captions, "实时字幕", 15, INK).setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+            if (!workCaptionStartedAt.isEmpty())
+                label(captions, TimeFormat.dayOf(workCaptionStartedAt) + " · " + TimeFormat.clockOf(workCaptionStartedAt) + " 开始", 12, WORK);
+            label(captions, "灰色为正在识别的内容，变黑表示已确认并保存；“说话人 1/2”按声音自动区分，不代表真实身份。", 11, MUTED);
+            ScrollView captionScroll = new ScrollView(this);
+            workCaptionBox = column(); workCaptionBox.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+            captionScroll.addView(workCaptionBox);
+            captions.addView(captionScroll, new LinearLayout.LayoutParams(-1, dp(320)));
+            renderWorkCaption();
+        } else workCaptionBox = null;
         label(intro, "结束后自动保存原文，再由 AI 整理摘要、决策与待办", 11, MUTED).setGravity(Gravity.CENTER);
         int retention = settings().optInt("work_audio_retention_days", 30);
         sectionHeader(page, "会议记录", "每次录音独立保存 · 处理进度自动更新",
@@ -1383,17 +1722,32 @@ public final class MainActivity extends Activity {
         });
     }
 
+    private JSONObject workMeetingOpen;
+    /** Save the open meeting (details, minutes, timed transcript) as a Markdown file the user picks. */
+    private void saveMeetingFile() {
+        JSONObject meeting = workMeetingOpen;
+        if (meeting == null) { feedback("会议还在加载，请稍候再保存", null); return; }
+        java.time.ZoneId zone = java.time.ZoneId.systemDefault();
+        exportData = MeetingExport.markdown(meeting, zone).getBytes(StandardCharsets.UTF_8);
+        exportNotice = "会议纪要已保存为文件";
+        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT); intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("text/markdown"); intent.putExtra(Intent.EXTRA_TITLE, MeetingExport.fileName(meeting, zone));
+        startActivityForResult(intent, 21);
+    }
+    private String exportNotice = "数据已导出";
+
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
-        if (request != 20) return;
+        if (request != 20 && request != 21) return;
+        String notice = request == 21 ? exportNotice : "数据已导出";
         byte[] payload = exportData; exportData = null;
         if (result != RESULT_OK || data == null || payload == null) return;
         Uri uri = data.getData();
-        worker.execute(() -> { try (OutputStream output = getContentResolver().openOutputStream(uri)) { if (output == null) throw new Exception("文件无法写入"); output.write(payload); runOnUiThread(() -> feedback("数据已导出", LocalCue.EXPORTED)); } catch (Exception e) { runOnUiThread(() -> showError("导出失败，请选择其他保存位置")); } });
+        worker.execute(() -> { try (OutputStream output = getContentResolver().openOutputStream(uri)) { if (output == null) throw new Exception("文件无法写入"); output.write(payload); runOnUiThread(() -> feedback(notice, LocalCue.EXPORTED)); } catch (Exception e) { runOnUiThread(() -> showError("导出失败，请选择其他保存位置")); } });
     }
 
     private void privacyInfo() {
-        new AlertDialog.Builder(this).setTitle("数据处理说明").setMessage("Aidol 测试版由测试负责人运营。\n\n账号使用唯一用户名和密码登录，无需邮箱或手机号。忘记密码时需使用注册时保存的恢复码。\n\n在你点击或通过耳机接通 AI 后采集麦克风，每句最多 60 秒；AI 通话会在回复后继续听，挂断即可停止。录音上传服务器用于语音识别；文字发送 AI 服务生成回复与记忆；回复可转换为语音播放。原始录音不保存到账号数据库。\n\n对话、偏好、记忆和会议待办按账号存储在服务器。你可以关闭新的转写保存、导出、清空数据或注销账号。测试负责人可管理服务器及备份。\n\n录制他人讲话前，请先征得对方同意。AI 回复与纪要需要自行核对。\n\n账号密钥保存在设备加密存储中；服务商 API Key 不下发到手机。").setPositiveButton("了解", null).show();
+        new AlertDialog.Builder(this).setTitle("数据处理说明").setMessage("Aidol 测试版由测试负责人运营。\n\n账号使用唯一用户名和密码登录，无需邮箱或手机号。忘记密码时需使用注册时保存的恢复码。\n\n在你点击或通过耳机接通 AI 后采集麦克风，每句最多 60 秒；AI 通话会在回复后继续听，挂断即可停止。录音上传服务器用于语音识别；文字发送 AI 服务生成回复与记忆；回复可转换为语音播放。工作会议录音按账号保存在服务器，到期（默认30天，可设为不保存）自动删除；其他对话的原始录音不保存。\n\n对话、偏好、记忆和会议待办按账号存储在服务器。你可以关闭新的转写保存、导出、清空数据或注销账号。测试负责人可管理服务器及备份。\n\n录制他人讲话前，请先征得对方同意。AI 回复与纪要需要自行核对。\n\n账号密钥保存在设备加密存储中；服务商 API Key 不下发到手机。").setPositiveButton("了解", null).show();
     }
 
     private void showSources(JSONArray sources) {
@@ -1529,7 +1883,9 @@ public final class MainActivity extends Activity {
             try { JSONObject value = job.run(); runOnUiThread(() -> {
                 busy = false; if (isDestroyed()) return; lastNotice = ""; updateStatus();
                 try { result.accept(value); } catch (Exception e) { showError("操作未完成，请稍后重试"); }
-            }); } catch (Exception e) { runOnUiThread(() -> { busy = false; if (!isDestroyed()) { lastNotice = fallback(e.getMessage(), "无法连接服务器，请检查网络后重试"); diagnosticError = lastNotice; renderDiagnostics(); updateStatus(); if (!(e instanceof ApiClient.ApiException) || ((ApiClient.ApiException) e).status != 409) showError(lastNotice); } }); }
+            }); } catch (Exception e) { runOnUiThread(() -> { busy = false; if (!isDestroyed()) { lastNotice = fallback(e.getMessage(), "无法连接服务器，请检查网络后重试"); diagnosticError = lastNotice; renderDiagnostics(); updateStatus();
+                // A 409 on the sign-in screen (e.g. username taken) must replace "正在连接…"; elsewhere 409 stays quiet.
+                if (authError != null || !(e instanceof ApiClient.ApiException) || ((ApiClient.ApiException) e).status != 409) showError(lastNotice); } }); }
         });
     }
     private void signOut() { clearVoicePreparation(); preparationAttemptAt = -60000; if (quickFeedback != null) quickFeedback.stop(); chatDraft = ""; stopLockScreenSession(); cancelSession(""); clearPrivateSnapshots(); api.vault.clear(); syncHeadsetControls(); state = new JSONObject(); lastNotice = ""; showAuth(0); }
@@ -1700,8 +2056,26 @@ public final class MainActivity extends Activity {
                 if (!currentSession(generation)) return;
                 lastBusinessRequestId = id; turnHasResult = false;
             }
+            @Override public void captionFinals(JSONArray sentences) {
+                if (!currentSession(generation)) return;
+                for (int i = 0; i < sentences.length(); i++) {
+                    JSONObject sentence = sentences.optJSONObject(i);
+                    if (sentence == null || sentence.optString("text").isEmpty()) continue;
+                    workCaptionSentences.add(new SpeakerParagraphs.Sentence(sentence.optString("id"), sentence.optString("speaker"),
+                        sentence.optLong("start_ms"), sentence.optString("text")));
+                }
+                renderWorkCaption();
+            }
+            @Override public void captionPartial(String text) {
+                if (!currentSession(generation)) return;
+                workCaptionPartial = text == null ? "" : text; renderWorkCaption();
+            }
             @Override public void meeting(JSONObject value) {
                 if (!currentSession(generation)) return;
+                if (!value.optString("id").equals(workCaptionMeetingId)) {
+                    workCaptionMeetingId = value.optString("id"); workCaptionSentences.clear(); workCaptionPartial = "";
+                    workCaptionStartedAt = value.optString("started_at"); showApp();
+                }
                 JSONArray previous = array(state, "work_meetings"), updated = new JSONArray();
                 updated.put(value);
                 for (int i = 0; i < previous.length(); i++) {
