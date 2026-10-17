@@ -138,9 +138,13 @@ class QwenRealtimeSession:
 
     async def receive(self, timeout=30):
         try:
-            value = json.loads(await asyncio.wait_for(self.ws.recv(), timeout))
+            raw = await asyncio.wait_for(self.ws.recv(), timeout)
+            value = json.loads(raw)
             if not isinstance(value, dict) or not isinstance(value.get('type'), str):
                 raise ValueError()
+            # Raw frame length for downstream buffer accounting; re-serializing the
+            # parsed event per frame would double the CPU of every audio delta.
+            value['_aidol_raw_len'] = len(raw)
             if value['type'] == 'error':
                 code = str((value.get('error') or {}).get('code', 'unknown'))
                 self.last_error_code = code if re.fullmatch(r'[a-zA-Z0-9_.-]{1,80}', code) else 'unknown'
@@ -395,7 +399,9 @@ class QwenDuplexSession(QwenRealtimeSession):
                     if kind == 'response.done':
                         self.active = False
                         self.settled.set()
-                    size = len(json.dumps(event, ensure_ascii=False))
+                    size = event.pop('_aidol_raw_len', None)
+                    if size is None:
+                        size = len(json.dumps(event, ensure_ascii=False))
                     if self.responses.full() or self.response_buffered + size > 8 * 1024 * 1024:
                         raise SpeechProviderError("实时回复缓存积压")
                     event["_aidol_buffer_size"] = size

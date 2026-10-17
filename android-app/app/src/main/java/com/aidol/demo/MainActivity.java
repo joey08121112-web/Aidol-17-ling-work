@@ -872,6 +872,8 @@ public final class MainActivity extends Activity {
                 if (!detailId.isEmpty()) detail = client.json("GET", "/v1/work-meetings/" + Uri.encode(detailId), null);
             } catch (Exception ignored) { /* Keep confirmed state and retry the read, never replay PCM. */ }
             JSONObject loadedList = list, loadedDetail = detail;
+            // Serialize the change fingerprint here so the UI thread never re-serializes a whole meeting every poll.
+            String loadedSnapshot = detail == null ? null : workMeetingSnapshot(detail);
             runOnUiThread(() -> {
                 workMeetingPollInFlight = false;
                 if (isDestroyed() || client != api || client.vault.token().isEmpty()) return;
@@ -879,7 +881,7 @@ public final class MainActivity extends Activity {
                     if (loadedList != null) put(state, "work_meetings", array(loadedList, "meetings"));
                     workMeetingSyncError = loadedList == null;
                     renderWorkMeetings();
-                    if (loadedDetail != null && detailId.equals(openWorkMeetingId)) renderWorkMeetingDetail(loadedDetail);
+                    if (loadedDetail != null && detailId.equals(openWorkMeetingId)) renderWorkMeetingDetail(loadedDetail, loadedSnapshot);
                 }
                 handler.removeCallbacks(workMeetingPoll);
                 if (visible && tab == 2) handler.postDelayed(workMeetingPoll, 2500);
@@ -930,8 +932,25 @@ public final class MainActivity extends Activity {
         meetingPage.show();
         handler.removeCallbacks(workMeetingPoll); handler.post(workMeetingPoll);
     }
-    private void renderWorkMeetingDetail(JSONObject meeting) {
+    private void renderWorkMeetingDetail(JSONObject meeting) { renderWorkMeetingDetail(meeting, workMeetingSnapshot(meeting)); }
+    /** Fingerprint of everything the detail view renders; static so the poll worker can build it off the UI thread. */
+    private static String workMeetingSnapshot(JSONObject meeting) {
+        return json("sources", array(meeting, "sources"), "report", meeting.optJSONObject("report"),
+            "summary_status", meeting.optString("summary_status"), "status", meeting.optString("status"),
+            "error", meeting.optString("error"), "utterances", array(meeting, "utterances"),
+            "events", array(meeting, "events"), "audio", meeting.optJSONObject("audio"),
+            // Progress-line inputs (summary_stage/transcription_status drive the header text between
+            // content changes) and detail fields the body branches on; ended_at backfills on finish.
+            "transcription_status", meeting.optString("transcription_status"), "summary_stage", meeting.optString("summary_stage"),
+            "processed_sections", meeting.optInt("processed_sections"), "total_sections", meeting.optInt("total_sections"),
+            "received_segments", meeting.optInt("received_segments"), "ended_at", meeting.optString("ended_at")).toString();
+    }
+    private void renderWorkMeetingDetail(JSONObject meeting, String snapshot) {
         if (workMeetingDetail == null || !meeting.optString("id").equals(openWorkMeetingId)) return;
+        // While recording, the document is still small and the progress line tracks live session
+        // state (workSaving flips) — keep rendering; long finished meetings take the cheap gate.
+        if (snapshot.equals(workMeetingDetailSnapshot) && !"recording".equals(meeting.optString("status"))) return;
+        workMeetingDetailSnapshot = snapshot;
         JSONObject report = meeting.optJSONObject("report");
         JSONArray sources = array(meeting, "sources");
         MeetingTimeline timeline = new MeetingTimeline(meeting);
@@ -947,11 +966,7 @@ public final class MainActivity extends Activity {
                 + (speakers.isEmpty() ? "未区分说话人" : speakers.size() + " 位说话人") + " · " + timeline.sentences().size() + " 句 · "
                 + workMeetingProgress(meeting));
         }
-        String snapshot = json("sources", sources, "report", report, "summary_status", meeting.optString("summary_status"),
-            "status", meeting.optString("status"), "error", meeting.optString("error"), "utterances", array(meeting, "utterances"),
-            "events", array(meeting, "events"), "audio", meeting.optJSONObject("audio")).toString();
-        if (snapshot.equals(workMeetingDetailSnapshot)) return;
-        workMeetingDetailSnapshot = snapshot; workMeetingDetail.removeAllViews(); meetingSections.clear();
+        workMeetingDetail.removeAllViews(); meetingSections.clear();
         workMeetingTimeline = timeline; workMeetingLines.clear(); workMeetingRanges.clear(); workMeetingPlayingId = "";
         playingMark[0] = null; jumpMark[0] = null;
         if (!playable && meeting.optString("id").equals(meetingPlayback.meetingId())) meetingPlayback.stop();

@@ -345,9 +345,10 @@ def create_hosted_app(config=None, data_directory=None):
             text = ''
         elif pcm is not None:
             async def chunks():
+                # No artificial pacing: providers consume as fast as they process
+                # (the /v1/voice/stream path already feeds the same upstreams unpaced).
                 for offset in range(0, len(pcm), 3200):
                     yield pcm[offset:offset + 3200]
-                    await asyncio.sleep(.02)
             text, utterances = '', ()
             with measured(request_id, 'asr'):
                 try:

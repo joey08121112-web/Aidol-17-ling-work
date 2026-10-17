@@ -145,6 +145,7 @@ class Store:
                   owner TEXT NOT NULL, due TEXT NOT NULL, source_ids TEXT NOT NULL,
                   status TEXT NOT NULL DEFAULT 'open', created_at TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS memory_created ON memories(created_at);
+                CREATE INDEX IF NOT EXISTS transcript_created ON transcripts(created_at);
                 CREATE TABLE IF NOT EXISTS mobile_turns (
                   id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT, created_at TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS work_meetings (
@@ -254,6 +255,9 @@ class Store:
     @contextmanager
     def connect(self):
         db = sqlite3.connect(self.path, timeout=10)
+        # WAL keeps durability across app crashes; NORMAL avoids one fsync per
+        # write transaction, which matters for the per-turn mobile_turn updates.
+        db.execute("PRAGMA synchronous=NORMAL")
         db.row_factory = sqlite3.Row
         db.create_function("aidol_terms", 1, index_text, deterministic=True)
         db.create_function("aidol_non_assertion", 2, is_non_assertion, deterministic=True)

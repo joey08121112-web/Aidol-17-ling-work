@@ -79,7 +79,10 @@ class MobileRuntimes:
             if wait_seconds:
                 await asyncio.wait_for(runtime.lock.acquire(), wait_seconds)
             else:
-                await runtime.lock.acquire()
+                # Bounded wait, not a bare acquire: if the lock was just released with
+                # queued waiters, a bare acquire parks behind them for a whole turn
+                # while this caller explicitly asked to fail fast.
+                await asyncio.wait_for(runtime.lock.acquire(), 0.05)
         except TimeoutError:
             raise HTTPException(409, '上一项操作仍在收尾，请稍后再开始') from None
         try:
