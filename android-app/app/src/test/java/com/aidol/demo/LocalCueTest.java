@@ -24,14 +24,15 @@ public class LocalCueTest {
         for (LocalCue value : LocalCue.values()) {
             String cue = value.name().toLowerCase(java.util.Locale.ROOT);
             byte[] pcm = WavAudio.pcm(Files.readAllBytes(directory.resolve("cue_" + cue + ".wav")));
-            assertTrue(cue + " must be audible and brief", pcm.length >= 4800 && pcm.length <= 19200);
+            assertTrue(cue + " must be audible and brief", pcm.length >= 4800 && pcm.length <= 43200);
             assertEquals(cue + " starts at silence", 0, sample(pcm, 0));
             assertEquals(cue + " ends at silence", 0, sample(pcm, pcm.length - 2));
+            boolean modeCue = value == LocalCue.LIFE || value == LocalCue.WORK || value == LocalCue.COMMUTE;
             int previous = 0;
             for (int i = 0; i < pcm.length; i += 2) {
                 int current = sample(pcm, i);
-                assertTrue(cue + " avoids loud peaks", Math.abs(current) <= 4300);
-                assertTrue(cue + " avoids abrupt sample jumps", Math.abs(current - previous) <= 1000);
+                assertTrue(cue + " avoids loud peaks", Math.abs(current) <= (modeCue ? 16000 : 4300));
+                assertTrue(cue + " avoids abrupt sample jumps", Math.abs(current - previous) <= (modeCue ? 4000 : 1000));
                 previous = current;
             }
             boolean audible = false;

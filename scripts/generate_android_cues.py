@@ -16,14 +16,16 @@ def render(recipe, rate):
     pcm = bytearray()
     for frame in range(frames):
         t = frame / rate
-        # One continuous note: a rounded attack and a smooth tail, with no click or second strike.
+        # Each note has a rounded attack and a smooth tail; mode cues repeat it after a short gap.
         attack = math.sin(math.pi / 2 * min(1, t / .035)) ** 2
         release = math.sin(math.pi / 2 * min(1, (duration - t) / .140)) ** 2
         envelope = attack * release * math.exp(-3.5 * t / duration)
         phase = 2 * math.pi * (recipe['start_hz'] * t + (recipe['end_hz'] - recipe['start_hz']) * t * t / (2 * duration))
         tone = (math.sin(phase) + .12 * math.sin(2 * phase) * math.exp(-8 * t)) / 1.12
-        pcm.extend(struct.pack('<h', round(32767 * .13 * envelope * tone)))
-    return bytes(pcm)
+        pcm.extend(struct.pack('<h', round(32767 * recipe.get('gain', .13) * envelope * tone)))
+    note = bytes(pcm)
+    gap = bytes(round(recipe.get('gap_ms', 0) * rate / 1000) * 2)
+    return gap.join([note] * recipe.get('repetitions', 1))
 
 
 def generate(output):

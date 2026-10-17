@@ -32,17 +32,26 @@
     "cue_life": {
       "duration_ms": 340,
       "start_hz": 659.25,
-      "end_hz": 698.46
+      "end_hz": 698.46,
+      "gain": 0.5334838230116768,
+      "repetitions": 2,
+      "gap_ms": 85
     },
     "cue_work": {
       "duration_ms": 320,
       "start_hz": 440,
-      "end_hz": 440
+      "end_hz": 440,
+      "gain": 0.5334838230116768,
+      "repetitions": 2,
+      "gap_ms": 85
     },
     "cue_commute": {
       "duration_ms": 360,
       "start_hz": 783.99,
-      "end_hz": 880
+      "end_hz": 880,
+      "gain": 0.5334838230116768,
+      "repetitions": 2,
+      "gap_ms": 85
     },
     "default": {
       "duration_ms": 280,

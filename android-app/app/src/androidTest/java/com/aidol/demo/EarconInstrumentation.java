@@ -27,7 +27,8 @@ public final class EarconInstrumentation extends Instrumentation {
             require(!getTargetContext().getSystemService(KeyguardManager.class).isKeyguardLocked(), "Unlock phone for earcon review");
             require(field(activity, "session") == null, "Existing session is active");
             require(!CommuteService.running((ApiClient)field(activity, "api")), "An existing commute is active");
-            runOnMainSync(() -> { try { ((QuickFeedback)field(activity, "quickFeedback")).stop(); } catch (Exception e) { throw new RuntimeException(e); } });
+            // Isolate measured playback from delayed startup/wear feedback in this review Activity.
+            runOnMainSync(() -> { try { ((QuickFeedback)field(activity, "quickFeedback")).close(); } catch (Exception e) { throw new RuntimeException(e); } });
             HeadsetController headset = (HeadsetController)field(activity, "headset");
             for(int i=0; i<100 && !headset.snapshot().ready(); i++) SystemClock.sleep(200);
             require(headset.snapshot().ready(), "Rise headset is not ready");
