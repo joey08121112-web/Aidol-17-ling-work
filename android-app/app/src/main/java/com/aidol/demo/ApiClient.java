@@ -8,6 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import okhttp3.Call;
+import okhttp3.ConnectionPool;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -25,27 +26,32 @@ public final class ApiClient {
     private final HttpTransport transport;
     /** Read-only recovery for stale USB/proxy connections must never replay a mutation. */
     static final class HttpTransport {
-        private final boolean freshConnections;
-        private final OkHttpClient mutations = new OkHttpClient.Builder().connectTimeout(15, TimeUnit.SECONDS)
-            .readTimeout(100, TimeUnit.SECONDS).writeTimeout(30, TimeUnit.SECONDS).callTimeout(120, TimeUnit.SECONDS)
-            .retryOnConnectionFailure(false).followRedirects(false).followSslRedirects(false).build();
+        private final OkHttpClient mutations;
         // newBuilder retains the same connection pool, dispatcher, timeouts and redirect policy.
-        private final OkHttpClient safeReads = mutations.newBuilder().retryOnConnectionFailure(true).build();
-        private final OkHttpClient liveSockets = mutations.newBuilder().readTimeout(0, TimeUnit.SECONDS)
-            .callTimeout(0, TimeUnit.SECONDS).pingInterval(20, TimeUnit.SECONDS).build();
+        private final OkHttpClient safeReads;
+        private final OkHttpClient liveSockets;
         // Media bodies are read at playback speed, so only the per-read timeout applies.
-        private final OkHttpClient mediaReads = safeReads.newBuilder().callTimeout(0, TimeUnit.SECONDS).build();
+        private final OkHttpClient mediaReads;
         HttpTransport() { this(false); }
-        HttpTransport(boolean freshConnections) { this.freshConnections = freshConnections; }
+        HttpTransport(boolean debugUsbOrigin) {
+            // Reuse is safe everywhere: reads recover a stale socket on a fresh connection and
+            // mutations never replay an uncertain write. The debug USB origin only narrows the
+            // stale-socket window (adb reverse reloads) with a short pool keep-alive.
+            OkHttpClient.Builder base = new OkHttpClient.Builder().connectTimeout(15, TimeUnit.SECONDS)
+                .readTimeout(100, TimeUnit.SECONDS).writeTimeout(30, TimeUnit.SECONDS).callTimeout(120, TimeUnit.SECONDS)
+                .retryOnConnectionFailure(false).followRedirects(false).followSslRedirects(false);
+            if (debugUsbOrigin) base.connectionPool(new ConnectionPool(5, 10, TimeUnit.SECONDS));
+            mutations = base.build();
+            safeReads = mutations.newBuilder().retryOnConnectionFailure(true).build();
+            liveSockets = mutations.newBuilder().readTimeout(0, TimeUnit.SECONDS)
+                .callTimeout(0, TimeUnit.SECONDS).pingInterval(20, TimeUnit.SECONDS).build();
+            mediaReads = safeReads.newBuilder().callTimeout(0, TimeUnit.SECONDS).build();
+        }
         Call call(Request request) {
-            // adb reverse/local reloads can leave stale HTTP/1.1 sockets. Prevent reuse for this
-            // debug-only origin instead of replaying an uncertain write after losing its response.
-            if (freshConnections) request = request.newBuilder().header("Connection", "close").build();
             boolean readOnly = request.method().equals("GET") || request.method().equals("HEAD");
             return (readOnly ? safeReads : mutations).newCall(request);
         }
         Call media(Request request) {
-            if (freshConnections) request = request.newBuilder().header("Connection", "close").build();
             return mediaReads.newCall(request);
         }
         WebSocket socket(Request request, WebSocketListener listener) {
@@ -63,10 +69,10 @@ public final class ApiClient {
     public ApiClient(Context context) { this(context, new DevelopmentSettings(context).serverUrl()); }
     public ApiClient(Context context, String serverUrl) {
         this.serverUrl = ServerEndpoint.validate(serverUrl, BuildConfig.DEBUG);
-        transport = new HttpTransport(useFreshConnections(this.serverUrl, BuildConfig.DEBUG));
+        transport = new HttpTransport(isDebugUsbOrigin(this.serverUrl, BuildConfig.DEBUG));
         vault = new AuthVault(context, ServerEndpoint.sessionNamespace(this.serverUrl));
     }
-    static boolean useFreshConnections(String validatedOrigin, boolean debug) {
+    static boolean isDebugUsbOrigin(String validatedOrigin, boolean debug) {
         return debug && ServerEndpoint.USB_LOCAL.equals(validatedOrigin);
     }
     public void setDiagnostics(Consumer<String> listener) { if (BuildConfig.DEBUG) diagnostics = listener; }
