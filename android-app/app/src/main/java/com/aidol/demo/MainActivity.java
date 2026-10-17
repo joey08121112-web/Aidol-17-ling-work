@@ -809,20 +809,30 @@ public final class MainActivity extends Activity {
         String capture = meeting.optString("status"), summary = meeting.optString("summary_status");
         if ("recording".equals(capture)) {
             if (session != null && meeting.optString("id").equals(session.workMeetingId()))
-                return session.workSaving() ? "正在转写并保存 · 请等待尾段提交" : "正在记录 · 原文陆续保存";
-            return "录音尚未确认结束 · 已保存片段可查看";
+                return session.workSaving() ? "正在保存录音 · 请稍候" : "正在录音 · 结束后识别整场发言人";
+            return "录音尚未确认结束 · 可结束后识别已保存录音";
         }
         if ("empty".equals(capture)) return "未识别到讲话 · 没有可整理的原文";
+        if ("pending".equals(meeting.optString("transcription_status")))
+            return "failed".equals(summary) ? "整场转写未完成 · 可重试" : "录音已保存 · 正在识别整场发言人";
         String prefix = "partial".equals(capture) ? "原文有缺段 · " : "原文已保存 · ";
         if ("pending".equals(summary)) {
             String stage = meeting.optString("summary_stage");
-            if ("analyzing".equals(stage)) return prefix + "正在分析 " + meeting.optInt("processed_sections") + "/" + meeting.optInt("total_sections") + " 组";
-            return prefix + ("synthesizing".equals(stage) ? "正在汇总会议纪要" : "等待 AI 整理");
+            if ("analyzing".equals(stage)) return prefix + "正在总结 · 阅读整场文稿";
+            return prefix + ("synthesizing".equals(stage) ? "正在总结 · 汇总中" : "正在总结 · 等待处理");
         }
-        if ("ready".equals(summary)) return prefix + "纪要已完成";
+        if ("ready".equals(summary)) return prefix + "总结完成";
         if ("fallback".equals(summary)) return prefix + "AI 整理未完成，可重试";
         if ("failed".equals(summary)) return prefix + "整理失败，可重试";
         return prefix + "可查看原文";
+    }
+    private String meetingPlace(JSONObject meeting) {
+        JSONObject location = meeting.optJSONObject("location");
+        if (location == null || !location.has("longitude")) return "地点：未获取（定位未授权或暂无定位）";
+        String address = location.optString("address");
+        if (!address.isEmpty()) return "开始地点：" + address;
+        return String.format(java.util.Locale.US, "开始地点：%.5f, %.5f（经纬度，地址暂不可用）",
+            location.optDouble("longitude"), location.optDouble("latitude"));
     }
     private void renderWorkMeetings() {
         if (workMeetingList == null || tab != 2) return;
@@ -841,6 +851,7 @@ public final class MainActivity extends Activity {
             label(item, title, 17, INK);
             label(item, date(meeting.optString("started_at")) + " · 时长 " + TimeFormat.clock(meeting.optLong("duration_ms"))
                 + " · 已保存 " + meeting.optInt("transcript_count") + " 段原文", 11, MUTED);
+            label(item, meetingPlace(meeting), 11, MUTED);
             label(item, workMeetingProgress(meeting), 13, WORK);
             String summary = meeting.isNull("summary") ? "" : meeting.optString("summary");
             if (!summary.isEmpty()) label(item, summary.length() > 120 ? summary.substring(0, 120) + "…" : summary, 13, MUTED);
@@ -959,6 +970,7 @@ public final class MainActivity extends Activity {
             + "（" + TimeFormat.gmt(zone) + "）", 14, MUTED);
         label(meta, "录音时长：" + TimeFormat.hms(timeline.audioEndMs()) + " · " + timeline.sentences().size() + " 句", 14, MUTED);
         label(meta, "说话人：" + (speakerNames.isEmpty() ? "未区分" : String.join("、", speakerNames)), 14, MUTED);
+        label(meta, meetingPlace(meeting), 14, MUTED);
         meetingSection("总结", "总结");
         if (report == null) label(workMeetingDetail, workMeetingProgress(meeting) + "。原文可先在下方查看，AI 整理完成后自动更新。", 14, MUTED);
         else {
@@ -990,6 +1002,12 @@ public final class MainActivity extends Activity {
                 card.setFocusable(true); card.setContentDescription("章节 " + TimeFormat.clock(at) + "，" + chapter.optString("title"));
                 card.setOnClickListener(v -> seekOrJump(meeting, timeline, at, target));
             }
+            meetingSection("观点", "各人物观点");
+            meetingItems(workMeetingDetail, meetingAnalysisItems(report, "viewpoints"), meeting, timeline, false);
+            meetingSection("冲突", "内容冲突与澄清");
+            meetingItems(workMeetingDetail, array(report, "conflicts"), meeting, timeline, false);
+            meetingSection("事件", "重要事件");
+            meetingItems(workMeetingDetail, meetingAnalysisItems(report, "events"), meeting, timeline, false);
             meetingSection("决策", "关键决策");
             meetingItems(workMeetingDetail, array(report, "decisions"), meeting, timeline, false);
             meetingSection("待办", "行动待办");
@@ -1042,8 +1060,9 @@ public final class MainActivity extends Activity {
                 });
             });
         }
-        if (!"recording".equals(meeting.optString("status")) && sources.length() > 0 && !"pending".equals(summaryStatus))
-            button(workMeetingDetail, "重新生成 AI 纪要", false, () -> {
+        if (!"recording".equals(meeting.optString("status")) && (sources.length() > 0 || "pending".equals(meeting.optString("transcription_status"))) && !"pending".equals(summaryStatus))
+            button(workMeetingDetail, ("pending".equals(meeting.optString("transcription_status")) || "failed".equals(meeting.optString("transcription_status")))
+                ? "重试整场识别与总结" : "重新生成 AI 纪要", false, () -> {
                 if (!canAct()) return;
                 request(() -> api.json("POST", "/v1/work-meetings/" + Uri.encode(meeting.optString("id")) + "/retry-summary", json()), r -> {
                     workMeetingDetailSnapshot = ""; renderWorkMeetingDetail(r);
@@ -1062,6 +1081,22 @@ public final class MainActivity extends Activity {
         renderMeetingPlayer(meeting.optString("id"));
         updateMeetingHighlight();
         if (!workMeetingJumpId.isEmpty()) { String jump = workMeetingJumpId; workMeetingJumpId = ""; scrollToSentence(jump); }
+    }
+    private JSONArray meetingAnalysisItems(JSONObject report, String key) {
+        JSONArray items = array(report, key), display = new JSONArray();
+        for (int i = 0; i < items.length(); i++) {
+            JSONObject item = items.optJSONObject(i); if (item == null) continue;
+            String text;
+            if ("viewpoints".equals(key)) {
+                text = fallback(item.optString("person"), "身份未明确的发言") + "\n" + item.optString("text");
+            } else {
+                text = item.optString("content") + "\n时间：" + fallback(item.optString("time"), "未明确")
+                    + "\n地点：" + fallback(item.optString("location"), "未明确")
+                    + "\n相关任务：" + fallback(item.optString("task"), "未明确");
+            }
+            display.put(json("text", text, "source_ids", array(item, "source_ids")));
+        }
+        return display;
     }
     /** Speaker paragraphs whose sentences stay individually tappable (play from there) and highlightable. */
     private void meetingParagraphs(java.util.List<SpeakerParagraphs.Sentence> sentences, JSONObject meeting, MeetingTimeline timeline, boolean playable) {
@@ -1955,7 +1990,7 @@ public final class MainActivity extends Activity {
             stopRepeat(); headsetNotice(InteractionCopy.name(listenMode) + "不适用于" + modeName(mode()) + "，请重新选择通话与记录方式"); return;
         }
         if (listenMode == VoiceInteraction.NOTES && (state.optJSONObject("capabilities") == null
-                || !state.optJSONObject("capabilities").optBoolean("asr"))) {
+                || !state.optJSONObject("capabilities").optBoolean("work_asr"))) {
             stopRepeat(); feedback("工作录音转写当前不可用，请配置后端语音识别后重试", LocalCue.RETRY); return;
         }
         if (listenMode == VoiceInteraction.NOTES && !state.optJSONObject("capabilities").optBoolean("work_meetings")) {

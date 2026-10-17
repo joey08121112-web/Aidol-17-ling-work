@@ -431,8 +431,13 @@ public final class HostedSession {
     }
     private void runWorkRecording() throws Exception {
         status("正在创建本次会议记录…");
+        JSONObject startMetadata = new JSONObject().put("meeting_id", sessionId)
+            .put("whole_audio", false)
+            .put("started_at", java.time.Instant.now().toString());
+        JSONObject location = MeetingStartLocation.capture(context);
+        if (location != null) startMetadata.put("location", location);
         JSONObject started = new JSONObject(new String(request("/v1/work-meetings",
-            new JSONObject().put("meeting_id", sessionId).toString().getBytes(StandardCharsets.UTF_8), "application/json"), StandardCharsets.UTF_8));
+            startMetadata.toString().getBytes(StandardCharsets.UTF_8), "application/json"), StandardCharsets.UTF_8));
         workMeetingStarted = true;
         post(() -> listener.meeting(started));
         boolean complete = false;
@@ -459,7 +464,9 @@ public final class HostedSession {
         }
         if (finished == null || !"saved".equals(finished.optString("status")))
             throw new IOException(finished == null ? "会议保存未确认，请查看工作页" : finished.optString("error", "工作记录未完整保存"));
-        status("会议原文已保存，正在后台整理摘要；可在工作页查看进度");
+        status("pending".equals(finished.optString("transcription_status"))
+            ? "会议录音已保存，正在识别整场发言人；完成后自动总结"
+            : "会议原文已保存，正在后台整理摘要；可在工作页查看进度");
     }
     private void captureWorkSegments() throws Exception {
         workBuffer = new WorkAudioBuffer();

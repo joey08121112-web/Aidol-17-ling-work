@@ -49,4 +49,18 @@ public class MeetingExportTest {
         assertTrue(text.contains("[0:00] 大家好。"));
         assertFalse(text.contains("## 摘要"));
     }
+
+    @Test public void exportIncludesWholeMeetingAnalysisAlongsideTimedTranscript() throws Exception {
+        JSONObject value = meeting(), report = value.getJSONObject("report");
+        JSONArray ids = new JSONArray().put("t2.0");
+        report.put("viewpoints", new JSONArray().put(new JSONObject().put("person", "说话人2").put("text", "建议推迟两天").put("source_ids", ids)))
+            .put("conflicts", new JSONArray().put(new JSONObject().put("text", "排期尚有分歧").put("source_ids", ids)))
+            .put("events", new JSONArray().put(new JSONObject().put("content", "安排评审").put("time", "周五").put("location", "北京").put("task", "").put("source_ids", ids)));
+        String text = MeetingExport.markdown(value, SHANGHAI);
+        assertTrue(text.contains("说话人2：建议推迟两天（依据 14:03:09）"));
+        assertTrue(text.contains("## 内容冲突与澄清"));
+        assertTrue(text.contains("时间：周五；地点：北京；相关任务：未明确"));
+        assertTrue(text.contains("## 智能章节"));
+        assertTrue(text.contains("[14:03:09] 说话人 2：我建议推迟两天。"));
+    }
 }

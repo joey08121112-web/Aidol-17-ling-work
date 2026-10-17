@@ -38,6 +38,13 @@ final class MeetingExport {
                     + (item.optString("summary").isEmpty() ? "" : "：" + item.optString("summary"));
             });
             section(out, "关键决策", array(report, "decisions"), item -> "- " + item.optString("text") + evidence(item, timeline, zone));
+            section(out, "各人物观点", array(report, "viewpoints"), item -> "- " + fallback(item.optString("person"), "身份未明确的发言")
+                + "：" + item.optString("text") + evidence(item, timeline, zone));
+            section(out, "内容冲突与澄清", array(report, "conflicts"), item -> "- " + item.optString("text") + evidence(item, timeline, zone));
+            section(out, "重要事件", array(report, "events"), item -> "- " + item.optString("content")
+                + "（时间：" + fallback(item.optString("time"), "未明确") + "；地点：" + fallback(item.optString("location"), "未明确")
+                + "；相关任务：" + fallback(item.optString("task"), "未明确") + "）" + evidence(item, timeline, zone));
+            section(out, "议题与重要信息", array(report, "topics"), item -> "- " + item.optString("text") + evidence(item, timeline, zone));
             section(out, "行动待办", array(report, "tasks"), item -> "- [ ] " + item.optString("content")
                 + "（负责人：" + fallback(item.optString("owner"), "未明确") + "；截止：" + fallback(item.optString("due"), "未提及") + "）"
                 + evidence(item, timeline, zone));

@@ -261,3 +261,63 @@ Android 实际播放排空后发送 `{"type":"playback.done","turn":N}`，后端
 关键词保护也覆盖已接纳问题的排队和思考阶段：此时普通起声和后续转写不会取消或替换已接纳问题；识别到“小万”仍可立即打断。避免噪声连续触发 VAD 导致回答尚未返回任何音频就反复被取消。
 
 整场结束发送 `{"type":"end"}`，或客户端直接取消连接；服务端取消全部子任务、结束上游连接、释放账号锁。正常结束回 `call.done`。`voice_duplex` / `voice_barge_in` 表示后端实现协议能力，硬件效果以验收记录为准。工具查询和发言继续按账号额度计费。回复下行按播放速度限制提前量，避免插话控制帧排在大段音频之后；回复缓存、输入/输出队列有上限。
+
+## 工作会议 Qwen 3.1 转写与开始信息（2026-10-17）
+
+工作会议 `/v1/voice?meeting_id=...&segment_index=...` 使用独立的
+`qwen-audio-3.1-asr-flash` HTTP 接口，开启 `speaker_diarization_enabled`。
+`capabilities.work_asr` 表示该配置就绪，`work_asr_model` 返回模型名；工作模式客户端不再以通用 `asr` 能力判断是否可以开始。未配置返回 503，不自动回退旧模型。普通语音和实时通话保持各自原有接口。
+
+`POST /v1/work-meetings` 增加可选 `started_at`（带时区、距当前不超过一天）和
+`location: {longitude, latitude, accuracy, source: "gps"}`。Android 在开始时读取最多两分钟内的定位，必要时最多等待三秒新定位；无授权/无定位不阻塞会议。后端可用高德将坐标转换为地址，失败仍保留坐标。首次创建的时间地点不可被重试覆盖，也不使用会议结束时的位置替换。
+
+列表、详情均返回 `location` 对象；无位置为 `{}`。完成的 report 同样包含 `started_at`、`location`。
+每条 sources 保留原始 `text`，另有 `utterances: [{text,speaker_id,begin_time,end_time}]`。
+时间单位为片段内毫秒，speaker_id 仅在该片段内有效，不代表真实身份或跨片段稳定身份。
+
+`summary_status=pending` 显示“正在总结”（分组或汇总进度），`ready` 显示“总结完成”；
+失败/摘录降级不显示成功。完成时详情自动展示摘要，用户仍可切换原始文稿。
+
+### 千问服务商配置补充
+
+已按现有服务商文档确认 Flash HTTP 地址为 `https://maas.qianwenaiapi.com/api/v1/services/aigc/multimodal-generation/generation`。默认复用同域名实时服务的 `QWEN_OMNI_API_KEY`，独立 `QWEN_WORK_ASR_API_KEY` 优先。其他域名不继承该密钥。仅该服务明确返回的 `CLIENT_ERROR / ASR_RESPONSE_HAVE_NO_WORDS` 被视为空语音片段，其余错误仍报识别失败。
+
+用户提供的 Filetrans 文档为整段文件 URL 异步识别接口；当前保留分段原文流程，使用同服务商 Flash 多人识别接口，不把 Filetrans 协议套用到 Flash。
+
+## 整场文稿总结（2026-10-17 最新约定）
+
+此节取代此前“分组分析/层级合并”的总结约定。录音上传仍采用原有可靠提交机制，但 Android 将所有识别原文按顺序展示为一份连续文稿，不显示上传片段标题。录音过程中不生成小结；结束后把全部已保存原文一次交给文字模型，不切分分析、不截断内容、不使用中间摘要替代原文。来源 ID 仅用于引用追溯。
+
+总结新增 `viewpoints: [{person,text,source_ids}]`、`conflicts: [{text,source_ids}]`、`events: [{content,time,location,task,source_ids}]`，并保留 tasks、topics、decisions、open_questions。未知人物/事件时间/地点/任务使用空字符串，界面显示未明确；人物、时间、地点必须出现在引用的原文里。任务与已确认决策沿用原有来源校验。
+
+工作页顺序为整场摘要、任务总结、各人物观点、内容冲突与澄清、重要事件、其他议题与重要信息、决策、待确认事项。重要事件逐项显示内容、时间、地点和相关任务，不能用录音开始时间地点替代事件本身的信息。录音开始快照仍单独显示。
+
+输入没有人为字符截断或分段总结。若超出所配文字模型的上下文容量、模型调用失败、输出被截断或证据校验失败，状态为未完成并保留原文，不宣称整场总结完成。接口结构新增字段不要求重写历史纪要，历史记录可重新生成。
+
+会议标题：成功总结后，模型按整场主要议题/核心决策生成单行标题，自动成为该记录在列表和详情中的标题；最多12个字符（标点/数字/字母计入）。提示词要求关键主题前置，后端去除空白和“标题：”包装并兜底限制长度，避免超长标题导致整份总结丢弃。已有历史记录不会批量改名，重新总结时应用新规则。
+
+## 整场说话人对话（2026-10-17 最新修正，覆盖前述 Flash/连续纯文本展示）
+
+新版 Android 创建会议时传 `whole_audio=true`，能力要求 `work_whole_audio=true`。录音只通过已鉴权 `POST /v1/work-meetings/{id}/audio?upload_index=N&request_id=UUID` 保存 16kHz PCM16 音频数据；这是可靠上传机制，不做分段 ASR，也不形成界面上的“片段”。每次请求限制100毫秒至60秒，单场限制两小时。旧客户端/旧记录仍保留兼容路径。
+
+结束后将整场录音拼成一个 WAV，以现有千问服务密钥调用 `qwen-audio-3.1-asr-flash-filetrans`，明确启用 `diarization_enabled=true`。通过服务商 `/api/v1/uploads?action=getPolicy&model=...` 临时上传音频，随后提交异步转写任务并持久化 task_id，重启后恢复查询；明确失败时由用户点击重试重新提交。供应商临时资源绑定主账号/模型，有效期48小时；该临时上传方式的生产容量限制见供应商文档，正式高并发部署应换为生产对象存储。无需新增公开音频下载路由。
+
+账户 SQLite 暂存上传音频，转写成功后删除，清空私密数据同样删除；超过24小时的原始音频在 Store 初始化时清理，过期后可能无法重试。临时 WAV 用临时文件对象，处理退出自动关闭。未把音频加入导出、Git、APK或网站。完整会议若上传数据缺失，不能静默转写成“完整”。
+
+`whole_audio` 返回布尔值，`transcription_status` 为 recording/pending/ready/empty（旧记录为legacy）。处理中显示“正在识别整场发言人”，之后再显示“正在总结/总结完成”。成功 sources 为按发言顺序保存的句子，带 `speaker_scope=meeting`、`speaker=发言人 N` 及原始句子时间/供应商 speaker_id。编号按整场结果首次出现顺序映射，同号共享同一人物标签，不代表真实姓名。无法识别时显示未识别发言人，不凭内容猜测。
+
+原始文稿按“发言人＋原话”逐条展示与复制，不展示上传边界。总结仍一次使用整场已保存原文，包含发言人标签，允许按整场匿名人物分别整理观点；明确第一人称承诺可使用该匿名标签作为任务负责人。旧记录没有整场音频可重做时不能凭局部编号建立整场身份。
+
+参考：https://platform.qianwenai.com/docs/developer-guides/speech/asr 和 https://platform.qianwenai.com/docs/api-reference/more/upload-file-get-temporary-url
+
+## 2026-10-17 双分支整合后的工作会议契约（覆盖前述冲突说明）
+
+- 当前 Android 使用 `whole_audio=false` 开场，保留开始时间与可用位置快照，通过 `/live` 接收实时字幕、通过 `/v1/voice` 上传含 `offset_ms` 的录音段。字幕覆盖时 `recognize=0` 不重复识别；字幕不可用时使用已配置的 Qwen Flash 或火山按段兜底。实时说话人仅在各上游识别段内稳定。
+- 结束后，在 Qwen 工作 ASR 已配置且音频可用时，以录音时间轴组装整场 WAV，提交一次 Filetrans 说话人识别，再一次性总结全部已保存原文。最终句子替换实时句子，保留时间轴、暂停、重点标记和录音回放；统一标签为 `说话人1/2/...`，仅最终整场结果标注 `speaker_scope=meeting`。完整录音缺失时保留原有转写，不伪造完整识别。
+- 无 Qwen 配置时保留火山实时/分段转写和文字纪要。`capabilities.work_asr` 表示至少一种工作转写可用；`work_whole_audio` 表示旧整场上传协议仍受支持，不是当前 Android 开场的必选门槛。
+- 兼容 `whole_audio=true` 的旧调用方和 `POST /v1/work-meetings/{id}/audio`。旧 SQLite 暂存上传在 Store 初始化时幂等导入账号音频目录，转写成功前保留旧副本。新上传在统一音频目录保存；同一个请求号携带不同 PCM 返回409。
+- `transcription_status` 补充 `failed`。整场识别失败后，有实时原文的会议仍可整理该原文，并明确提示整场说话人识别未完成；无原文则显示失败。手动重试可重试识别，终态失败清除 task_id，暂时性查询错误保留 task_id。已忘记的原文不得由正在返回的识别结果重建。
+- 当前 Android 的录音保存遵守 `work_audio_retention_days`（默认30天，0不落盘，因此不再做结束后的整场识别）。旧 `whole_audio=true` 客户端即使设0也需暂存以完成识别，成功立即删除，失败最多额外保留24小时供重试；不是所有录音都转写后立即删除。已保存录音窗口起点超出最后样本时返回404。
+- AI 纪要保留整场任务、人物观点、冲突、事件、议题、决策、待确认，并结合可选的 `chapters/highlights`；章节时间由服务端依据句子计算，非逐字摘录的重点丢弃。Android 全屏会议页及 Markdown 导出包含这些内容和对应时间引用。
+
+以上是本地源码/协议整合，真实服务配额、长会议、实体耳机和远端部署另行验收，见 [工作日志](work-log-2026-10-17.md)。

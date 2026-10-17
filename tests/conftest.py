@@ -6,6 +6,7 @@ import pytest
 from app.config import Config
 from app.providers.volc_speech import VolcSpeechConfig
 from app.providers.qwen_realtime import QwenRealtimeConfig
+from app.providers.qwen_work_asr import QwenWorkAsrConfig
 from app.events import EventBus
 from app.services.agent import Agent
 from app.storage import Store
@@ -20,7 +21,7 @@ def config(tmp_path):
         if any(part in field.name for part in ("key", "token", "secret", "app_id"))
     }
     return Config(database_path=str(tmp_path / "test.sqlite3"), proxy=None, asr_mode="stream",
-                  speech=VolcSpeechConfig(), qwen=QwenRealtimeConfig(), **credentials)
+                  speech=VolcSpeechConfig(), qwen=QwenRealtimeConfig(), work_asr=QwenWorkAsrConfig(), **credentials)
 
 
 @pytest.fixture
