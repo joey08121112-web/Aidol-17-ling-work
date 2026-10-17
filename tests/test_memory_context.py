@@ -92,3 +92,10 @@ async def test_failed_text_model_still_returns_evidence(agent, config, store, mo
     result = await agent.ingest(TextInput(text='我答应客户什么时候交方案？'), directed=True)
     assert result['interaction'] == 'memory_recall'
     assert '周五' in result['response'] and result['citations']
+
+
+def test_life_queries_are_answered_by_the_assistant_not_deflected(agent):
+    for directed in (True, False):
+        context = realtime_instructions(agent.instructions(directed=directed))
+        assert '绝不能让用户自己去查' in context and 'web_search' in context
+        assert '实际下单需用户在官方渠道完成' not in context
