@@ -17,6 +17,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Predicate;
+import java.util.function.BooleanSupplier;
 import okhttp3.Call;
 import org.json.JSONObject;
 
@@ -126,6 +127,11 @@ public final class HostedSession {
     public boolean isDuplexCall() { return duplex != null; }
     public void sendDuplexText(String value) {
         try { duplex.text(value); } catch (IOException error) { status(error.getMessage()); }
+    }
+    private BooleanSupplier locationForeground = () -> false;
+    public HostedSession locationForeground(BooleanSupplier foreground) {
+        if (launched.get()) throw new IllegalStateException("会话已开始");
+        locationForeground = foreground; return this;
     }
     private boolean workRecording;
     private volatile String workAudioStatus = "正在准备工作录音";
@@ -451,7 +457,7 @@ public final class HostedSession {
         JSONObject startMetadata = new JSONObject().put("meeting_id", sessionId)
             .put("whole_audio", false)
             .put("started_at", java.time.Instant.now().toString());
-        JSONObject location = MeetingStartLocation.capture(context);
+        JSONObject location = MeetingStartLocation.capture(context, api, locationForeground);
         if (location != null) startMetadata.put("location", location);
         JSONObject started = new JSONObject(new String(request("/v1/work-meetings",
             startMetadata.toString().getBytes(StandardCharsets.UTF_8), "application/json"), StandardCharsets.UTF_8));

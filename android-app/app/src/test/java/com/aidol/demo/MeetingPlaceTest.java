@@ -40,4 +40,20 @@ public class MeetingPlaceTest {
         meeting.put("address_retry_at", 123456);
         assertFalse(MeetingPlace.label(meeting).contains("已重试3次"));
     }
+    @Test public void cachedAddressAndObservationTimeSurviveExportWithoutCoordinates() throws Exception {
+        JSONObject meeting = new JSONObject().put("location", new JSONObject()
+            .put("longitude", 116.4).put("latitude", 39.9).put("address", "测试会议室")
+            .put("cached", true).put("observed_at", "2026-10-18T01:00:00Z"));
+        String label = MeetingPlace.label(meeting);
+        assertTrue(label.contains("测试会议室（缓存定位 · "));
+        assertTrue(label.contains(TimeFormat.format("2026-10-18T01:00:00Z")));
+        String export = MeetingExport.markdown(meeting, ZoneId.of("Asia/Shanghai"));
+        assertTrue(export.contains("缓存定位 · 2026-10-18 09:00:00"));
+        assertFalse(export.contains("116.4")); assertFalse(export.contains("39.9"));
+        meeting.getJSONObject("location").remove("address");
+        assertTrue(MeetingPlace.label(meeting).contains("缓存定位"));
+        meeting.put("address_attempts", 4).put("address_retry_at", JSONObject.NULL);
+        assertTrue(MeetingPlace.label(meeting).contains("已重试3次"));
+        assertTrue(MeetingPlace.label(meeting).contains("缓存定位"));
+    }
 }

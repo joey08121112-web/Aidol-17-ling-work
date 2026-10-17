@@ -176,7 +176,8 @@ public final class MainActivity extends Activity {
     private CompanionOrbView orb;
     private String chatDraft = "";
     private HostedSession session;
-    private boolean busy, recording, visible;
+    private boolean busy, recording;
+    private volatile boolean visible;
     private int tab, authMode;
     private String memoryFilter = "", lastNotice = "", lastAnswer = "", lastUser = "";
     private JSONArray lastCitations = new JSONArray(), lastTools = new JSONArray();
@@ -1836,6 +1837,11 @@ public final class MainActivity extends Activity {
         startupLocationAttempted = true;
         locationMonitor.enter(api, maintenanceEntry);
     }
+    private void clearLocationCache() {
+        stopLocation();
+        if (locationMonitor != null) locationMonitor.stop();
+        MeetingLocationCache.clear(this); startupLocationAttempted = false;
+    }
     private void locationFailed(String message) {
         boolean quiet = automaticLocation;
         stopLocation();
@@ -1875,6 +1881,7 @@ public final class MainActivity extends Activity {
                 if (!usableLocation(location)) return;
                 if (BuildConfig.DEBUG) android.util.Log.d("AidolLocation", "Accepted provider=" + location.getProvider() + " accuracy_m=" + location.getAccuracy());
                 stopLocation(); if (!visible) return;
+                MeetingLocationCache.remember(MainActivity.this, locationApi, locationToken, location);
                 JSONObject point = json("longitude", location.getLongitude(), "latitude", location.getLatitude(), "accuracy", location.getAccuracy(), "source", "gps"); if (location.hasSpeed()) put(point, "speed", location.getSpeed());
                 JSONObject payload = cloneJson(settings()); put(payload, "mode", "commute"); put(payload, "auto_mode", false);
                 request(() -> {
@@ -1988,7 +1995,7 @@ public final class MainActivity extends Activity {
         dialog.setOnShowListener(v -> { dialog.getButton(-1).setTextColor(RED); dialog.getButton(-1).setOnClickListener(w -> {
             if (!canAct()) return; if (password.length() == 0) { password.setError("请输入密码"); return; }
             request(() -> api.json("DELETE", account ? "/auth/account" : "/v1/data", json("password", password.getText().toString())), r -> {
-                dialog.dismiss(); TaskReminders.clear(this); getSharedPreferences("meeting_edit_drafts", MODE_PRIVATE).edit().clear().apply(); clearPrivateSnapshots(); if (account) signOut(); else { showApp(); refresh(); }
+                dialog.dismiss(); clearLocationCache(); TaskReminders.clear(this); getSharedPreferences("meeting_edit_drafts", MODE_PRIVATE).edit().clear().apply(); clearPrivateSnapshots(); if (account) signOut(); else { showApp(); refresh(); }
             });
         }); }); dialog.show();
     }
@@ -2169,7 +2176,7 @@ public final class MainActivity extends Activity {
                 if (authError != null || !(e instanceof ApiClient.ApiException) || ((ApiClient.ApiException) e).status != 409) showError(lastNotice); } }); }
         });
     }
-    private void signOut() { TaskReminders.clear(this); getSharedPreferences("meeting_edit_drafts", MODE_PRIVATE).edit().clear().apply(); clearVoicePreparation(); preparationAttemptAt = -60000; if (quickFeedback != null) quickFeedback.stop(); chatDraft = ""; stopLockScreenSession(); cancelSession(""); clearPrivateSnapshots(); api.vault.clear(); syncHeadsetControls(); state = new JSONObject(); lastNotice = ""; showAuth(0); }
+    private void signOut() { TaskReminders.clear(this); getSharedPreferences("meeting_edit_drafts", MODE_PRIVATE).edit().clear().apply(); clearVoicePreparation(); preparationAttemptAt = -60000; if (quickFeedback != null) quickFeedback.stop(); chatDraft = ""; stopLockScreenSession(); cancelSession(""); clearPrivateSnapshots(); api.vault.clear(); clearLocationCache(); syncHeadsetControls(); state = new JSONObject(); lastNotice = ""; showAuth(0); }
     private boolean canAct() { if (busy || session != null || locationListener != null) { feedback("上一项操作正在进行，请稍候", LocalCue.BUSY); return false; } return true; }
 
     private boolean lockScreenEnabled() { return voiceService != null && voiceService.enabled(); }
@@ -2443,7 +2450,7 @@ public final class MainActivity extends Activity {
         };
         AudioMode input = development.audioMode();
         session = new HostedSession(this, api, AudioMode.RISE_SDK,
-            new VendorCaptureSource(headset, !operationCue, !operationCue && listenMode == VoiceInteraction.NOTES), headset::matchesOutput, listener);
+            new VendorCaptureSource(headset, !operationCue, !operationCue && listenMode == VoiceInteraction.NOTES), headset::matchesOutput, listener).locationForeground(() -> visible);
         if (lockScreenEnabled()) voiceService.own(session);
         if (voiceButton != null) voiceButton.setText(operationCue ? "正在播放操作提示…" : "正在准备…"); if (cancelButton != null) cancelButton.setVisibility(View.VISIBLE); updateStatus();
     }
@@ -2717,7 +2724,7 @@ public final class MainActivity extends Activity {
                     return;
                 }
                 chatDraft = ""; if (chatInput != null) chatInput.setText("");
-                clearPrivateSnapshots(); connectBackend(); state = new JSONObject(); tab = 0; lastNotice = "";
+                clearLocationCache(); clearPrivateSnapshots(); connectBackend(); state = new JSONObject(); tab = 0; lastNotice = "";
                 diagnosticInput = "尚未录音"; diagnosticOutput = "尚未播放"; diagnosticRequest = "尚未请求"; diagnosticSession = "尚未开始"; diagnosticStage = "空闲"; diagnosticError = "无"; diagnosticRms = 0; diagnosticBytes = 0;
                 if (api.vault.token().isEmpty()) showAuth(0); else { showApp(); refresh(); }
             }).show();

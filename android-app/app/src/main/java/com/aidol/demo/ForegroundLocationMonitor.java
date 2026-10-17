@@ -71,6 +71,7 @@ final class ForegroundLocationMonitor implements AutoCloseable {
             @Override public void onLocationChanged(Location location) {
                 if (fix != this || !current(client, token, current) || !usable(location)) return;
                 clearFix();
+                MeetingLocationCache.remember(context, client, token, location);
                 listener.status("定位：正在记录");
                 try {
                     long age = SystemClock.elapsedRealtimeNanos() - location.getElapsedRealtimeNanos();

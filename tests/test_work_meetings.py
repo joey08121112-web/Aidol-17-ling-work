@@ -878,3 +878,42 @@ def test_call_boundaries_are_ordered_idempotent_and_independent_of_manual_pause(
     assert [e['kind'] for e in detail['events']] == ['call_start', 'pause', 'call_end', 'resume', 'call_start', 'call_end']
     assert client.post(url, json=event('call_start', 500)).status_code == 409
     assert client.post('/v1/work-meetings/' + uuid4().hex + '/events', json=event('call_start')).status_code == 404
+
+
+@pytest.mark.parametrize('cached', [False, True])
+def test_observed_location_metadata_survives_address_summary_and_export(work, config, monkeypatch, cached):
+    from datetime import datetime, timezone, timedelta
+    client, runtime, _, _ = work
+    config.amap_key = 'offline-only'
+    async def reverse(self, location):
+        return {'available': True, 'address': '测试会议地点'}
+    monkeypatch.setattr('app.services.maps.MapService.reverse', reverse)
+    observed = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    meeting_id = uuid4().hex
+    point = {'longitude': 116.4, 'latitude': 39.9, 'accuracy': 30, 'source': 'gps',
+             'cached': cached, 'observed_at': observed}
+    response = client.post('/v1/work-meetings', json={'meeting_id': meeting_id, 'location': point})
+    assert response.status_code == 200, response.text
+    assert upload(client, meeting_id).status_code == 200
+    finish(client, meeting_id)
+    saved = client.get('/v1/work-meetings/' + meeting_id).json()
+    for location in [saved['location'], saved['report']['location'],
+                     client.get('/v1/state').json()['work_meetings'][0]['location'],
+                     client.get('/v1/export').json()['work_meetings'][0]['location']]:
+        assert location['cached'] is cached
+        assert location['observed_at'] == observed
+        assert location['address'] == '测试会议地点'
+    assert runtime.store.work_meeting(meeting_id)['location'] == saved['location']
+
+
+@pytest.mark.parametrize('extra', [
+    {'cached': True}, {'cached': 'true', 'observed_at': '2026-10-18T01:00:00Z'},
+    {'cached': True, 'observed_at': '2026-10-18T01:00:00'},
+    {'cached': True, 'observed_at': '2099-01-01T01:00:00Z'},
+])
+def test_invalid_meeting_cache_metadata_is_rejected(work, extra):
+    client, runtime, _, _ = work
+    response = client.post('/v1/work-meetings', json={'meeting_id': uuid4().hex,
+        'location': {'longitude': 116.4, 'latitude': 39.9, **extra}})
+    assert response.status_code == 422
+    assert not runtime.store.work_meetings()

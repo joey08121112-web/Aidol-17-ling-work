@@ -45,7 +45,8 @@ async def test_background_enrichment_updates_existing_report_and_is_not_repeated
 @pytest.mark.asyncio
 async def test_provider_failure_keeps_coordinates_and_throttles_poll_retries(config, store, monkeypatch):
     config.amap_key = 'offline-only'
-    meeting = store.start_work_meeting(uuid4().hex, location=POINT)
+    point = {**POINT, 'cached': True, 'observed_at': '2026-10-18T01:00:00+00:00'}
+    meeting = store.start_work_meeting(uuid4().hex, location=point)
     calls = []
 
     async def reverse(self, point):
@@ -62,12 +63,14 @@ async def test_provider_failure_keeps_coordinates_and_throttles_poll_retries(con
     resolver, background = MeetingAddresses(config, clock=lambda: stamp[0], sleep=advance), BackgroundTasks()
     resolver.schedule(background, store, [meeting])
     await background()
-    assert store.work_meeting(meeting['id'])['location'] == POINT
+    assert store.work_meeting(meeting['id'])['location'] == point
     retry = BackgroundTasks()
     resolver.schedule(retry, store, [meeting])
     assert not retry.tasks and len(calls) == 1
     await asyncio.gather(*list(resolver.tasks))
     assert store.work_meeting(meeting['id'])['location']['address'] == '重试后的地址'
+    assert store.work_meeting(meeting['id'])['location']['observed_at'] == point['observed_at']
+    assert store.work_meeting(meeting['id'])['location']['cached'] is True
     assert delays == [30]
     assert store.work_meeting(meeting['id'])['address_attempts'] == 2
 

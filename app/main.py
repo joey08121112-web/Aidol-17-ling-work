@@ -120,10 +120,27 @@ def create_hosted_app(config=None, data_directory=None):
         request_id: str = Field(pattern=r'^[a-zA-Z0-9-]{16,64}$')
         interaction_source: str = Field(default='ambient_capture', pattern=r'^(direct_question|ambient_capture|continuous_call)$')
 
+    class MeetingLocationInput(LocationInput):
+        observed_at: datetime | None = None
+        cached: bool = Field(default=False, strict=True)
+
+        @field_validator('observed_at')
+        @classmethod
+        def aware_observation(cls, value):
+            if value is not None and (value.tzinfo is None or (value - datetime.now(timezone.utc)).total_seconds() > 120):
+                raise ValueError('定位获取时间需包含时区且不能晚于当前时间')
+            return value
+
+        @model_validator(mode='after')
+        def cached_time(self):
+            if self.cached and self.observed_at is None:
+                raise ValueError('缓存定位需包含实际获取时间')
+            return self
+
     class WorkMeetingStart(BaseModel):
         meeting_id: str = Field(pattern=r'^[a-zA-Z0-9-]{16,64}$')
         started_at: datetime | None = None
-        location: LocationInput | None = None
+        location: MeetingLocationInput | None = None
         whole_audio: bool = False
 
         @field_validator('started_at')
@@ -1062,7 +1079,9 @@ def create_hosted_app(config=None, data_directory=None):
             existing = rt.store.work_meeting(value.meeting_id)
             if existing and bool(existing['whole_audio']) != value.whole_audio:
                 raise HTTPException(409, '会议录音方式不一致，请开始新的会议')
-            location = value.location.model_dump() if value.location else {}
+            location = value.location.model_dump(exclude={'observed_at', 'cached'}) if value.location else {}
+            if value.location and value.location.observed_at is not None:
+                location.update(observed_at=value.location.observed_at.isoformat(), cached=value.location.cached)
             try:
                 meeting = rt.store.start_work_meeting(value.meeting_id,
                     value.started_at.isoformat() if value.started_at else None,

@@ -240,3 +240,8 @@ adb -s <serial> pull /sdcard/Android/data/com.aidol.app.review/files/visual-revi
 - 开始工作录音会建立持续通知与前台服务，需要通知权限；打开音乐播放器、接听界面或锁屏不会仅因 Activity 离开前台而结束录音。通知“停止会话”会排空并保存工作记录，工作录音自动申请的服务随本次录音完成而结束。定位仍仅在 App 前台每 180 秒更新，不新增定位弹窗或后台定位。
 
 真实来电自测：先戴好 Rise 并启动音乐，再在工作页开始会议；用另一部电话打进来，通过 Rise 接听，双方轮流说一条容易区分的测试句。确认来电等待状态、接通后的双方音频状态、实时字幕及保存后两句话都在原文中；挂断后继续说一句环境测试语，再结束保存。未接听/拒接、手机扬声器接听、手动暂停中来电和耳机断连也需检查。当前不会把逻辑模拟测试记为真实电话双向录音验收。
+## 2026-10-18 熄屏会议定位缓存
+
+`ForegroundLocationMonitor` 和手动定位在上传前写入 `MeetingLocationCache`，采用私有 SharedPreferences，按服务和登录会话隔离，保留实际获取时间；账号退出/清空/切换服务清理。`LocationSnapshot` 校验24小时有效期及200米精度。`HostedSession` 通过 Activity 可见状态及系统亮屏/锁定状态限制 `MeetingStartLocation`：前台可最多等待3秒新定位，后台只读App/系统缓存，缺失不阻塞录音。前台180秒刷新、无定位弹窗、地址失败30秒×3次重试均保留。
+
+会议快照追加 `observed_at/cached`，后端解析地址与生成报告保留元数据，页面与Markdown导出明确显示缓存获取时间。验收 runner 使用 `-PaidolLocationCacheReview` 构建，`LocationCacheInstrumentation` 的 `phase=seed/verify` 分两次进程运行；仅独立测试命名空间私有存储和公开测试坐标，不写用户会议，不调用真实地图或模型。实际结果见 acceptance.md。

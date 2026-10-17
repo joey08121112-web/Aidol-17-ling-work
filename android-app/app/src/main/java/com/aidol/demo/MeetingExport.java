@@ -29,7 +29,7 @@ final class MeetingExport {
         java.util.List<String> speakers = new java.util.ArrayList<>();
         for (String label : timeline.speakers()) speakers.add(SpeakerParagraphs.name(label));
         out.append("- 说话人：").append(speakers.isEmpty() ? "未区分" : String.join("、", speakers) + "（按声音自动区分，不代表真实身份）").append('\n');
-        out.append("- ").append(MeetingPlace.label(meeting)).append('\n');
+        out.append("- ").append(MeetingPlace.label(meeting, zone)).append('\n');
         out.append("- 原文句数：").append(timeline.sentences().size()).append("\n\n");
         if (report != null) {
             out.append("## 摘要\n\n").append(report.optString("summary")).append("\n\n");
