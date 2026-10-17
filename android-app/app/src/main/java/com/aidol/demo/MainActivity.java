@@ -206,6 +206,8 @@ public final class MainActivity extends Activity {
     private TextView workMeetingPlayerStatus;
     private final Runnable workMeetingPlaybackTick = this::tickMeetingPlayback;
     private long workMeetingReadGeneration;
+    private final java.util.HashSet<String> meetingChanges = new java.util.HashSet<>();
+    private android.app.Dialog meetingDeleteDialog;
     private final Runnable workMeetingPoll = this::pollWorkMeetings;
     private String lastBusinessRequestId = "", uncertainTurnId = "";
     private boolean turnHasResult;
@@ -523,7 +525,7 @@ public final class MainActivity extends Activity {
     private void conversationTranscript() {
         boolean live = session != null && sessionUsesCapture && "work".equals(mode());
         JSONArray meetings = array(state, "work_meetings");
-        JSONObject latest = meetings.length() > 0 ? meetings.optJSONObject(0) : null;
+        JSONObject latest = MeetingOrder.latest(meetings);
         boolean showLatest = !live && workCaptionSentences.isEmpty() && latest != null;
         TextView heading = label(page, "文字记录", 20, INK); heading.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         java.time.ZoneId zone = java.time.ZoneId.systemDefault();
@@ -545,11 +547,13 @@ public final class MainActivity extends Activity {
             else {
                 label(box, "正在加载最近一场会议的文字记录…", 13, MUTED);
                 ApiClient client = api;
+                long readGeneration = workMeetingReadGeneration;
                 worker.execute(() -> {
                     JSONObject detail = null;
                     try { detail = client.json("GET", "/v1/work-meetings/" + Uri.encode(latestId), null); } catch (Exception ignored) {}
                     JSONObject loaded = detail;
                     runOnUiThread(() -> {
+                        if (readGeneration != workMeetingReadGeneration) return;
                         if (loaded == null || client != api) { if (box.isAttachedToWindow()) { box.removeAllViews(); label(box, "文字记录暂未加载，下拉刷新或点下面查看。", 13, MUTED); } return; }
                         latestMeetingDetail = loaded;
                         if (box.isAttachedToWindow()) renderLatestMeeting(box, loaded);
@@ -870,9 +874,10 @@ public final class MainActivity extends Activity {
         lastRenderedMeetingList = workMeetingList; lastRenderedMeetingSnapshot = snapshot;
         if (taskBoard != null) taskBoard.refreshReminders();
         Runnable restoreTaskPosition = taskBoard == null ? () -> {} : taskBoard.preserveViewport();
+        ScrollView viewport = scroll; int previousY = viewport == null ? 0 : viewport.getScrollY();
         workMeetingList.removeAllViews();
         if (workMeetingSyncError) label(workMeetingList, "进度暂未同步，正在重试；下面显示上次确认的状态。", 12, MUTED);
-        JSONArray meetings = array(state, "work_meetings");
+        JSONArray meetings = MeetingOrder.sorted(array(state, "work_meetings"));
         if (meetings.length() == 0) {
             LinearLayout empty = card(workMeetingList);
             label(empty, "还没有会议记录", 15, INK);
@@ -881,8 +886,25 @@ public final class MainActivity extends Activity {
         for (int i = 0; i < meetings.length(); i++) {
             JSONObject meeting = meetings.optJSONObject(i); if (meeting == null) continue;
             LinearLayout item = card(workMeetingList);
+            android.view.ViewGroup.LayoutParams spacing = item.getLayoutParams(); workMeetingList.removeView(item);
+            SwipeTaskRow shell = new SwipeTaskRow(this, 88); shell.setTag(meeting.optString("id")); shell.setClipToOutline(true);
+            shell.setBackground(shape(0xfffff0f0, 20, 0xfff2d8dc)); workMeetingList.addView(shell, spacing);
+            TextView delete = EditorUi.button(this, "删除", false, () -> confirmDeleteWorkMeeting(meeting));
+            delete.setTextColor(0xffc34f5a); delete.setBackgroundColor(android.graphics.Color.TRANSPARENT);
+            delete.setContentDescription("删除会议：" + date(meeting.optString("started_at")));
+            shell.addView(delete, new android.widget.FrameLayout.LayoutParams(dp(88), -1, Gravity.END));
+            shell.addView(item, new android.widget.FrameLayout.LayoutParams(-1, -2)); shell.foreground(item);
             String title = meeting.isNull("title") ? "会议记录" : fallback(meeting.optString("title"), "会议记录");
-            label(item, title, 17, INK);
+            LinearLayout heading = row(); heading.setGravity(Gravity.TOP); item.addView(heading);
+            TextView name = label(heading, title, 17, INK); name.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
+            name.setPadding(0, dp(8), dp(10), 0);
+            MeetingBookmarkView bookmark = new MeetingBookmarkView(this, pinned(meeting), title);
+            heading.addView(bookmark, new LinearLayout.LayoutParams(dp(44), dp(44)));
+            bookmark.setEnabled(!meetingChanges.contains(meeting.optString("id")));
+            bookmark.setOnClickListener(v -> {
+                bookmark.animate().scaleX(.85f).scaleY(.85f).setDuration(90).withEndAction(() -> bookmark.animate().scaleX(1).scaleY(1).setDuration(160).start()).start();
+                changeWorkMeeting(meeting.optString("id"), json("pinned", !pinned(meeting)), bookmark, null);
+            });
             label(item, date(meeting.optString("started_at")) + " · 时长 " + TimeFormat.clock(meeting.optLong("duration_ms"))
                 + " · 已保存 " + meeting.optInt("transcript_count") + " 段原文", 11, MUTED);
             label(item, meetingPlace(meeting), 11, MUTED);
@@ -891,7 +913,68 @@ public final class MainActivity extends Activity {
             if (!summary.isEmpty()) label(item, summary.length() > 120 ? summary.substring(0, 120) + "…" : summary, 13, MUTED);
             button(item, "查看原文与纪要", false, () -> openWorkMeeting(meeting.optString("id")));
         }
-        restoreTaskPosition.run();
+        restoreWorkScroll(viewport, previousY); restoreTaskPosition.run();
+    }
+    private void restoreWorkScroll(ScrollView viewport, int y) {
+        if (viewport == null) return;
+        viewport.getViewTreeObserver().addOnPreDrawListener(new android.view.ViewTreeObserver.OnPreDrawListener() {
+            public boolean onPreDraw() {
+                if (viewport.getViewTreeObserver().isAlive()) viewport.getViewTreeObserver().removeOnPreDrawListener(this);
+                if (viewport == scroll) viewport.scrollTo(0, y); return true;
+            }
+        }); viewport.invalidate();
+    }
+    private void confirmDeleteWorkMeeting(JSONObject meeting) {
+        if (!canAct() || meetingDeleteDialog != null) return;
+        if ("recording".equals(meeting.optString("status"))) { lastNotice = "请先结束会议，再删除会议记录"; updateStatus(); return; }
+        LinearLayout body = EditorUi.column(this), footer = EditorUi.column(this);
+        body.addView(EditorUi.text(this, "将删除本场原文、录音、纪要和关联待办，无法撤销。单独保存的记忆会保留。", 14, INK));
+        TextView problem = EditorUi.text(this, "", 12, 0xffc34f5a); body.addView(problem);
+        android.app.Dialog dialog = EditorUi.dialog(this, "删除会议记录", body, footer); meetingDeleteDialog = dialog;
+        TextView remove = EditorUi.button(this, "删除会议", true, () -> {}); remove.setBackground(shape(0xffce4956, 16, 0xffce4956));
+        remove.setOnClickListener(v -> changeWorkMeeting(meeting.optString("id"), null, remove, problem)); footer.addView(remove);
+        footer.addView(EditorUi.button(this, "取消", false, dialog::dismiss));
+        dialog.setOnDismissListener(d -> { if (meetingDeleteDialog == dialog) meetingDeleteDialog = null; });
+        dialog.show(); dialog.getWindow().setLayout(getResources().getDisplayMetrics().widthPixels - dp(28), dp(330));
+    }
+    private void changeWorkMeeting(String id, JSONObject pin, View control, TextView problem) {
+        if (!canAct() || !meetingChanges.add(id)) return;
+        ApiClient client = api; String token = client.vault.token(); ++workMeetingReadGeneration;
+        android.app.Dialog pendingDialog = pin == null ? meetingDeleteDialog : null;
+        control.setEnabled(false); control.setAlpha(.55f);
+        worker.execute(() -> {
+            try {
+                JSONObject result = client.json(pin == null ? "DELETE" : "PATCH", "/v1/work-meetings/" + Uri.encode(id), pin);
+                runOnUiThread(() -> {
+                    meetingChanges.remove(id);
+                    if (isDestroyed() || api != client || !token.equals(client.vault.token())) return;
+                    ++workMeetingReadGeneration;
+                    if (pin == null) {
+                        if (meetingDeleteDialog == pendingDialog && pendingDialog != null) pendingDialog.dismiss();
+                        if (latestMeetingDetail != null && id.equals(latestMeetingDetail.optString("id"))) latestMeetingDetail = null;
+                        if (id.equals(openWorkMeetingId) && meetingPage != null) meetingPage.dismiss();
+                        if (id.equals(meetingPlayback.meetingId())) meetingPlayback.stop();
+                        if (id.equals(workCaptionMeetingId)) { workCaptionMeetingId = ""; workCaptionSentences.clear(); workCaptionPartial = ""; workCaptionStartedAt = ""; }
+                        android.content.SharedPreferences drafts = getSharedPreferences("meeting_edit_drafts", MODE_PRIVATE);
+                        android.content.SharedPreferences.Editor editor = drafts.edit(); String prefix = ActionTaskBoard.account(client) + ":" + id + ":";
+                        for (String key : drafts.getAll().keySet()) if (key.startsWith(prefix)) editor.remove(key); editor.apply();
+                        JSONArray removed = array(result, "deleted_task_ids");
+                        for (int i = 0; i < removed.length(); i++) TaskReminders.cancel(this, removed.optString(i));
+                        put(state, "tasks", array(result, "tasks")); put(state, "transcripts", array(result, "transcripts"));
+                        put(state, "meeting_report", result.opt("meeting_report")); renderHistoryReport();
+                        conversationFeed.clear(); lastTools = new JSONArray(); lastCitations = new JSONArray(); lastAnswer = ""; lastUser = ""; exportData = null;
+                    }
+                    put(state, "work_meetings", array(result, "meetings")); workMeetingSyncError = false;
+                    renderWorkMeetings(); lastNotice = ""; updateStatus();
+                });
+            } catch (Exception e) { runOnUiThread(() -> {
+                meetingChanges.remove(id);
+                if (isDestroyed() || api != client || !token.equals(client.vault.token())) return;
+                ++workMeetingReadGeneration; control.setEnabled(true); control.setAlpha(1);
+                String message = fallback(e.getMessage(), "操作未完成，请重试");
+                if (problem != null) problem.setText(message); else { lastNotice = message; updateStatus(); }
+            }); }
+        });
     }
     private void pollWorkMeetings() {
         if (!visible || tab != 2 || isDestroyed() || api.vault.token().isEmpty()) return;
@@ -2424,7 +2507,7 @@ public final class MainActivity extends Activity {
         else if (listenMode != VoiceInteraction.CALL && session != null && sessionUsesCapture) endVoice();
         stopLocation(); super.onPause();
     }
-    @Override protected void onDestroy() { if (workOptionsDialog != null) workOptionsDialog.dismiss(); if (taskBoard != null) taskBoard.close(); if (locationMonitor != null) locationMonitor.close(); if (statusPopup != null) statusPopup.dismiss(); handler.removeCallbacks(automaticHeadsetTick); if (quickFeedback != null) quickFeedback.close(); if (meetingPlayback != null) meetingPlayback.close(); handler.removeCallbacks(workMeetingPlaybackTick); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); super.onDestroy(); }
+    @Override protected void onDestroy() { if (meetingDeleteDialog != null) meetingDeleteDialog.dismiss(); if (workOptionsDialog != null) workOptionsDialog.dismiss(); if (taskBoard != null) taskBoard.close(); if (locationMonitor != null) locationMonitor.close(); if (statusPopup != null) statusPopup.dismiss(); handler.removeCallbacks(automaticHeadsetTick); if (quickFeedback != null) quickFeedback.close(); if (meetingPlayback != null) meetingPlayback.close(); handler.removeCallbacks(workMeetingPlaybackTick); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); super.onDestroy(); }
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent); setIntent(intent);
         if (intent.getBooleanExtra("open_work_tasks", false) && api != null && !api.vault.token().isEmpty()) switchTab(2);

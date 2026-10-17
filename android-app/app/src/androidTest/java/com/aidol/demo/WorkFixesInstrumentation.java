@@ -17,18 +17,25 @@ public final class WorkFixesInstrumentation extends Instrumentation {
     private MainActivity activity;
     private ApiClient api;
     private final List<String> created = new ArrayList<>();
+    private final List<String> createdMeetings = new ArrayList<>();
     private File output;
-    private boolean checkNotification = true, optionsOnly, editOnly;
-    @Override public void onCreate(Bundle arguments) { super.onCreate(arguments); editOnly = arguments != null && "true".equals(arguments.getString("task_edit_only")); optionsOnly = arguments != null && "true".equals(arguments.getString("work_options_only")); checkNotification = arguments == null || !"true".equals(arguments.getString("skip_reminder_wait")); start(); }
+    private boolean checkNotification = true, optionsOnly, editOnly, meetingsOnly;
+    @Override public void onCreate(Bundle arguments) { super.onCreate(arguments); meetingsOnly = arguments != null && "true".equals(arguments.getString("meeting_management_only")); editOnly = arguments != null && "true".equals(arguments.getString("task_edit_only")); optionsOnly = arguments != null && "true".equals(arguments.getString("work_options_only")); checkNotification = arguments == null || !"true".equals(arguments.getString("skip_reminder_wait")); start(); }
     @Override public void onStart() {
         Bundle result = new Bundle(); int outcome = Activity.RESULT_CANCELED;
         try {
             activity = (MainActivity) startActivitySync(new Intent(getTargetContext(), MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+            main(() -> activity.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON));
             SystemClock.sleep(1800); waitForIdleSync(); api = (ApiClient) field(activity, "api");
+            if (!getTargetContext().getSystemService(PowerManager.class).isInteractive() || getTargetContext().getSystemService(KeyguardManager.class).isKeyguardLocked()) throw new AssertionError("Unlock and wake the phone before physical gesture tests");
             if (!api.serverUrl.startsWith("http://127.0.0.1:") || api.vault.token().isEmpty()) throw new AssertionError("Requires a signed-in local USB development build");
             if (!getTargetContext().getSystemService(NotificationManager.class).areNotificationsEnabled()) throw new AssertionError("Enable notifications before reminder smoke test");
             output = new File(getTargetContext().getExternalFilesDir(null), "work-fixes"); output.mkdirs();
-            if (editOnly) {
+            if (meetingsOnly) {
+                reviewMeetingManagement();
+                result.putString("stream", "PASS: bookmark fills red, multiple pins sort newest first, unpin restores order, reread retains pins; true horizontal swipe reveals delete, cancel preserves meeting/scroll, confirmed DELETE removes only fixture and preserves page position through polling. No audio or model calls. Temporary meetings cleaned up.");
+                outcome = Activity.RESULT_OK;
+            } else if (editOnly) {
                 reviewTaskEditing();
                 result.putString("stream", "PASS: real swipe exposes edit/delete; same task editor prefills content, owner, deadline and lead; cancel preserves data; date/time and lead changes save through PUT without moving page or changing ID/status/order; " + (checkNotification ? "rescheduled alarm delivers edited content; " : "notification timing skipped in layout rerun; ") + "location callback is silent and Bluetooth popup remains. Temporary task removed.");
                 outcome = Activity.RESULT_OK;
@@ -37,7 +44,7 @@ public final class WorkFixesInstrumentation extends Instrumentation {
                 result.putString("stream", "PASS: rounded work pickers show current selection, highlight changes, confirm selection and preserve scrollY/header position on cancel and simulated save/report results. No server settings changed or AI requests made.");
                 finish(Activity.RESULT_OK, result); return;
             }
-            if (!editOnly) {
+            if (!editOnly && !meetingsOnly) {
             String id = UUID.randomUUID().toString(), text = "Aidol UI smoke " + id.substring(0, 6);
             api.json("POST", "/v1/tasks", new JSONObject().put("task_id", id).put("content", text).put("owner", "Test")
                 .put("due_at", Instant.now().plusSeconds(3620).toString()).put("reminder_hours", 1)); created.add(id);
@@ -107,9 +114,66 @@ public final class WorkFixesInstrumentation extends Instrumentation {
             }
         } catch (Throwable error) { result.putString("stream", "FAIL: " + android.util.Log.getStackTraceString(error)); }
         finally {
+            if (api != null) for (String id : createdMeetings) try { api.json("DELETE", "/v1/work-meetings/" + id, null); } catch (Exception ignored) {}
             if (api != null) for (String id : created) try { api.json("DELETE", "/v1/tasks/" + id, null); TaskReminders.cancel(getTargetContext(), id); } catch (Exception ignored) {}
         }
         finish(outcome, result);
+    }
+    private void reviewMeetingManagement() throws Exception {
+        JSONObject initial = api.json("GET", "/v1/state", null);
+        if (!"work".equals(initial.getJSONObject("settings").optString("mode"))) throw new AssertionError("Requires existing work mode; test does not change user settings");
+        for (int i = 0; i < 3; i++) {
+            String id = UUID.randomUUID().toString();
+            api.json("POST", "/v1/work-meetings", new JSONObject().put("meeting_id", id).put("started_at", Instant.now().minusSeconds(10 + i * 60).toString()));
+            createdMeetings.add(id);
+            api.json("POST", "/v1/work-meetings/" + id + "/finish", new JSONObject().put("segment_count", 0).put("complete", true));
+        }
+        String newest = createdMeetings.get(0), middle = createdMeetings.get(1), oldest = createdMeetings.get(2);
+        JSONObject state = api.json("GET", "/v1/state", null);
+        main(() -> { set(activity, "state", state); set(activity, "tab", 2); invoke(activity, "showApp"); }); SystemClock.sleep(400);
+        ScrollView scroll = (ScrollView) field(activity, "scroll");
+        placeInViewport(scroll, meetingRow(oldest)); int before = scroll.getScrollY();
+        main(() -> findType(meetingRow(oldest), MeetingBookmarkView.class).performClick()); awaitPin(oldest, true); SystemClock.sleep(400);
+        if (scroll != field(activity, "scroll") || scroll.getScrollY() != before) throw new AssertionError("Bookmark moved page");
+        main(() -> findType(meetingRow(middle), MeetingBookmarkView.class).performClick()); awaitPin(middle, true); SystemClock.sleep(400);
+        LinearLayout rows = (LinearLayout) field(activity, "workMeetingList");
+        if (!middle.equals(rows.getChildAt(0).getTag()) || !oldest.equals(rows.getChildAt(1).getTag())) throw new AssertionError("Multiple pinned meetings not sorted by time");
+        if (!findType(meetingRow(middle), MeetingBookmarkView.class).isSelected()) throw new AssertionError("Bookmark not filled");
+        placeInViewport(scroll, meetingRow(middle)); capture(activity.getWindow().getDecorView(), "09-meeting-bookmarks");
+        main(() -> findType(meetingRow(oldest), MeetingBookmarkView.class).performClick()); awaitPin(oldest, false); SystemClock.sleep(350);
+        if (!middle.equals(rows.getChildAt(0).getTag()) || !newest.equals(rows.getChildAt(1).getTag()) || findType(meetingRow(oldest), MeetingBookmarkView.class).isSelected()) throw new AssertionError("Unpin did not restore time order");
+        JSONObject reread = api.json("GET", "/v1/state", null);
+        main(() -> { set(activity, "state", reread); invoke(activity, "showApp"); }); SystemClock.sleep(300);
+        if (!findType(meetingRow(middle), MeetingBookmarkView.class).isSelected()) throw new AssertionError("Pin did not persist on reread");
+        ScrollView reopenedScroll = (ScrollView) field(activity, "scroll");
+        View row = meetingRow(newest); placeInViewport(reopenedScroll, row); int deleteY = reopenedScroll.getScrollY();
+        int[] at = new int[2]; row.getLocationOnScreen(at); float density = activity.getResources().getDisplayMetrics().density;
+        float x = at[0] + row.getWidth() - 20 * density, y = at[1] + row.getHeight() / 2f;
+        long down = SystemClock.uptimeMillis(); sendPointerSync(MotionEvent.obtain(down, down, MotionEvent.ACTION_DOWN, x, y, 0));
+        for (int i = 1; i <= 8; i++) { SystemClock.sleep(25); sendPointerSync(MotionEvent.obtain(down, SystemClock.uptimeMillis(), MotionEvent.ACTION_MOVE, x - i * 18 * density, y, 0)); }
+        sendPointerSync(MotionEvent.obtain(down, SystemClock.uptimeMillis(), MotionEvent.ACTION_UP, x - 144 * density, y, 0)); SystemClock.sleep(250);
+        FrameLayout shell = (FrameLayout) row;
+        if (Math.abs(shell.getChildAt(1).getTranslationX() + 88 * density) > 2) { capture(activity.getWindow().getDecorView(), "10-meeting-swipe-failed"); throw new AssertionError("Meeting swipe did not reveal delete: " + shell.getChildAt(1).getTranslationX()); }
+        capture(activity.getWindow().getDecorView(), "10-meeting-delete-swipe");
+        main(() -> shell.getChildAt(0).performClick()); SystemClock.sleep(250);
+        Dialog dialog = (Dialog) field(activity, "meetingDeleteDialog");
+        if (dialog == null) throw new AssertionError("Delete confirmation missing");
+        capture(dialog.getWindow().getDecorView(), "11-meeting-delete-confirm"); main(() -> find(dialog.getWindow().getDecorView(), "取消").performClick()); SystemClock.sleep(200);
+        api.json("GET", "/v1/work-meetings/" + newest, null);
+        if (reopenedScroll.getScrollY() != deleteY) throw new AssertionError("Cancel delete moved page");
+        main(() -> shell.getChildAt(0).performClick()); SystemClock.sleep(150);
+        Dialog confirmed = (Dialog) field(activity, "meetingDeleteDialog"); main(() -> find(confirmed.getWindow().getDecorView(), "删除会议").performClick());
+        for (int i = 0; i < 40 && meetingRow(newest) != null; i++) SystemClock.sleep(100);
+        SystemClock.sleep(3000);
+        if (meetingRow(newest) != null || reopenedScroll != field(activity, "scroll") || reopenedScroll.getScrollY() != deleteY) throw new AssertionError("Delete restored row or moved page");
+        JSONArray finalRows = api.json("GET", "/v1/work-meetings", null).getJSONArray("meetings");
+        for (int i = 0; i < finalRows.length(); i++) if (newest.equals(finalRows.getJSONObject(i).getString("id"))) throw new AssertionError("Deleted meeting still on server");
+        api.json("GET", "/v1/work-meetings/" + middle, null); api.json("GET", "/v1/work-meetings/" + oldest, null);
+    }
+    private View meetingRow(String id) throws Exception { return ((LinearLayout) field(activity, "workMeetingList")).findViewWithTag(id); }
+    private void awaitPin(String id, boolean expected) throws Exception {
+        for (int i = 0; i < 30; i++) { if (api.json("GET", "/v1/work-meetings/" + id, null).optBoolean("pinned") == expected) return; SystemClock.sleep(100); }
+        throw new AssertionError("Pin did not persist");
     }
     private void reviewTaskEditing() throws Exception {
         String id = UUID.randomUUID().toString(), text = "Aidol edit smoke " + id.substring(0, 6), changed = text + " updated";

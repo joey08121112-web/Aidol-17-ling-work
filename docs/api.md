@@ -6,16 +6,22 @@
 
 | 请求 | 契约 |
 | --- | --- |
-| `POST /v1/work-meetings` | `{"meeting_id":"客户端生成16–64位唯一编号"}`；工作模式下幂等建场，已结束编号不能复用。成功后才开启采音。 |
+| `POST /v1/work-meetings` | `{"meeting_id":"客户端生成16–64位唯一编号"}`；工作模式下幂等建场，已结束或已删除编号不能复用。成功后才开启采音。 |
 | `POST /v1/voice?request_id=…&meeting_id=…&segment_index=0&offset_ms=0` | PCM16/16kHz；`meeting_id` 与从0递增的 `segment_index` 必须同时提供，来源为 `ambient_capture`。`recognize=0` 表示该段文字已由实时字幕保存：只存录音，不做 ASR、不计额度。默认 `recognize=1` 时做整段识别，并删除起点落在该段内的实时字幕句子再写入识别结果（实时字幕中断时的兜底）。`offset_ms` 为该段在本场录音时间轴上的起点（只计已录 PCM，32 字节/毫秒，不含暂停）；旧客户端省略时按 `segment_index×20000`。只能与会议参数一起使用。每段独立 request_id；原文与场次关联在一个事务内提交。静音段保留无原文回执，不假装记录了文字。同一编号重试不重复 ASR 或原文，不同请求占用同一片段编号返回409。 |
 | `POST /v1/work-meetings/{id}/finish` | `{"segment_count":N,"complete":true}`；客户端排空后告知本场总片段数。核对0到N−1回执，完整且有文字才为 `saved`；无讲话为 `empty`，缺段／非正常结束为 `partial`。返回原文和后台整理状态；结束请求幂等，不再接受追加。异常中断可用 `complete:false` 收尾已保存部分。 |
-| `GET /v1/work-meetings` | `{"meetings":[…]}`；最近100场，含开始／结束时间、原文段数、标题、摘要和处理状态。只读 SQLite 快照不等待 ASR 账号锁。 |
+| `GET /v1/work-meetings` | `{"meetings":[…]}`；最多100场，置顶优先，同组按开始时间从新到旧（按实际时刻比较时区），同刻按ID稳定排序；含pinned、开始／结束时间、原文段数、标题、摘要和处理状态。只读 SQLite 快照不等待 ASR 账号锁。 |
 | `GET /v1/work-meetings/{id}` | 本场完整有序 `sources`（含 `offset_ms/duration_ms`）、`utterances`、`events`、`audio` 和 `report`；原文不按最近100条聊天裁剪。未知／其他账号编号返回404。列表另含 `duration_ms`。 |
 | `WS /v1/work-meetings/{id}/live?offset_ms=N` | 实时字幕（仅请求头 Bearer 鉴权）。会议须为录音中且工作模式，否则以 4409 关闭；每条连接计一次额度，不占账号锁。客户端发送已录 PCM 二进制帧（16 kHz 单声道 PCM16，单帧 ≤64000 字节；暂停期间不发），控制消息 `{"type":"pause"}` / `{"type":"resume","offset_ms":N}` / `{"type":"end"}`。服务端发送 `ready`、`partial {text,start_ms}`（仅显示、不保存）、`final {sentences:[{id,transcript_id,start_ms,end_ms,text,speaker}]}`（已保存到本场）、`paused`、`done`（收到 end 后保存完最后几句）、`error`（上游失败，随后关闭）。时间轴为 `offset_ms` 起累计的已录 PCM；暂停或单次上游满10分钟时结束当前识别并另起一段。字幕句子以 `segment_index=-1` 进入 `utterances`/`sources`，纪要可直接引用。 |
 | `POST /v1/work-meetings/{id}/events` | `{"event_id":"16–64位","kind":"pause|resume|mark","offset_ms":N,"origin":"app|headset"}`；仅录音中可写。同一 event_id 重试返回原记录，内容不同返回409；已暂停再暂停、未暂停时继续返回409。读 SQLite 快照写入，不等待片段 ASR 持有的账号锁。 |
 | `GET /v1/work-meetings/{id}/audio?start_ms=0&duration_ms=600000` | 返回本场录音时间轴 `[start_ms, start_ms+duration_ms)` 的 16 kHz 单声道 WAV，单次最多 10 分钟，裁到最后一段已存音频；缺失片段补静音。无录音、已过期或已删除返回404。 |
 | `DELETE /v1/work-meetings/{id}/audio` | 只删除本场录音文件，保留原文、句子与纪要；录音中返回409。返回会议详情。 |
+| `PATCH /v1/work-meetings/{id}` | `{pinned:true/false}`（严格布尔值）；返回`{meeting_id,pinned,meetings}`。重复设置幂等，未找到/跨账号404；不改原开始时间、状态或纪要。 |
+| `DELETE /v1/work-meetings/{id}` | 删除已结束会议；录音中409，未知/跨账号404。成功返回`{ok,deleted_task_ids,meetings,meeting_report,tasks,transcripts}`，后四项为删除后的当前账号快照；同账号已删除ID重复请求返回相同删除回执，不恢复会议。 |
 | `POST /v1/work-meetings/{id}/retry-summary` | 只重新处理已保存的文字，不重新 ASR 或上传音频；并发轮询不重复启动后台任务。替换同场旧纪要和待办，保留相同待办的完成状态。 |
+
+2026-10-18 会议管理：列表/详情/导出增加`pinned`布尔值，旧库无损增加默认0字段。Android在每条标题右上角提供书签，未置顶为空心，置顶后红色实心；多条置顶按会议开始时间降序排列，取消回到普通时间组。点击有短缩放反馈，列表原地重排并保留scrollY；对话页的最近会议独立按时间选取，不受书签排序影响。会议卡片整面可左滑露出删除，确认窗说明删除范围、确认后才提交；取消/失败不移除行，失败可重试，过期轮询不得覆盖修改结果。
+
+删除事务清理本场原文、句子、事件、上传记录、纪要和引用本场原文的关联行动项（含已编辑行动项），随后清理本场录音目录；引用被删原文的历史整理快照失效，其未引用被删来源的行动项独立保留。单独保存的记忆、独立对话及其他会议保留；曾返回原文的请求缓存失效，防止迟到重放旧原文。Android取消被删行动项提醒、清理该会议本地编辑稿/详情缓存并更新历史整理结果。删除回执只保存会议ID与关联任务ID，防止迟到建场重建；迟到ASR/AI/地址结果无法恢复已删会议。全量清空同时清除此回执表。正在录音的会议先结束；录音已中断时可从原详情入口结束已上传部分再删除。
 
 `status` 是原文保存状态：`recording/saved/partial/empty`；`summary_status` 为 `waiting/pending/ready/fallback/failed/unavailable`。`summary_stage` 为 `waiting/queued/analyzing/synthesizing/done`，`processed_sections/total_sections` 是实际完成的分析组数，不伪造百分比。Android 在本机停止至上传排空间显示“正在转写并保存”。网络失败保留上次确认状态并提示同步重试；后端重启后，读取列表／详情／state 会恢复持久化的 pending 任务。
 

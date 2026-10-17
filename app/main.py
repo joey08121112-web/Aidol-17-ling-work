@@ -138,6 +138,9 @@ def create_hosted_app(config=None, data_directory=None):
         base_report_id: str = Field(min_length=1, max_length=64)
         document: dict
 
+    class MeetingPin(BaseModel):
+        pinned: bool = Field(strict=True)
+
     class CustomTask(BaseModel):
         task_id: str = Field(pattern=r'^[a-zA-Z0-9-]{16,64}$')
         content: str = Field(min_length=1, max_length=500)
@@ -1060,9 +1063,12 @@ def create_hosted_app(config=None, data_directory=None):
             if existing and bool(existing['whole_audio']) != value.whole_audio:
                 raise HTTPException(409, '会议录音方式不一致，请开始新的会议')
             location = value.location.model_dump() if value.location else {}
-            meeting = rt.store.start_work_meeting(value.meeting_id,
-                value.started_at.isoformat() if value.started_at else None,
-                location, value.whole_audio)
+            try:
+                meeting = rt.store.start_work_meeting(value.meeting_id,
+                    value.started_at.isoformat() if value.started_at else None,
+                    location, value.whole_audio)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from None
             if meeting['status'] != 'recording':
                 raise HTTPException(409, '这场会议已结束，请开始新的会议')
             meeting_addresses.schedule(background, rt.store, [meeting])
@@ -1110,6 +1116,26 @@ def create_hosted_app(config=None, data_directory=None):
         resume_work_summaries(background, current, [meeting])
         meeting_addresses.schedule(background, store, [meeting])
         return meeting
+
+    @api.patch('/v1/work-meetings/{meeting_id}')
+    async def pin_work_meeting(meeting_id: str, value: MeetingPin, request: Request, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            if not rt.store.pin_work_meeting(meeting_id, value.pinned):
+                raise HTTPException(404, '会议记录不存在')
+            return {'meeting_id': meeting_id, 'pinned': value.pinned, 'meetings': rt.store.work_meetings()}
+
+    @api.delete('/v1/work-meetings/{meeting_id}')
+    async def delete_work_meeting(meeting_id: str, request: Request, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            try:
+                removed = rt.store.delete_work_meeting(meeting_id)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from None
+            if removed is None:
+                raise HTTPException(404, '会议记录不存在')
+            return {'ok': True, 'deleted_task_ids': removed, 'meetings': rt.store.work_meetings(),
+                    'meeting_report': rt.store.meeting_report(), 'tasks': rt.store.list('action_tasks', 10000),
+                    'transcripts': list(reversed(rt.store.list('transcripts', 100)))}
 
     @api.post('/v1/work-meetings/{meeting_id}/events')
     async def work_meeting_event(meeting_id: str, value: WorkMeetingEvent, current=Depends(user)):
