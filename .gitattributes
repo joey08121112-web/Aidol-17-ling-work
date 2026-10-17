@@ -1,5 +1,6 @@
 # Shell entry points must stay executable with Unix line endings on macOS/Linux.
 *.sh text eol=lf
+*.conf text eol=lf
 *.command text eol=lf
 *.bat text eol=crlf
 *.ps1 text eol=crlf
