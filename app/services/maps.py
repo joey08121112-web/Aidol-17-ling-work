@@ -4,6 +4,7 @@ Transit responses are route plans and scheduled service information, never live
 vehicle telemetry. Missing configuration/results are explicit and are not mocked.
 """
 import math
+from datetime import datetime, timezone
 
 import httpx
 
@@ -48,6 +49,7 @@ class MapService:
                  "transit": "公共交通线路规划与计划时刻；不代表车辆实时位置或实际到站时间"}
         result = {"available": True, "source": "amap_" + transport, "transport": transport,
                   "eta_seconds": duration, "distance_meters": distance,
+                  "fetched_at": datetime.now(timezone.utc).isoformat(),
                   "destination": settings.destination_name, "note": notes[transport]}
         if transport == "transit":
             result.update({"scheduled": True, "steps": self._transit_steps(selected),

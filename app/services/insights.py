@@ -37,11 +37,16 @@ def _timestamp(record):
         return 0
 
 
-def _select(transcripts):
-    valid = [row for row in transcripts if isinstance(row, dict)
+def _valid_records(transcripts):
+    return [row for row in transcripts if isinstance(row, dict)
              and row.get("mode") == "work"
+             and row.get("speaker") != "assistant"
              and isinstance(row.get("id"), str) and 0 < len(row["id"]) <= 128
              and isinstance(row.get("text"), str) and row["text"].strip()]
+
+
+def _select(transcripts):
+    valid = _valid_records(transcripts)
     chosen, seen, remaining = [], set(), MAX_TEXT_CHARS
     for row in sorted(valid, key=_timestamp, reverse=True):
         if row["id"] in seen:
@@ -57,6 +62,30 @@ def _select(transcripts):
         if len(chosen) == MAX_RECORDS or remaining == 0:
             break
     return list(reversed(chosen))
+
+
+def meeting_coverage(transcripts, source_ids, *, earlier_records_omitted=False):
+    """Describe evidence actually summarized without claiming continuous capture.
+
+    Call with the complete requested time window, before applying model budgets.
+    If the storage query itself was capped, explicitly flag that omission.
+    """
+    available = {row["id"]: row for row in _valid_records(transcripts)}
+    selected_ids = set(source_ids)
+    selected = [row for row in _select(transcripts) if row["id"] in selected_ids]
+    truncated = [row["id"] for row in selected
+                 if len(row["text"]) < len(available[row["id"]]["text"].strip())]
+    omitted = len(available) - len(selected)
+    partial = bool(omitted or truncated or earlier_records_omitted)
+    return {"available_records": len(available), "summarized_records": len(selected),
+            "omitted_records": omitted, "truncated_source_ids": truncated,
+            "earlier_records_omitted": earlier_records_omitted, "partial": partial,
+            "first_record_at": selected[0]["created_at"] if selected else None,
+            "last_record_at": selected[-1]["created_at"] if selected else None,
+            "continuous_capture_verified": False,
+            "note": ("本纪要仅使用部分已保存记录，存在未纳入或截短的片段。" if partial
+                     else "本纪要使用本次提供的已保存记录。")
+                    + "记录时间范围不代表持续采集；无法据此确认期间没有缺段。"}
 
 
 def _string(value, limit, *, empty=False):
@@ -122,6 +151,10 @@ def _validate(parsed, records):
 def _rules(records):
     decisions, tasks = [], []
     for row in records:
+        # Sentence splitting must not turn a later sentence inside a quotation
+        # into the wearer's first-person commitment.
+        if re.search(r'[“”"‘’]', row["text"]):
+            continue
         for sentence in re.findall(r"[^。！？!?\n]+[。！？!?]?", row["text"]):
             if sentence.endswith(("?", "？")):
                 continue

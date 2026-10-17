@@ -1,6 +1,8 @@
-"""Bounded local retrieval and evidence-only answers; no external knowledge search."""
+"""Rank indexed history candidates and answer using exact source evidence."""
 import json
 import re
+
+from .memory import is_non_assertion
 
 import httpx
 
@@ -30,7 +32,7 @@ class RecallService:
 
     The LLM selects exact quotes rather than writing unconstrained factual prose.
     Completion state is not inferred from a remembered promise. Caller should load
-    recent bounded collections from Store and handle ValueError as HTTP 422.
+    indexed candidates from Store and handle ValueError as HTTP 422.
     """
 
     def __init__(self, config):
@@ -42,13 +44,17 @@ class RecallService:
         intents = {kind for kind, (pattern, _) in _INTENTS.items() if re.search(pattern, question)}
         pending_only = bool(_PENDING.search(question))
         candidates, seen = [], set()
+        represented = {row.get("source", "").split(":", 1)[1] for row in memories
+                       if isinstance(row, dict) and row.get("source", "").startswith(("transcript:", "demo_transcript:"))}
         for kind, rows in (("memory", memories), ("transcript", transcripts)):
-            for row in rows[:500]:
+            for row in rows:
                 if not isinstance(row, dict):
                     continue
                 row_id = row.get("id")
                 text = row.get("content" if kind == "memory" else "text")
                 if not isinstance(row_id, str) or not row_id or len(row_id) > 128 or not isinstance(text, str) or not text.strip():
+                    continue
+                if kind == "transcript" and (row_id in represented or is_non_assertion(text, row.get("speaker", ""))):
                     continue
                 if pending_only and not (kind == "memory" and row.get("source") == "action_task"
                                          and re.search(r"完成状态[：:]\s*未完成(?:[；;。\s]|$)", text)):
@@ -57,7 +63,7 @@ class RecallService:
                 if ref in seen:
                     continue
                 seen.add(ref)
-                text = text[:2000].strip()
+                text = text.strip()
                 overlap = len(tokens & _tokens(text))
                 semantic = 0
                 for intent in intents:

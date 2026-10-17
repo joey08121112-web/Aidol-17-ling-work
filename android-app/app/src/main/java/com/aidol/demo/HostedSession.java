@@ -59,6 +59,7 @@ public final class HostedSession {
     private Thread worker;
     private long lastMeter;
     private int recordSeconds = 60;
+    private String interactionSource = "direct_question";
     private boolean autoEnd, heardSpeech;
     private double voiceThreshold = .025;
     private long voicedBytes, silenceBytes;
@@ -96,6 +97,12 @@ public final class HostedSession {
         autoEnd = vad; voiceThreshold = Math.max(.005, Math.min(.2, threshold)); return this;
     }
     public String sessionId() { return sessionId; }
+    boolean usesSystemCommunicationRoute() { return mode == AudioMode.BLUETOOTH && captureActive; }
+    public HostedSession interactionSource(boolean directQuestion) {
+        if (launched.get()) throw new IllegalStateException("会话已开始");
+        interactionSource = directQuestion ? "direct_question" : "ambient_capture";
+        return this;
+    }
     public String requestId() { return requestId; }
     public String phase() { return turn.phase().name(); }
     public String diagnostics() {
@@ -146,11 +153,12 @@ public final class HostedSession {
                 });
                 if (pcm.length < 3200) throw new IOException("录音太短，请重新录音");
                 status("正在识别并整理回复…"); diagnostic("上传 bytes=" + pcm.length);
-                result = new JSONObject(new String(request("/v1/voice?request_id=" + requestId,
+                result = new JSONObject(new String(request("/v1/voice?request_id=" + requestId + "&interaction_source=" + interactionSource,
                     pcm, "audio/pcm"), StandardCharsets.UTF_8));
             } else {
                 status("正在思考…");
                 result = new JSONObject(new String(request("/v1/chat", new JSONObject().put("text", text)
+                    .put("interaction_source", interactionSource)
                     .put("request_id", requestId).toString().getBytes(StandardCharsets.UTF_8), "application/json"), StandardCharsets.UTF_8));
             }
             check(); diagnostic("业务响应"); post(() -> listener.result(result));

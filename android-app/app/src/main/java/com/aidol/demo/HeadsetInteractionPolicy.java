@@ -5,10 +5,10 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
-/** Foreground gesture decisions only. No SDK, microphone, network or Android dependencies. */
+/** Gesture decisions within a visible or explicitly enabled foreground-service session. */
 final class HeadsetInteractionPolicy {
     enum Gesture { TOGGLE, NEXT_MODE, CANCEL, DISCARD_COMBINATION, IGNORE }
-    enum Action { START, STOP_AND_SEND, CANCEL, CHANGE_MODE }
+    enum Action { START, STOP_AND_SEND, CANCEL, CHANGE_MODE, DEFER_MODE }
     static final long GESTURE_SETTLE_MS = 400;
     private static final long DEBOUNCE_MS = 800, MAX_EVENT_AGE_MS = 1500;
 
@@ -102,8 +102,7 @@ final class HeadsetInteractionPolicy {
         clearPending();
         if (!context.enabled() || context.busy || generation != context.sessionGeneration) return Decision.none();
         if (intended == Action.CHANGE_MODE) {
-            if (context.active && !context.recording) return new Decision(null, "本轮正在处理，请结束后再切换模式");
-            // UI recording state may lag a VAD stop; the session owns the atomic cancel decision.
+            if (context.active) return new Decision(intendedMode, "本轮结束后切换模式；当前录音会保留", Action.DEFER_MODE);
             return new Decision(intendedMode, "", Action.CHANGE_MODE);
         }
         if (intended == Action.STOP_AND_SEND) return context.active && context.recording
@@ -120,7 +119,6 @@ final class HeadsetInteractionPolicy {
         List<String> notices = new ArrayList<>();
         String stop = null;
         boolean bothOut = Boolean.FALSE.equals(device.leftWorn) && Boolean.FALSE.equals(device.rightWorn);
-        boolean removed = previous != null && (Boolean.TRUE.equals(previous.leftWorn) || Boolean.TRUE.equals(previous.rightWorn)) && bothOut;
         boolean previouslyBothOut = previous != null && Boolean.FALSE.equals(previous.leftWorn) && Boolean.FALSE.equals(previous.rightWorn);
         if (previous != null && previous.ready && !device.ready) {
             clearPending();
@@ -128,7 +126,7 @@ final class HeadsetInteractionPolicy {
         } else if (device.inCall && (previous == null || !previous.inCall)) {
             clearPending();
             if (active) stop = "检测到来电或通话，本轮已暂停；通话结束后请手动开始";
-        } else if (device.ready && removed) {
+        } else if (device.ready && bothOut && active) {
             clearPending();
             if (active) stop = "检测到耳机摘下，本轮已暂停；重新佩戴后请手动开始";
             else notices.add("耳机已摘下；重新佩戴后请手动开始");

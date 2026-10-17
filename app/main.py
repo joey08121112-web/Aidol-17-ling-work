@@ -16,7 +16,7 @@ from .config import Config
 from .domain import Settings, LocationInput, MemoryInput, SpeechInput, NearbyInput
 from .domain import MeetingRequest, RecallRequest, TaskStatusInput, MemoryUpdate
 from .providers.volc_speech import VolcSpeechProvider, SpeechProviderError
-from .services.insights import MeetingInsights
+from .services.insights import MeetingInsights, meeting_coverage
 from .services.recall import RecallService
 
 
@@ -30,7 +30,7 @@ def create_hosted_app(config=None, data_directory=None):
     from fastapi.exceptions import RequestValidationError
     from pydantic import BaseModel, Field, field_validator
     from starlette.concurrency import run_in_threadpool
-    from .storage import AccountStore
+    from .storage import AccountStore, Store
     from .services.accounts import digest, password_hash, password_matches, DUMMY_PASSWORD
     from .services.mobile import MobileRuntimes
 
@@ -89,6 +89,7 @@ def create_hosted_app(config=None, data_directory=None):
     class Turn(BaseModel):
         text: str = Field(min_length=1, max_length=6000)
         request_id: str = Field(pattern=r'^[a-zA-Z0-9-]{16,64}$')
+        interaction_source: str = Field(default='ambient_capture', pattern=r'^(direct_question|ambient_capture)$')
 
     @api.exception_handler(RequestValidationError)
     async def invalid(request, error):
@@ -261,11 +262,11 @@ def create_hosted_app(config=None, data_directory=None):
             await rt.agent.decide()
             return value
 
-    async def process(rt, current, request_id, fingerprint, text=None, pcm=None):
+    async def process(rt, current, request_id, fingerprint, text=None, pcm=None, interaction_source='ambient_capture'):
         with measured(request_id, 'turn'):
-            return await process_turn(rt, current, request_id, fingerprint, text=text, pcm=pcm)
+            return await process_turn(rt, current, request_id, fingerprint, text=text, pcm=pcm, interaction_source=interaction_source)
 
-    async def process_turn(rt, current, request_id, fingerprint, text=None, pcm=None):
+    async def process_turn(rt, current, request_id, fingerprint, text=None, pcm=None, interaction_source='ambient_capture'):
         try:
             cached = rt.store.mobile_turn(request_id, fingerprint, reserve=False)
         except ValueError as exc:
@@ -291,13 +292,25 @@ def create_hosted_app(config=None, data_directory=None):
                             if result.text:
                                 text = result.text
                 except (SpeechProviderError, TimeoutError):
+                    rt.store.fail_mobile_turn(request_id)
                     raise HTTPException(502, '识别暂不可用，请稍后重试')
+                except BaseException:
+                    rt.store.fail_mobile_turn(request_id)
+                    raise
             if not text.strip():
                 result = {'text': '', 'response': '没有听清，请靠近麦克风再试一次', 'speak': False}
                 rt.store.finish_mobile_turn(request_id, result)
                 return result
-        with measured(request_id, 'business'):
-            result = await rt.turn(text[:6000], 'asr' if pcm is not None else 'text')
+        rt.store.mobile_turn_stage(request_id, 'business')
+        try:
+            with measured(request_id, 'business'):
+                if interaction_source == 'ambient_capture':
+                    result = await rt.turn(text[:6000], 'asr' if pcm is not None else 'text')
+                else:
+                    result = await rt.turn(text[:6000], 'asr' if pcm is not None else 'text', interaction_source)
+        except BaseException:
+            rt.store.fail_mobile_turn(request_id)
+            raise
         rt.store.finish_mobile_turn(request_id, result)
         return result
 
@@ -306,10 +319,12 @@ def create_hosted_app(config=None, data_directory=None):
         if not value.text.strip():
             raise HTTPException(422, '请输入内容')
         async with runtime(current, request) as rt:
-            return await process(rt, current, value.request_id, 'text:' + digest(value.text), text=value.text)
+            fingerprint = 'text:' + digest(value.text) + (':direct_question' if value.interaction_source == 'direct_question' else '')
+            return await process(rt, current, value.request_id, fingerprint, text=value.text, interaction_source=value.interaction_source)
 
     @api.post('/v1/voice')
-    async def mobile_voice(request: Request, request_id: str = Query(pattern=r'^[a-zA-Z0-9-]{16,64}$'), current=Depends(user)):
+    async def mobile_voice(request: Request, request_id: str = Query(pattern=r'^[a-zA-Z0-9-]{16,64}$'),
+                           interaction_source: str = Query(default='ambient_capture', pattern=r'^(direct_question|ambient_capture)$'), current=Depends(user)):
         if not config.speech.asr_ready:
             raise HTTPException(503, '服务器尚未配置语音识别')
         if request.headers.get('content-type', '').split(';')[0] != 'audio/pcm':
@@ -318,7 +333,24 @@ def create_hosted_app(config=None, data_directory=None):
         if len(pcm) < 3200 or len(pcm) % 2:
             raise HTTPException(422, '录音太短或不完整，请重新录音')
         async with runtime(current, request) as rt:
-            return await process(rt, current, request_id, 'pcm:' + hashlib.sha256(pcm).hexdigest(), pcm=pcm)
+            fingerprint = 'pcm:' + hashlib.sha256(pcm).hexdigest() + (':direct_question' if interaction_source == 'direct_question' else '')
+            return await process(rt, current, request_id, fingerprint, pcm=pcm, interaction_source=interaction_source)
+
+    @api.get('/v1/turns/{request_id}')
+    async def mobile_turn_status(request_id: str, request: Request, current=Depends(user)):
+        # Read-only recovery remains available during a long ASR/model operation.
+        # The path comes from the authenticated UUID, never from a supplied path.
+        rt = runtimes.items.get(current['id'])
+        path = directory / 'users' / (current['id'] + '.sqlite3')
+        if rt is None and not path.exists():
+            raise HTTPException(404, '请求不存在')
+        store = rt.store if rt else Store(str(path))
+        result = store.mobile_turn_status(request_id)
+        if result is None:
+            raise HTTPException(404, '请求不存在')
+        if rt and rt.lock.locked():
+            result['retryable'] = False
+        return result
 
     @api.post('/v1/speech')
     async def mobile_speech(value: SpeechInput, request: Request, current=Depends(user)):
@@ -339,7 +371,9 @@ def create_hosted_app(config=None, data_directory=None):
     @api.post('/v1/memories')
     async def mobile_memory(value: MemoryInput, request: Request, current=Depends(user)):
         async with runtime(current, request) as rt:
-            return rt.store.add('memories', **value.model_dump(), source='user')
+            row = rt.store.add('memories', **value.model_dump(), source='user')
+            rt.agent.memory_interaction.reset()
+            return row
 
     @api.post('/v1/memories/from-transcript/{transcript_id}')
     async def mobile_remember(transcript_id: str, request: Request, current=Depends(user)):
@@ -347,6 +381,7 @@ def create_hosted_app(config=None, data_directory=None):
             row = rt.store.remember_transcript(transcript_id)
             if row is None:
                 raise HTTPException(404, '原始对话不存在')
+            rt.agent.memory_interaction.reset()
             return row
 
     @api.get('/v1/memories/{memory_id}/source')
@@ -362,6 +397,8 @@ def create_hosted_app(config=None, data_directory=None):
         async with runtime(current, request) as rt:
             if not rt.store.delete_memory(memory_id):
                 raise HTTPException(404, '记忆不存在')
+            rt.agent.memory_interaction.reset()
+            rt.agent.conversation.history = []
             return {'ok': True}
 
     @api.put('/v1/memories/{memory_id}')
@@ -369,6 +406,8 @@ def create_hosted_app(config=None, data_directory=None):
         async with runtime(current, request) as rt:
             if not rt.store.update_memory(memory_id, value.content, value.kind, value.pinned):
                 raise HTTPException(404, '记忆不存在')
+            rt.agent.memory_interaction.reset()
+            rt.agent.conversation.history = []
             return {'ok': True}
 
     @api.post('/v1/recall')
@@ -376,10 +415,8 @@ def create_hosted_app(config=None, data_directory=None):
         if not value.question.strip():
             raise HTTPException(422, '请输入你想回忆的问题')
         async with runtime(current, request, True) as rt:
-            tasks = [{'id': 'task:' + row['id'], 'kind': 'task', 'source': 'action_task', 'created_at': row['created_at'],
-                      'content': f"待办：{row['content']}；负责人：{row['owner'] or '未明确'}；截止：{row['due'] or '未明确'}；完成状态：{'已完成' if row['status'] == 'done' else '未完成'}"}
-                     for row in rt.store.list('action_tasks', 300)]
-            return await RecallService(config).answer(value.question, tasks + rt.store.list('memories', 500), rt.store.list('transcripts', 500))
+            memories, transcripts = rt.store.recall_records(value.question)
+            return await RecallService(config).answer(value.question, memories, transcripts)
 
     @api.get('/v1/maps/search')
     async def mobile_places(request: Request, q: str = Query(min_length=1, max_length=100), city: str = Query(default='', max_length=80), current=Depends(user)):
@@ -430,7 +467,7 @@ def create_hosted_app(config=None, data_directory=None):
     async def mobile_meeting(value: MeetingRequest, request: Request, current=Depends(user)):
         async with runtime(current, request, True) as rt:
             cutoff = (datetime.now(timezone.utc) - timedelta(hours=value.hours)).isoformat()
-            rows = [r for r in rt.store.list('transcripts', 1000) if r['mode'] == 'work' and r['speaker'] != 'assistant' and r['created_at'] >= cutoff][:80]
+            rows = rt.store.meeting_records(cutoff)
             if not rows:
                 raise HTTPException(422, '请先在工作模式记录会议，再生成纪要')
             signature = digest(json.dumps(rows, sort_keys=True, ensure_ascii=False))
@@ -438,7 +475,9 @@ def create_hosted_app(config=None, data_directory=None):
             if old:
                 return old
             report = await MeetingInsights(config).generate(rows)
-            report.update(sources=list(reversed(rows)), hours=value.hours, includes_demo=False)
+            selected = set(report.get('source_ids', []))
+            report.update(sources=[row for row in reversed(rows) if row['id'] in selected],
+                          coverage=meeting_coverage(rows, report.get('source_ids', [])), hours=value.hours, includes_demo=False)
             return rt.store.save_meeting_report(signature, report)
 
     @api.patch('/v1/tasks/{task_id}')
@@ -464,6 +503,7 @@ def create_hosted_app(config=None, data_directory=None):
                 raise HTTPException(401, '密码不正确')
             rt.store.clear()
             rt.agent.conversation.history = []
+            rt.agent.memory_interaction.reset()
             rt.agent.location, rt.agent.route = None, None
             return {'ok': True}
 

@@ -5,9 +5,12 @@ import json
 from pathlib import Path
 import sqlite3
 import time
+import re
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from .domain import Settings
+from .search import index_text, query_terms, is_non_assertion
 
 
 def now():
@@ -55,11 +58,38 @@ class Store:
             if "updated_at" not in memory_columns:
                 db.execute("ALTER TABLE memories ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
             db.execute("CREATE INDEX IF NOT EXISTS memory_pinned_created ON memories(pinned DESC, created_at DESC)")
+            turn_columns = {row["name"] for row in db.execute("PRAGMA table_info(mobile_turns)")}
+            if "status" not in turn_columns:
+                db.execute("ALTER TABLE mobile_turns ADD COLUMN status TEXT NOT NULL DEFAULT 'processing'")
+                db.execute("UPDATE mobile_turns SET status='completed' WHERE result IS NOT NULL")
+            if "stage" not in turn_columns:
+                db.execute("ALTER TABLE mobile_turns ADD COLUMN stage TEXT NOT NULL DEFAULT 'business'")
+            transcript_columns = {row["name"] for row in db.execute("PRAGMA table_info(transcripts)")}
+            if 'interaction_source' not in transcript_columns:
+                db.execute("ALTER TABLE transcripts ADD COLUMN interaction_source TEXT NOT NULL DEFAULT 'ambient_capture'")
+            db.execute("CREATE TABLE IF NOT EXISTS recall_exclusions (transcript_id TEXT PRIMARY KEY)")
+            # One transactional migration indexes existing history, then triggers keep
+            # updates/deletes in sync, including writes inside report transactions.
+            indexed = db.execute("SELECT 1 FROM sqlite_master WHERE name='recall_index'").fetchone()
+            db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS recall_index USING fts5(collection UNINDEXED, record_id UNINDEXED, terms)")
+            for table, expression in (("memories", "content"), ("transcripts", "text"),
+                                      ("action_tasks", "content || ' ' || owner || ' ' || due || ' 任务 待办 完成'")):
+                # These expressions are static identifiers, never user SQL.
+                new_expression = expression if table == "action_tasks" else "new." + expression
+                if table == "action_tasks":
+                    new_expression = "new.content || ' ' || new.owner || ' ' || new.due || ' 任务 待办 完成'"
+                db.execute(f"CREATE TRIGGER IF NOT EXISTS recall_{table}_insert AFTER INSERT ON {table} BEGIN INSERT INTO recall_index VALUES('{table}',new.id,aidol_terms({new_expression})); END")
+                db.execute(f"CREATE TRIGGER IF NOT EXISTS recall_{table}_delete AFTER DELETE ON {table} BEGIN DELETE FROM recall_index WHERE collection='{table}' AND record_id=old.id; END")
+                db.execute(f"CREATE TRIGGER IF NOT EXISTS recall_{table}_update AFTER UPDATE ON {table} BEGIN DELETE FROM recall_index WHERE collection='{table}' AND record_id=old.id; INSERT INTO recall_index VALUES('{table}',new.id,aidol_terms({new_expression})); END")
+                if not indexed:
+                    db.execute(f"INSERT INTO recall_index SELECT ?,id,aidol_terms({expression}) FROM {table}", (table,))
 
     @contextmanager
     def connect(self):
         db = sqlite3.connect(self.path, timeout=10)
         db.row_factory = sqlite3.Row
+        db.create_function("aidol_terms", 1, index_text, deterministic=True)
+        db.create_function("aidol_non_assertion", 2, is_non_assertion, deterministic=True)
         try:
             yield db
             db.commit()
@@ -126,12 +156,17 @@ class Store:
     def save_meeting_report(self, signature, payload):
         """Commit a report and its action items together; retries never duplicate tasks."""
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             existing = db.execute("SELECT * FROM meeting_reports WHERE signature=?", (signature,)).fetchone()
             if existing:
                 return {"id": existing["id"], "created_at": existing["created_at"], **json.loads(existing["payload"])}
             report_id, created = uuid4().hex, now()
             db.execute("INSERT INTO meeting_reports VALUES(?,?,?,?)", (report_id, signature, json.dumps(payload, ensure_ascii=False), created))
             for task in payload.get("tasks", []):
+                candidates = db.execute("SELECT source_ids FROM action_tasks WHERE content=? AND owner=? AND due=?",
+                                        (task["content"], task["owner"], task["due"])).fetchall()
+                if any(set(json.loads(row["source_ids"])) & set(task["source_ids"]) for row in candidates):
+                    continue
                 db.execute("INSERT INTO action_tasks VALUES(?,?,?,?,?,?,?,?)", (
                     uuid4().hex, report_id, task["content"], task["owner"], task["due"],
                     json.dumps(task["source_ids"]), "open", created))
@@ -150,6 +185,12 @@ class Store:
 
     def delete_memory(self, memory_id):
         with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT source FROM memories WHERE id=?', (memory_id,)).fetchone()
+            if row:
+                if row['source'].startswith(('transcript:', 'demo_transcript:')):
+                    db.execute('INSERT OR IGNORE INTO recall_exclusions VALUES(?)', (row['source'].split(':', 1)[1],))
+                self._invalidate_recall(db)
             return db.execute("DELETE FROM memories WHERE id=?", (memory_id,)).rowcount > 0
 
     def remember_transcript(self, transcript_id):
@@ -184,6 +225,12 @@ class Store:
         if not isinstance(pinned, bool):
             raise ValueError("pinned must be boolean")
         with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            previous = db.execute('SELECT content,source FROM memories WHERE id=?', (memory_id,)).fetchone()
+            if previous and previous['content'] != content.strip():
+                if previous['source'].startswith(('transcript:', 'demo_transcript:')):
+                    db.execute('INSERT OR IGNORE INTO recall_exclusions VALUES(?)', (previous['source'].split(':', 1)[1],))
+                self._invalidate_recall(db)
             return db.execute(
                 "UPDATE memories SET content=?, kind=?, pinned=?, updated_at=? WHERE id=?",
                 (content.strip(), kind, int(pinned), now(), memory_id)).rowcount > 0
@@ -196,23 +243,151 @@ class Store:
 
     def clear(self):
         with self.connect() as db:
-            for table in ("memories", "transcripts", "events", "drafts", "processed", "meeting_reports", "action_tasks", "mobile_turns"):
+            for table in ("memories", "transcripts", "events", "drafts", "processed", "meeting_reports", "action_tasks", "mobile_turns", "recall_exclusions"):
                 db.execute(f"DELETE FROM {table}")
 
     def mobile_turn(self, turn_id, fingerprint, reserve=True):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT fingerprint,result FROM mobile_turns WHERE id=?", (turn_id,)).fetchone()
+            row = db.execute("SELECT fingerprint,result,status,stage FROM mobile_turns WHERE id=?", (turn_id,)).fetchone()
             if row:
-                if row['fingerprint'] != fingerprint or row['result'] is None:
+                if row['fingerprint'] != fingerprint:
                     raise ValueError("该请求已提交或内容不一致，请查看历史后重新发起")
-                return json.loads(row['result'])
+                if row['result'] is not None:
+                    return json.loads(row['result'])
+                if row['stage'] == 'asr':
+                    if reserve:
+                        db.execute("UPDATE mobile_turns SET status='processing' WHERE id=?", (turn_id,))
+                    return None
+                raise ValueError("该请求可能已产生记录，请查询请求状态和历史，不要重复执行")
             if reserve:
-                db.execute("INSERT INTO mobile_turns VALUES(?,?,NULL,?)", (turn_id, fingerprint, now()))
+                stage = 'asr' if fingerprint.startswith('pcm:') else 'business'
+                db.execute("INSERT INTO mobile_turns (id,fingerprint,result,created_at,status,stage) VALUES(?,?,NULL,?,'processing',?)", (turn_id, fingerprint, now(), stage))
 
     def finish_mobile_turn(self, turn_id, result):
         with self.connect() as db:
-            db.execute("UPDATE mobile_turns SET result=? WHERE id=?", (json.dumps(result, ensure_ascii=False), turn_id))
+            db.execute("UPDATE mobile_turns SET result=?,status='completed',stage='completed' WHERE id=?", (json.dumps(result, ensure_ascii=False), turn_id))
+
+    def mobile_turn_stage(self, turn_id, stage):
+        with self.connect() as db:
+            db.execute("UPDATE mobile_turns SET stage=? WHERE id=?", (stage, turn_id))
+
+    def fail_mobile_turn(self, turn_id):
+        with self.connect() as db:
+            db.execute("UPDATE mobile_turns SET status='failed' WHERE id=? AND result IS NULL", (turn_id,))
+
+    def mobile_turn_status(self, turn_id):
+        with self.connect() as db:
+            row = db.execute("SELECT id,status,stage,result FROM mobile_turns WHERE id=?", (turn_id,)).fetchone()
+        if row is None:
+            return None
+        return {"request_id": row['id'], "status": row['status'], "stage": row['stage'],
+                "retryable": row['stage'] == 'asr',
+                "result": json.loads(row['result']) if row['result'] else None}
+
+    def recall_records(self, question):
+        """Search all local history first; bound only the evidence sent to recall."""
+        terms = query_terms(question)
+        if not terms:
+            return [], []
+        match = ' OR '.join('"' + term + '"' for term in sorted(terms))
+        found = {}
+        month_bounds = None
+        if '上个月' in question:
+            current = datetime.now(ZoneInfo(self.settings().timezone))
+            end = current.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            year, month = (end.year - 1, 12) if end.month == 1 else (end.year, end.month - 1)
+            start = end.replace(year=year, month=month)
+            month_bounds = (start.astimezone(timezone.utc).isoformat(), end.astimezone(timezone.utc).isoformat())
+        pending_only = bool(re.search(r'未完成|没完成|待办|还没做|还有什么.*做', question))
+        with self.connect() as db:
+            for table in ('action_tasks', 'memories', 'transcripts'):
+                params = [match, table]
+                extra = (" AND aidol_non_assertion(r.text,r.speaker)=0 AND NOT EXISTS (SELECT 1 FROM recall_exclusions e WHERE e.transcript_id=r.id)"
+                         if table == 'transcripts' else '')
+                if table == 'memories':
+                    extra = " AND aidol_non_assertion(r.content,'用户')=0"
+                if table == 'action_tasks':
+                    extra = " AND NOT EXISTS (SELECT 1 FROM json_each(r.source_ids) s JOIN recall_exclusions e ON e.transcript_id=s.value)"
+                    if pending_only:
+                        extra += " AND r.status='open'"
+                if month_bounds:
+                    extra += ' AND julianday(r.created_at)>=julianday(?) AND julianday(r.created_at)<julianday(?)'
+                    params.extend(month_bounds)
+                rows = db.execute(f"SELECT r.* FROM recall_index JOIN {table} r ON r.id=recall_index.record_id "
+                                  f"WHERE recall_index MATCH ? AND collection=?{extra} "
+                                  "ORDER BY bm25(recall_index),r.created_at DESC LIMIT 100", params).fetchall()
+                found[table] = [dict(row) for row in rows]
+        tasks = [{'id': 'task:' + row['id'], 'kind': 'task', 'source': 'action_task',
+                  'created_at': row['created_at'], 'content':
+                  f"{row['content']}；负责人：{row['owner']}；期限：{row['due']}；完成状态：{'已完成' if row['status'] == 'done' else '未完成'}"}
+                 for row in found['action_tasks']]
+        return tasks + found['memories'], found['transcripts']
+
+    def conversation_history(self, limit=12):
+        with self.connect() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT * FROM transcripts r WHERE NOT EXISTS (SELECT 1 FROM recall_exclusions e WHERE e.transcript_id=r.id) ORDER BY created_at DESC LIMIT ?", (limit,))]
+
+    def meeting_records(self, cutoff):
+        with self.connect() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT * FROM transcripts r WHERE mode='work' AND speaker!='assistant' "
+                "AND interaction_source='ambient_capture' AND created_at>=? "
+                "AND NOT EXISTS (SELECT 1 FROM recall_exclusions e WHERE e.transcript_id=r.id) ORDER BY created_at DESC", (cutoff,))]
+
+    def get_memory(self, memory_id):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
+        return dict(row) if row else None
+
+    @staticmethod
+    def _invalidate_recall(db):
+        # Keep identities so a retry cannot execute an old mutation a second time.
+        withdrawn = json.dumps({'text': '', 'response': '记录已变更，请重新查询。', 'speak': False,
+                                'invalidated': True}, ensure_ascii=False)
+        db.execute("UPDATE mobile_turns SET result=? WHERE result IS NOT NULL", (withdrawn,))
+        db.execute("DELETE FROM transcripts WHERE speaker='assistant'")
+
+    def correct_memory(self, memory_id, content):
+        if not isinstance(content, str) or not 1 <= len(content.strip()) <= 6000:
+            raise ValueError('memory content must contain 1–6000 characters')
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT * FROM memories WHERE id=?', (memory_id,)).fetchone()
+            if not row:
+                return None
+            db.execute('UPDATE memories SET content=?,updated_at=? WHERE id=?', (content.strip(), now(), memory_id))
+            if row['source'].startswith(('transcript:', 'demo_transcript:')):
+                db.execute('INSERT OR IGNORE INTO recall_exclusions VALUES(?)', (row['source'].split(':', 1)[1],))
+            self._invalidate_recall(db)
+            return dict(db.execute('SELECT * FROM memories WHERE id=?', (memory_id,)).fetchone())
+
+    def forget_memory(self, memory_id):
+        """Forget one memory and its directly linked source, not an entire topic."""
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT * FROM memories WHERE id=?', (memory_id,)).fetchone()
+            if not row:
+                return None
+            removed_memories = db.execute('DELETE FROM memories WHERE id=?', (memory_id,)).rowcount
+            removed_transcripts = removed_reports = removed_tasks = 0
+            if row['source'].startswith(('transcript:', 'demo_transcript:')):
+                source_id = row['source'].split(':', 1)[1]
+                removed_memories += db.execute('DELETE FROM memories WHERE source=?', (row['source'],)).rowcount
+                removed_transcripts = db.execute('DELETE FROM transcripts WHERE id=?', (source_id,)).rowcount
+                db.execute('DELETE FROM recall_exclusions WHERE transcript_id=?', (source_id,))
+                for task in db.execute('SELECT id,source_ids FROM action_tasks').fetchall():
+                    if source_id in json.loads(task['source_ids']):
+                        removed_tasks += db.execute('DELETE FROM action_tasks WHERE id=?', (task['id'],)).rowcount
+                for report in db.execute('SELECT id,payload FROM meeting_reports').fetchall():
+                    payload = json.loads(report['payload'])
+                    source_ids = set(payload.get('source_ids', [])) | {s['id'] for s in payload.get('sources', [])}
+                    if source_id in source_ids:
+                        removed_reports += db.execute('DELETE FROM meeting_reports WHERE id=?', (report['id'],)).rowcount
+            self._invalidate_recall(db)
+            return {'memories': removed_memories, 'transcripts': removed_transcripts,
+                    'reports': removed_reports, 'tasks': removed_tasks, 'scope': 'memory_and_linked_source'}
 
 
 class AccountStore:

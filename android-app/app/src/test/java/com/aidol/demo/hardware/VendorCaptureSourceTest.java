@@ -210,6 +210,17 @@ public class VendorCaptureSourceTest {
             device.listener.state("idle", 2); assertEquals(0, result.endings.get());
         }
     }
+    @Test public void sdkStartupDoesNotConsumeRecordingDeadline() throws Exception {
+        Device device = new Device(); Result result = new Result();
+        try (VendorCaptureSource source = new VendorCaptureSource(device, 1000, 1024, 200)) {
+            source.start(result);
+            assertFalse("startup is separate from recording time", result.complete.await(250, TimeUnit.MILLISECONDS));
+            device.listener.state("recording", 2);
+            device.listener.pcm(2, new byte[]{1, 2});
+            source.stop(result); device.listener.state("idle", 2); result.await();
+            assertNull(result.error); assertEquals(1, result.endings.get());
+        }
+    }
     @Test public void queueByteLimitFailsWithoutSilentDrop() throws Exception {
         Device device = new Device(); Result result = new Result();
         try (VendorCaptureSource source = new VendorCaptureSource(device, 200, 4)) {

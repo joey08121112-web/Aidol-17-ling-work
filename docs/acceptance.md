@@ -4,6 +4,49 @@
 
 更新日期：2026-10-17。服务测试是本轮开发时的结果，不保证未来配额、网络和账号状态。真实凭证仅留在受控的本地/服务器配置，本文不含 Key。
 
+## 2026-10-17 语音记忆闭环与显式锁屏会话：开发整合验收
+
+本轮按用户“多智能体协同开发、合并”的要求完成后端记忆、Android 会话与独立审查的共同整合，保留此前界面/SDK/USB工作。实现状态与未完成阶段见 [旗舰方案第14节](headset-experience-plan.md#14-后续开发第一批可靠性改进2026-10-17)，契约见 [API](api.md)。没有调用真实供应商、发布官网或部署公网后端。
+
+| 层级 | 实际结果 | 不能据此推导 |
+| --- | --- | --- |
+| 后端离线全量 | `.venv/Scripts/python.exe -m pytest tests -q`：**289 passed**，62.33 秒；1 条既有 AnyIO 弃用警告 | 不是付费供应商或真实语音识别质量验证 |
+| Python 编译 | `-m compileall -q app` 成功 | 不证明业务与硬件实时性 |
+| HTTP 核心闭环 | 合成文字、真实鉴权/SQLite、mock供应商：工作私人记忆保存→问回→更正→再问→遗忘→无证据；旧ID重放不恢复内容 | 未完成手机锁屏＋实物耳机端到端演示 |
+| 历史检索/隐私 | 超过1100条干扰记录仍找回旧来源；未完成/月度条件先于候选限制；问题不成事实；跨账号隔离、来源清理与缓存失效回归通过 | 关键词检索不是任意同义表达检索；工作空间独立权限未实现 |
+| 独立审查修复 | 旧任务/上月记录被候选限额挤掉；新话题或手机新增记忆后旧指代误删；关联旧任务期限/原文/缓存泄漏，均加入回归 | 纯转写/混合任务引用暂不接受语音修改；语义任务合并未完成 |
+| Android 单元测试 | **119 项，0 失败、0 错误** | 前台服务/锁屏/通知真实系统行为未实机验证 |
+| Android 构建 | `testDebugUnitTest lintDebug assembleDebug assembleDebugAndroidTest --offline` 成功 | 测试APK只编译；没有执行设备instrumentation，本轮未签发release |
+| Lint | **0 errors，11 warnings** | 保留国际化等既有警告，不是零警告 |
+| 最终 Debug APK | `android-app/app/build/outputs/apk/debug/app-debug.apk`；SHA-256 `c7747728cdb277555b8292b7e0ea58aa701d5b2daf2edcf89808d3a50c01e521` | 生成文件未入Git，未安装手机、未上传官网 |
+| USB与实机 | `adb devices -l` 无设备；未新增实物观察 | 锁屏、通知停止、通话/断连、录音计时、双击保片段、听音和功耗均待新版本实测 |
+
+锁屏服务只在用户前台显式授权后有效，最长一小时、通知可停止，依赖当前 Activity 宿主存活；系统回收/任务移除不自动恢复，连续/定时不在后台接续。Rise 连接事件可撤销空闲锁屏授权；系统蓝牙兼容模式尚无空闲断连监听，正在采音/播放时仍检查路由与焦点。没有新增未经握手证实的 SDK 能力。
+
+下面的 UI 哈希与历史供应商/硬件记录仅对应当时构建，不替代本节新版本的待验项。
+
+## 2026-10-17 原生界面升级：代码与构建验收
+
+### 后续精简版（保留全部功能入口）
+
+按用户要求移除装饰性标语和重复说明，将记忆统计合并一行，附近/天气和开发工具改为按需展开；未移除业务按钮、接口请求或危险操作确认。功能位置见 [展示精简与功能入口](android-handoff.md#展示精简与功能入口)。静态对照确认原有 API 路径引用无增减，按钮及内容操作入口保留；这不等同于全功能真机点击通过。
+
+最终 `testDebugUnitTest lintDebug assembleDebug assembleDebugAndroidTest compileReleaseJavaWithJavac` 成功，116 项 Android 单测通过，Lint 0 错误、12 警告。新 debug APK SHA-256 为 `666fc9d0123efd1ab1250b3707bd69addabb20816ed7a72cd7aadc09d2c8ac84`，替代下表初版 debug 哈希。后端未修改，本次未重跑后端测试或调用供应商。`adb devices -l` 仍无设备，离线界面 runner 仅编译通过；真机视觉、交互与耳机复验待完成，未发布公网。
+
+### 初版构建记录
+
+暖白与深松绿视觉覆盖登录/注册/恢复账号及对话、记忆、工作、通勤、我的五页；原生动态球体、图标、按钮/输入/空态/折叠设置同步更新。保留现有硬件和请求流程，增加当前进程内的对话草稿保持。使用入口和离线截图脚本见 [Android 交接](android-handoff.md)。
+
+| 检查 | 本轮实际结果 | 边界 |
+| --- | --- | --- |
+| Android 单元测试 | 116 项，0 失败、0 错误、0 跳过 | 既有业务/硬件策略回归，不是屏幕截图测试 |
+| Android 构建 | `testDebugUnitTest lintDebug assembleDebug assembleDebugAndroidTest compileReleaseJavaWithJavac` 成功 | 仅 debug APK 和界面测试 APK；release 源码编译通过，未签发新 release |
+| Lint | 0 错误、15 警告 | 警告主要为文字资源国际化、既有蓝牙 API 常量和 manifest 版本属性；不能称为零警告 |
+| 后端回归 | `python -m pytest tests -q`：243 passed，47.98 秒，1 条 AnyIO 弃用警告；`compileall -q app` 成功 | 临时数据库与 mock providers；没有运行付费供应商探测 |
+| Debug APK | `android-app/app/build/outputs/apk/debug/app-debug.apk`，SHA-256 `acd2475916041b7ffde5bc3c680e8bea0aca3ff1e9b0d49bbee3bef2e2b24e86` | 未安装手机、未发布官网、未覆盖旧 release APK |
+| 界面截图与交互 | 离线截图 runner 编译通过，运行未完成 | `adb devices -l` 无设备；本机缺少 Android Emulator hypervisor，关闭加速后的模拟器同样启动退出，无截图证据。模拟器尝试仅用于 UI，不新增产品入口 |
+| 待实物复验 | 五页渲染、320dp 小屏、大字体/横屏、键盘、TalkBack、开始/结束/取消及耳机回归 | 本轮不宣称视觉验收、语音链路或物理耳机测试通过；历史成功不代表新版通过 |
+
 ## 2026-10-17 追加耳机联动：当前交付
 
 用户明确追加：触控切模式、开始/结束/取消单轮对话、摘下暂停、断连停止、有界重连恢复就绪、电量和佩戴提醒，然后整理推送 Git。随后增加模式确认、开始和结束的简短语音提示。代码和操作见 [Rise 联动](rise-controls.md) 与 [操作语音](android-audio-prompts.md)，同事配置传递见 [团队交接](team-delivery.md)。

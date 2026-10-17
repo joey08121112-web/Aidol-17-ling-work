@@ -36,13 +36,13 @@ public class HeadsetInteractionPolicyTest {
         assertTrue(policy.flush(2600, recording()).actions.isEmpty());
     }
 
-    @Test public void doubleTapSupersedesPendingSingleAndDelegatesAtomicModeChange() {
+    @Test public void doubleTapSupersedesPendingStopAndDefersModeWithoutDiscardingRecording() {
         HeadsetInteractionPolicy policy = new HeadsetInteractionPolicy();
         policy.event(TOGGLE, 1, 1000, 1000, recording());
         assertTrue(policy.event(NEXT_MODE, 2, 1200, 1200, recording()).actions.isEmpty());
         assertTrue(policy.flush(1400, recording()).actions.isEmpty());
         HeadsetInteractionPolicy.Decision decision = policy.flush(1600, recording());
-        assertEquals(Arrays.asList(CHANGE_MODE), decision.actions);
+        assertEquals(Arrays.asList(DEFER_MODE), decision.actions);
         assertEquals("work", decision.mode);
         assertFalse(policy.hasPending()); assertTrue(policy.flush(1600, recording()).actions.isEmpty());
     }
@@ -217,6 +217,20 @@ public class HeadsetInteractionPolicyTest {
         policy.device(device(true, false, true, true, 80), true);
         assertNull(policy.device(device(true, false, null, false, 80), true).stopReason);
         assertNull(policy.device(device(true, false, false, null, 80), true).stopReason);
+    }
+
+    @Test public void knownRemovalStopsAnActiveTurnEvenAfterUnknownWearState() {
+        HeadsetInteractionPolicy policy = new HeadsetInteractionPolicy();
+        policy.device(device(true, false, true, true, 80), true);
+        assertNull(policy.device(device(true, false, null, null, 80), true).stopReason);
+        assertNotNull(policy.device(device(true, false, false, false, 80), true).stopReason);
+    }
+
+    @Test public void doubleTapThatSettlesAfterVadStopStillPreservesTheSubmittedTurn() {
+        HeadsetInteractionPolicy policy = new HeadsetInteractionPolicy();
+        policy.event(NEXT_MODE, 1, 1000, 1000, recording());
+        HeadsetInteractionPolicy.Context processing = context(true, true, true, true, false, false, true, false, false, "life");
+        assertEquals(Arrays.asList(DEFER_MODE), policy.flush(1400, processing).actions);
     }
 
     @Test public void batteryBandsAlertOnceAndRequireRecoveryAboveTwentyFiveBeforeRearming() {

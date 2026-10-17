@@ -22,7 +22,7 @@ public final class VendorCaptureSource implements CaptureSource, AutoCloseable {
     private Listener listener;
     private StopCallback completion;
     private FusionDevice.Listener vendorListener;
-    private ScheduledFuture<?> stopTimeout, durationTimeout;
+    private ScheduledFuture<?> stopTimeout, durationTimeout, startupTimeout;
     private long generation;
     private boolean active, stopping, idle, closed, recording;
     private int queuedBytes, receivedBytes, pendingByte = -1;
@@ -66,9 +66,8 @@ public final class VendorCaptureSource implements CaptureSource, AutoCloseable {
             callbacks = vendorListener;
             consumer = new Thread(() -> consume(token), "rise-pcm-" + token);
             consumer.setDaemon(true); consumer.start();
-            // Includes the stop/drain budget. HostedSession normally requests stop at 57 seconds.
-            durationTimeout = timer.schedule(() -> fail(token, "录音超过 60 秒，已丢弃本段，请重新开始", true),
-                    durationLimitMs, TimeUnit.MILLISECONDS);
+            startupTimeout = timer.schedule(() -> fail(token, "耳机麦克风启动超时，请重连后再试", true),
+                    12_000, TimeUnit.MILLISECONDS);
         }
         target.status("正在开启耳机麦克风");
         synchronized (this) { if (!current(token)) return; }
@@ -96,7 +95,15 @@ public final class VendorCaptureSource implements CaptureSource, AutoCloseable {
         recording = true;
         Listener target = listener;
         target.input("Rise SDK 麦克风 · 16 kHz 单声道");
-        if (current(token)) target.recording();
+        if (current(token)) {
+            target.recording();
+            if (!current(token)) return;
+            if (startupTimeout != null) startupTimeout.cancel(false);
+            // Share HostedSession's readiness origin: SDK startup latency is not recorded audio.
+            // The independent deadline still includes the stop/drain budget.
+            durationTimeout = timer.schedule(() -> fail(token, "录音超过 60 秒，已丢弃本段，请重新开始", true),
+                    durationLimitMs, TimeUnit.MILLISECONDS);
+        }
     }
 
     private void onPcm(long token, int channel, byte[] bytes) {
@@ -208,6 +215,7 @@ public final class VendorCaptureSource implements CaptureSource, AutoCloseable {
     }
     private boolean current(long token) { return active && generation == token && !closed; }
     private void cancelTimers() {
+        if (startupTimeout != null) startupTimeout.cancel(false);
         if (stopTimeout != null) stopTimeout.cancel(false);
         if (durationTimeout != null) durationTimeout.cancel(false);
     }

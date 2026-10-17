@@ -29,16 +29,17 @@ class MobileRuntime:
         self.agent.conversation = MobileConversation(config)
         self.lock = asyncio.Lock()
 
-    async def turn(self, text, source):
-        history = list(reversed(self.store.list('transcripts', 12)))
+    async def turn(self, text, source, interaction_source='ambient_capture'):
+        history = list(reversed(self.store.conversation_history(12)))
         self.agent.conversation.history = [
             {'role': 'assistant' if row['speaker'] == 'assistant' else 'user', 'content': row['text'][:2000]}
             for row in history]
-        result = await self.agent.ingest(TextInput(text=text, source=source), respond=True)
+        result = await self.agent.ingest(TextInput(text=text, source=source), respond=True,
+                                        directed=interaction_source == 'direct_question')
         answer = result.get('response', '')
         if answer and self.store.settings().retain_transcripts:
             self.store.add('transcripts', speaker='assistant', text=answer, mode=result['mode'], source=source)
-        return {'text': text, **result, 'speak': result['mode'] != 'work',
+        return {'text': text, **result, 'speak': result['mode'] != 'work' or result.get('explicit_reply', False),
                 'notice': '模型暂不可用，本次为基础规则回复' if result['interaction'] == 'rules' and result['mode'] != 'work' else ''}
 
 

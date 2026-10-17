@@ -1,13 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.Aidol" parent="android:style/Theme.Material.NoActionBar">
-        <item name="android:fontFamily">sans</item>
-        <item name="android:colorAccent">#8CE8D4</item>
-        <item name="android:windowLightStatusBar">false</item>
+    <style name="Theme.Aidol" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans-serif</item>
+        <item name="android:colorAccent">#28644E</item>
+        <item name="android:colorControlActivated">#28644E</item>
+        <item name="android:colorControlHighlight">#2028644E</item>
+        <item name="android:windowLightStatusBar">true</item>
         <item name="android:windowActionModeOverlay">true</item>
-        <item name="android:windowBackground">#0A1115</item>
-        <item name="android:statusBarColor">#0A1115</item>
-        <item name="android:navigationBarColor">#0A1115</item>
+        <item name="android:windowBackground">#F6F7F2</item>
+        <item name="android:statusBarColor">#F6F7F2</item>
+        <item name="android:navigationBarColor">#F6F7F2</item>
         <item name="android:windowNoTitle">true</item>
     </style>
 </resources>

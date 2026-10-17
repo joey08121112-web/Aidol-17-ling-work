@@ -29,16 +29,17 @@ APK 内置基址 `https://123.207.219.174:7776`，由 `create_hosted_app` 提供
 | --- | --- |
 | `GET /v1/state` | 返回 `user/settings/capabilities/agent/transcripts/memories/tasks/drafts/meeting_report`；刷新时重新判断当前模式 |
 | `PUT /v1/settings` | 完整 `Settings` JSON；返回保存后的设置。固定 `provider=cascade`、`life_poll_enabled=false`；目的地/交通参数变化清除旧路线与提醒节流 |
-| `POST /v1/chat` | `{text,request_id}`；text 1–6000 有效字符；返回 `text/mode/memories/response/extraction/interaction/speak/notice` |
-| `POST /v1/voice?request_id=...` | `Content-Type: audio/pcm`，16 kHz 单声道小端 PCM16 原始字节；不带 WAV 头；返回与 chat 相同结构，未识别时返回空 text、解释 response、`speak=false` |
+| `POST /v1/chat` | `{text,request_id,interaction_source?}`；text 1–6000 有效字符；返回 `text/mode/memories/response/extraction/interaction/speak/notice`，记忆操作另含 `citations/recall/deletion` 等回执 |
+| `POST /v1/voice?request_id=...&interaction_source=direct_question` | `Content-Type: audio/pcm`，16 kHz 单声道小端 PCM16 原始字节；不带 WAV 头；返回与 chat 相同结构，未识别时返回空 text、解释 response、`speak=false` |
+| `GET /v1/turns/{request_id}` | 同账号只读请求状态，不占业务锁、不计模型额度；`request_id/status/stage/retryable/result`；不存在 404 |
 | `POST /v1/speech` | `{text}`，1–1500 字符；返回 24 kHz 单声道 PCM16 的 `audio/wav` |
 | `POST /v1/memories` | `{content,kind}`，content 1–6000 有效字符，kind 为 `preference/task/fact/trip`；返回保存记录 |
 | `PUT /v1/memories/{id}` | `{content,kind,pinned}`；更正/收藏，`{ok:true}` |
 | `DELETE /v1/memories/{id}` | `{ok:true}` |
 | `POST /v1/memories/from-transcript/{id}` | 将本人转写完整原句保存为事实笔记；重复调用按来源返回同一笔记 |
 | `GET /v1/memories/{id}/source` | 返回明确关联的本人原始转写；手动笔记等无来源则 404 |
-| `POST /v1/recall` | `{question}`，1–500 有效字符；返回 `answer/citations/extraction/insufficient`；行动项带真实完成状态参加检索 |
-| `POST /v1/meetings` | `{hours}`，1–168，默认 24；本人最近时段最多 80 条非助手工作转写；返回 `id/created_at/summary/decisions/tasks/source_ids/extraction/sources/hours/includes_demo`；同快照复用报告，无记录 422 |
+| `POST /v1/recall` | `{question}`，1–500 有效字符；返回 `answer/citations/extraction/insufficient`；全历史索引检索，行动项带真实完成状态参加检索 |
+| `POST /v1/meetings` | `{hours}`，1–168，默认 24；筛选本人时段内的环境工作转写，排除助手和私人提问；有界生成后返回 `id/created_at/summary/decisions/tasks/source_ids/extraction/sources/coverage/hours/includes_demo`；同快照复用报告，无记录 422 |
 | `PATCH /v1/tasks/{id}` | `{status:"open"或"done"}`；`{ok:true}`；可修改的任务 ID 从 state.tasks 取得 |
 | `GET /v1/maps/search?q=...&city=...` | q 1–100 字符，city 最多 80；高德地点搜索结果，沿用下方地图结构 |
 | `POST /v1/location` | `{longitude,latitude,accuracy?,speed?,source?}`，WGS-84 定位；返回 agent 快照，可能更新模式、路线与提醒草稿 |
@@ -50,7 +51,17 @@ APK 内置基址 `https://123.207.219.174:7776`，由 `create_hosted_app` 提供
 
 `PUT /v1/settings` 是完整替换：先取 state.settings 再合并修改。字段取值范围沿用下方“设置”，Android 强制值优先；新账号默认手动生活模式，偏好为空。关闭 `retain_transcripts` 阻止新增转写历史，但不清除旧数据，也不阻止抽取记忆或幂等结果保存；完整清除使用 `/v1/data`。
 
-服务端 `life_poll_enabled=false` 禁止服务器触发后台采集，不妨碍 Android 在当前前台页面、用户本次主动开启后按 `life_poll_seconds`（60–3600，默认 300）及 `listen_seconds`（5–60，默认 30）调度有界录音。连续模式也是一轮识别/回复/播放完成后开启下一轮；各轮单独提交 HTTP，不是 WebSocket 连续双工。停止、页面失去前台或错误会停止接续，重新开始需要用户操作。
+服务端 `life_poll_enabled=false` 禁止服务器触发后台采集，不妨碍 Android 在当前前台页面、用户本次主动开启后按 `life_poll_seconds`（60–3600，默认 300）及 `listen_seconds`（5–60，默认 30）调度有界录音。连续模式也是一轮识别/回复/播放完成后开启下一轮；各轮单独提交 HTTP，不是 WebSocket 连续双工。停止、页面失去前台或错误会停止自动接续。用户另外开启本次锁屏耳机会话后，可在宿主仍存活期间继续手动短语音；它不授权后台连续或定时开麦。
+
+`interaction_source` 仅允许 `direct_question`（用户定向提问/命令）与 `ambient_capture`（环境记录），省略时兼容旧版为后者。新版 Android 的单轮触控、手动文字使用前者，连续/定时采集使用后者。工作模式环境记录保持安静，不执行原文中的删除等命令；显式提问允许简短答复。三种模式共用同一个账号编排器及记忆上下文。
+
+定向记忆操作支持“记住，周四交方案”→问回→“后来改成周五了”→“忘记刚才那条”。`interaction` 为 `memory_remember/recall/correct/forget`。更正、遗忘仅接受十分钟内唯一命中的记忆，歧义、已失效指代或不存在目标返回明确解释，不猜测删除对象；普通新话题会清理旧指代。日期局部替换要求原文只有一个明确日期，否则要求完整更正。纯转写或多条任务/记忆引用不能直接口头更改，当前任务状态仍通过 `/v1/tasks` 操作。保存约定不代表设置提醒或生成可调度任务。
+
+索引在当前账号 SQLite 内用 FTS5 存储中文双字词与英文词，首次启动回填全历史，写入/更正/删除由同事务触发器同步。结构条件先于候选限额：上个月按账号时区的**记录时间**筛选，未完成按任务真实状态筛选；不是事件发生日期解析。每类最多取 100 条候选，再选择最多 8 条证据、回答最多 4 条引用。关键词索引覆盖旧记录，仍不等于任意同义表达均能命中。问题、假设和助手输出不作为事实证据；模型只选择可核验连续原文，失败时明确降级为原文摘录。
+
+更正保留原始来源供 `/source` 核对，但原文不再作为当前召回或普通对话依据。口头遗忘删除选定记忆、同来源派生记忆、关联原始转写、引用它的纪要和任务，并返回 `deletion` 计数；其他独立记录、运维备份不在此次范围。旧 `DELETE /v1/memories/{id}` 保持仅删记忆语义，但屏蔽关联旧原文的召回。上述修改均失效已完成请求正文缓存、清理助手历史，保留请求身份以防旧请求重放恢复内容；旧结果重试返回 `invalidated=true`。单纯关闭转写不是临时会话。
+
+纪要 `coverage` 披露可用/纳入/遗漏片段、截短来源与记录首尾时间；`continuous_capture_verified=false` 明示这些信息不能证明没有采集缺段。模型仍最多使用 80 条、18000 字材料。新增片段后重生成纪要时，仅内容、负责人、期限相同且来源重叠的任务复用旧 ID/完成状态；语义改写仍需后续任务关联设计。
 
 state 最多返回 100 条转写（按时间正序）、300 条记忆、300 条行动项、30 条草稿及最新纪要；记忆按收藏优先及时间倒序。导出各集合最多 10000 条，暂不提供分页。纪要中的 tasks 是生成时的草稿快照，当前完成状态以 state.tasks 或 export.tasks 为准。`include_demo` 为兼容模型字段，不会为托管账号注入模拟内容。
 
@@ -60,7 +71,7 @@ M1 Android 复用 HTTP 短语音，无新增实时接口。含异步停止尾帧
 
 诊断：chat/voice沿用 `request_id`；speech可带 `X-Aidol-Request-ID: <同轮ID>`，格式 `[A-Za-z0-9-]{16,64}`，缺失或无效时生成诊断ID，不记录无效原文。此头仅关联日志，不提供speech幂等、鉴权或额度豁免。`uvicorn.error.aidol.mobile`记录cache/asr/business/turn/tts阶段、状态与耗时，不记录正文、音频、凭证或账户信息。客户端debug并列显示本地session ID与request ID。
 
-`request_id` 必须为 16–64 位字母、数字或连字符，建议使用 UUID；范围是当前账号。聊天/语音已完成请求使用相同 ID、相同文本或 PCM 指纹重试时，返回原结果，不重复写入、模型调用或额度消耗。相同 ID 携带不同内容、或首次处理未完成/失败而未保存结果，返回 409；客户端应先看历史，再决定用新 ID 提交。幂等不等于供应商事务，进程异常中断不能保证上游没有消耗费用。
+`request_id` 必须为 16–64 位字母、数字或连字符，建议使用 UUID；范围是当前账号。聊天/语音已完成请求使用相同 ID、相同文本或 PCM 及 `interaction_source` 指纹重试时，返回原结果，不重复写入、模型调用或额度消耗（记忆变更后旧正文撤回，见上）。不同内容/来源返回 409。状态为 `processing/completed/failed`，阶段为 `asr/business/completed`；ASR失败或进程中断在ASR阶段，可使用同 ID、同内容重试并重新计费。进入 business 后失败可能已有副作用，`retryable=false`，重放返回409，先核对历史；不能自动换ID重做。状态查询在正在处理时仍可读取，活动账号锁期间返回 `retryable=false`。幂等不等于供应商事务，进程异常中断不能保证上游没有消耗费用。
 
 | 限制 | 默认值与口径 |
 | --- | --- |
@@ -75,7 +86,7 @@ M1 Android 复用 HTTP 短语音，无新增实时接口。含异步停止尾帧
 
 常见状态：400 不支持的草稿动作；401 会话/密码无效；403 注册关闭或名额满；404 当前账号内不存在；409 操作冲突、请求 ID 冲突或凭据已变更；413 超大请求；415 音频类型错误；422 输入无效或无会议内容；429 请求过于频繁/额度用尽；502 识别/合成/地图服务失败；503 配置不全或服务繁忙。正文为 `{detail:可展示的提示}`，不回显供应商密钥或内部错误体。
 
-工作模式 `speak=false`；此值应由客户端遵守，不自动请求播放。文字模型不可用时允许规则降级，`interaction=rules` 和 `notice` 解释实际来源。附近 POI 不证明商家正在营业，公交计划不等于实时车辆位置，草稿复制不等于发送。
+工作模式环境记录 `speak=false`；`direct_question` 允许 `speak=true`，此值由客户端遵守。文字模型不可用时允许规则降级，`interaction=rules` 和 `notice` 解释实际来源。附近 POI 不证明商家正在营业，公交计划不等于实时车辆位置，草稿复制不等于发送。原文出现“下一站”不自动生成到站草稿；ETA 引用还要求近期路线和足够精确的定位。
 
 ## 设置
 
