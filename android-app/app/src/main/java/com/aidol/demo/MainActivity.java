@@ -748,9 +748,10 @@ public final class MainActivity extends Activity {
             StringBuilder raw = new StringBuilder();
             for (int i = 0; i < sources.length(); i++) {
                 JSONObject source = sources.optJSONObject(i); if (source == null) continue;
-                label(workMeetingDetail, "片段 " + (source.optInt("segment_index") + 1), 11, WORK);
+                String time = date(source.optString("created_at"));
+                label(workMeetingDetail, "片段 " + (source.optInt("segment_index") + 1) + " · " + time, 11, WORK);
                 label(workMeetingDetail, source.optString("text"), 15, INK).setTextIsSelectable(true);
-                if (raw.length() > 0) raw.append("\n\n"); raw.append(source.optString("text"));
+                if (raw.length() > 0) raw.append("\n\n"); raw.append("[").append(time).append("] ").append(source.optString("text"));
             }
             if (raw.length() > 0) button(workMeetingDetail, "复制本次会议原文", false, () -> copy("会议原文", raw.toString()));
         } else if (report != null) {
@@ -1878,7 +1879,7 @@ public final class MainActivity extends Activity {
     private static void put(JSONObject value, String key, Object object) { try { value.put(key, object); } catch (Exception ignored) { } }
     private static String fallback(String text, String other) { return text == null || text.isEmpty() ? other : text; }
     private static String value(EditText field) { return field.getText().toString().trim(); }
-    private static String date(String raw) { try { return java.time.OffsetDateTime.parse(raw).atZoneSameInstant(java.time.ZoneId.systemDefault()).format(java.time.format.DateTimeFormatter.ofPattern("MM-dd HH:mm")); } catch (Exception e) { return raw; } }
+    private static String date(String raw) { return TimeFormat.format(raw); }
     private static String kind(String raw) { return "preference".equals(raw) ? "偏好" : "task".equals(raw) ? "待办" : "trip".equals(raw) ? "出行" : "事实"; }
     private static boolean pinned(JSONObject memory) { return memory.optBoolean("pinned") || memory.optInt("pinned", 0) == 1; }
 
