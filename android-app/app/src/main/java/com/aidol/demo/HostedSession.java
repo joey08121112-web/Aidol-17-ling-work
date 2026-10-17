@@ -16,6 +16,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
 import okhttp3.Call;
 import org.json.JSONObject;
@@ -84,6 +85,31 @@ public final class HostedSession {
     private final Runnable startupTimeout = () -> failCapture("麦克风启动超时，请恢复或重连设备后重试");
     private final Runnable stopTimeout = () -> failCapture("聆听停止未确认，已丢弃本轮，请恢复或重连耳机");
 
+    /**
+     * Overlaps the ASR end flush (socket ready handshake plus the end message) with the local
+     * end cue: independent systems that were previously serialized. The chain joins before
+     * proceeding and the flush failure surfaces exactly where the serial version threw it.
+     */
+    static final class TurnFlush {
+        interface Step { void run() throws Exception; }
+        private final AtomicReference<Exception> failure = new AtomicReference<>();
+        private final Thread worker;
+        TurnFlush(String name, Step step) {
+            worker = new Thread(() -> {
+                try { step.run(); }
+                catch (Exception error) { failure.compareAndSet(null, error); }
+            }, name);
+            worker.setDaemon(true);
+        }
+        TurnFlush start() { worker.start(); return this; }
+        void await() throws Exception {
+            worker.join();
+            Exception error = failure.get();
+            if (error != null) throw error;
+        }
+        void cancel() { worker.interrupt(); }
+    }
+
     public HostedSession(Context context, ApiClient api, Listener listener) {
         this(context, api, AudioMode.RISE_SDK, listener);
     }
@@ -139,6 +165,9 @@ public final class HostedSession {
     private volatile WorkLiveCaptions live;
     private volatile boolean liveWanted;
     private final Runnable liveReconnect = this::reconnectLive;
+    /** Wakes the work loop for a closed segment, capture end or failure, instead of 10 Hz polling. */
+    private final PlaybackLease.EventSignal workArrived = new PlaybackLease.EventSignal();
+    private static final long WORK_IDLE_FALLBACK_MILLIS = 1000;
     public String workMeetingId() { return workRecording && workMeetingStarted ? sessionId : ""; }
     public boolean workSaving() { return workRecording && workStopping.get(); }
     public boolean workPaused() { WorkAudioBuffer buffer = workBuffer; return buffer != null && buffer.paused(); }
@@ -152,6 +181,8 @@ public final class HostedSession {
         try {
             long offset = buffer.pause();
             if (offset < 0) return false;
+            // Pausing closes the partial segment; the loop should see it without waiting.
+            workArrived.signal();
             WorkLiveCaptions current = live; if (current != null) current.pause();
             postWorkEvent("pause", offset, "app");
             status("已暂停 · 不记录、不上传；点“继续”恢复");
@@ -284,19 +315,31 @@ public final class HostedSession {
                     failCapture("聆听等待超时，已丢弃本轮，请恢复或重连设备");
                 clearCaptureTimers(); check();
                 if (failure != null) throw new IOException(failure);
-                byte[] pcm = prompts.finish(() -> {
-                    byte[] snapshot = turn.finish();
-                    captureActive = false; releaseCaptureFocus(); diagnostic("结束并排空");
-                    if (snapshot.length < 3200) throw new IOException("刚才没听清，请再说一次");
-                    // Flush ASR as soon as the hardware drain is confirmed;
-                    // the short END cue can play while the backend finalizes.
-                    if (upload != null && uploadStarted) { upload.awaitReady(); check(); upload.finish(); }
-                    return snapshot;
-                }, () -> {}, cueFailure -> {
-                    promptNotice = "结束提示音未播放";
-                    status("聆听已结束，提示音未播放；正在提交聆听");
-                    diagnostic("结束提示音失败 · " + audioFailure(cueFailure));
-                });
+                final TurnFlush[] flush = new TurnFlush[1];
+                byte[] pcm;
+                try {
+                    pcm = prompts.finish(() -> {
+                        byte[] snapshot = turn.finish();
+                        captureActive = false; releaseCaptureFocus(); diagnostic("结束并排空");
+                        if (snapshot.length < 3200) throw new IOException("刚才没听清，请再说一次");
+                        // The ASR end flush and the END cue wait on independent systems (socket
+                        // handshake vs local audio); run them overlapped, not back to back.
+                        if (upload != null && uploadStarted)
+                            flush[0] = new TurnFlush("aidol-upload-flush", () -> {
+                                upload.awaitReady(); check(); upload.finish();
+                            }).start();
+                        return snapshot;
+                    }, () -> {}, cueFailure -> {
+                        promptNotice = "结束提示音未播放";
+                        status("聆听已结束，提示音未播放；正在提交聆听");
+                        diagnostic("结束提示音失败 · " + audioFailure(cueFailure));
+                    });
+                    // Join the overlapped flush where the serial chain used to continue.
+                    if (flush[0] != null) flush[0].await();
+                } finally {
+                    // An abandoned drain must not leave the flush thread waiting on its latches.
+                    if (flush[0] != null) flush[0].cancel();
+                }
                 if (callTurn && !qwenRealtime && !endpoint.heardSpeech()) {
                     if (upload != null) upload.cancel();
                     status("我在，想说的时候直接说"); post(listener::idle); return;
@@ -427,7 +470,7 @@ public final class HostedSession {
     private void workFailure(String message) {
         failure = message;
         captureActive = false;
-        capture.close(); end.countDown();
+        capture.close(); end.countDown(); workArrived.signal();
     }
     private void runWorkRecording() throws Exception {
         status("正在创建本次会议记录…");
@@ -497,6 +540,9 @@ public final class HostedSession {
                         WorkLiveCaptions current = live;
                         if (current != null && !current.audio(pcm)) scheduleLiveReconnect();
                     }
+                    // A pending closed segment is what the loop waits for; per-frame signals are
+                    // no-ops while the loop is busy uploading (no waiter).
+                    if (workBuffer.peek() != null) workArrived.signal();
                     long now = SystemClock.elapsedRealtime();
                     if (now - lastMeter > 300) {
                         lastMeter = now; long size = workBuffer.size(); double rms = AudioFrames.rms(pcm);
@@ -507,6 +553,7 @@ public final class HostedSession {
             public void error(String message) { workFailure(message); }
         });
         boolean liveClosed = false, liveConfirmed = false;
+        long seen = workArrived.version();
         while (true) {
             check();
             if (failure != null) throw new IOException(failure);
@@ -521,7 +568,10 @@ public final class HostedSession {
                 liveEndedHealthySince = liveConfirmed ? since : Long.MAX_VALUE;
             }
             if (segment != null && !LiveCoverage.settled(segment.endedAt, LiveCoverage.now(), captureEnded)) {
-                end.await(100, TimeUnit.MILLISECONDS); continue;
+                // Wake exactly at the settle boundary, or early when capture ends or fails.
+                workArrived.await(seen, Math.max(1, LiveCoverage.SETTLE_MS - (LiveCoverage.now() - segment.endedAt)));
+                seen = workArrived.version();
+                continue;
             }
             if (segment != null) {
                 workBuffer.poll();
@@ -551,7 +601,11 @@ public final class HostedSession {
                     throw new IOException("工作记录未完整保存；请查看历史确认已提交部分。" + error.getMessage(), error);
                 }
             } else if (workBuffer.complete()) break;
-            else end.await(100, TimeUnit.MILLISECONDS);
+            else {
+                // Signals cover segments, capture end and failure; the cap only guards a missed wake.
+                workArrived.await(seen, WORK_IDLE_FALLBACK_MILLIS);
+                seen = workArrived.version();
+            }
         }
     }
     private volatile long liveEndedHealthySince = Long.MAX_VALUE;
@@ -659,7 +713,7 @@ public final class HostedSession {
                         ui.removeCallbacks(stopTimeout); ui.removeCallbacks(startupTimeout);
                         captureActive = false;
                         try { workBuffer.finish(); } catch (IOException error) { failure = error.getMessage(); }
-                        releaseCaptureFocus(); end.countDown();
+                        releaseCaptureFocus(); end.countDown(); workArrived.signal();
                     }
                     public void error(String message) { workFailure(message); }
                 });
@@ -698,7 +752,7 @@ public final class HostedSession {
         }
         clearCaptureTimers();
         if (upload != null) upload.cancel();
-        capture.close(); releaseCaptureFocus(); end.countDown(); diagnostic("聆听失败");
+        capture.close(); releaseCaptureFocus(); end.countDown(); workArrived.signal(); diagnostic("聆听失败");
     }
     private void requestCaptureFocus() throws IOException {
         if (mode != AudioMode.RISE_SDK) return;
@@ -853,7 +907,7 @@ public final class HostedSession {
     public void cancel() {
         if (!cancelled.compareAndSet(false, true)) return;
         if (duplex != null) duplex.cancel();
-        events.invalidate(); captureActive = false; turn.cancel(); clearCaptureTimers(); end.countDown();
+        events.invalidate(); captureActive = false; turn.cancel(); clearCaptureTimers(); end.countDown(); workArrived.signal();
         if (upload != null) upload.cancel();
         liveWanted = false; WorkLiveCaptions current = live; if (current != null) current.close();
         if (pending != null) pending.cancel(); cancelPlayer();
