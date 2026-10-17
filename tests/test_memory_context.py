@@ -1,4 +1,4 @@
-"""Demo full-memory context, using isolated accounts and offline reply providers."""
+"""Demo TOP-K memory context, using isolated accounts and offline reply providers."""
 import json
 
 import httpx
@@ -11,15 +11,19 @@ from app.storage import Store
 from app.services.qwen_voice import realtime_instructions
 
 
-def test_full_context_has_all_kinds_beyond_snapshot_limit_and_refreshes(agent, store, tmp_path):
+def test_topk_context_keeps_newest_rows_beyond_snapshot_limit_and_refreshes(agent, store, tmp_path):
     for index in range(305):
         store.add('memories', content=f'旧记录{index}', kind='fact', source='user')
     rows = [store.add('memories', content=content, kind=kind, source='user')
             for kind, content in [('preference', '不吃香菜'), ('task', '周五交方案'),
                                   ('trip', '下周去上海')]]
     context = agent.instructions(directed=True)
-    for row in store.conversation_memories():
-        assert row['id'] in context and row['content'] in context
+    injected = store.conversation_memories()
+    # 注入上限 60：最新三类保留，远期旧记录淘汰出每轮提示词。
+    assert len(injected) == 60
+    for row in injected:
+        assert row['content'] in context
+    assert '旧记录304' in context and '旧记录0' not in context and '旧记录240' not in context
     other = Store(str(tmp_path / 'other.sqlite3'))
     other.add('memories', content='另一个账号的秘密', kind='fact', source='user')
     assert '另一个账号的秘密' not in context

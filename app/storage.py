@@ -23,6 +23,7 @@ def now():
 
 WORK_SEGMENT_MS = 20000  # Older clients cut fixed 20 s segments and send no offset.
 PCM_BYTES_PER_MS = 32    # 16 kHz mono PCM16.
+MEMORY_CONTEXT_LIMIT = 60  # Per-round prompt injection cap: pinned+relevant+recent.
 
 
 _SENTENCE_END = re.compile(r'[^。！？!?；;\n]+[。！？!?；;]*')
@@ -316,11 +317,34 @@ class Store:
                 row["source_ids"] = json.loads(row["source_ids"])
         return result
 
-    def conversation_memories(self):
-        """Demo context: all saved memories in this account, without list limits."""
+    def conversation_memories(self, question="", limit=MEMORY_CONTEXT_LIMIT):
+        """Top-K prompt context: pinned favorites first, then FTS5 matches for the
+        current question, then most recent. The unbounded full history stays out
+        of every-round prompts; recall_memory covers the rest on demand."""
+        if limit <= 0:
+            return []
+        terms = query_terms(question or "")
+        match = " OR ".join('"' + term + '"' for term in sorted(terms)) if terms else ""
+        # Tiered fill, deterministic inside a tier; ids dedupe across tiers.
+        queries = [
+            ("SELECT * FROM memories WHERE pinned=1 ORDER BY created_at DESC,id LIMIT ?", (limit,)),
+        ]
+        if match:
+            queries.append(("SELECT m.* FROM recall_index JOIN memories m ON m.id=recall_index.record_id "
+                            "WHERE recall_index MATCH ? AND recall_index.collection='memories' "
+                            "ORDER BY bm25(recall_index),m.created_at DESC,m.id LIMIT ?", (match, limit)))
+        queries.append(("SELECT * FROM memories ORDER BY created_at DESC,id LIMIT ?", (limit,)))
+        selected, seen = [], set()
         with self.connect() as db:
-            return [dict(row) for row in db.execute(
-                "SELECT * FROM memories ORDER BY created_at,id")]
+            for sql, params in queries:
+                for row in db.execute(sql, params).fetchall():
+                    if row["id"] in seen:
+                        continue
+                    seen.add(row["id"])
+                    selected.append(dict(row))
+                    if len(selected) >= limit:
+                        return selected
+        return selected
 
     def meeting_report(self, signature=None):
         with self.connect() as db:
