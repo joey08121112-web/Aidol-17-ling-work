@@ -27,7 +27,7 @@
 
 ## 换机与硬件资料
 
-当前 Rise 交接必须包含官方 `耳机SDK Android 文档.docx`、`demo_6_7.zip` 和当前源码快照。官方 ZIP 是导入 SDK 的来源，不能与已移除的项目 Demo 混淆。固定 AAR 校验与导入步骤见 [M0/M1 交接](android-m0-m1-handoff.md)。只发旧 HEAD 无法复现当前未提交实现。
+当前 Rise 交接必须包含官方 `耳机SDK Android 文档.docx`、`demo_6_7.zip` 和当前源码快照。厂商资料已纳入 `vendor/rise/6.7/`，随 Git 同步；Demo ZIP 去除了示例签名私钥和密码，官方 AAR 保持原样。它是导入 SDK 的来源，不能与已移除的项目 Demo 混淆。固定 AAR 校验与导入步骤见 [M0/M1 交接](android-m0-m1-handoff.md)。只发旧 HEAD 无法复现当前未提交实现。
 
 `python scripts/package_android_handoff.py --official-doc <官方.docx路径> --demo-zip <demo_6_7.zip路径>` 可重新生成源码交接包。以前生成的 ZIP 和 APK 是当时快照，收窄目录后需要重新打包才能反映当前源码；不把本机数据或凭证装入交接包。
 
@@ -35,7 +35,7 @@
 
 本地回归运行 `python -m pytest tests -q`、`python -m compileall -q app`；Android 使用 JDK 17 / SDK 35 运行 `testDebugUnitTest lintDebug assembleDebug`。官网单独检查桌面、窄屏、交互、资源和 APK 下载。真实供应商脚本可能消耗配额，仅由开发者按需手动执行。
 
-按项目清理要求，仓库不启用 GitHub CI workflow。每位开发者在本地执行后端离线测试、编译、启动器配置检查及官网 `node --check website/app.js`。官方 SDK AAR 不进 Git，取得官方 Word 与 `demo_6_7.zip` 并导入后完成 Android 检查；软件检查不能代替硬件验收。
+按项目清理要求，仓库不启用 GitHub CI workflow。每位开发者在本地执行后端离线测试、编译、启动器配置检查及官网 `node --check website/app.js`。官方 SDK AAR 已包含在 Git 中的 `vendor/rise/6.7/demo_6_7.zip`，导入后完成 Android 检查；软件检查不能代替硬件验收。
 
 Windows 已观察到真实手机连接和 Rise READY、电量/佩戴上报；手机断网健康检查及移除/恢复 USB reverse 的对照通过。Windows USB 本地服务与 SDK 6.7 的一次真机短语音收到 `mic_bytes=107520`，ASR、业务、TTS 和目标 Rise 输出核验成功，用户确认转写正确并从耳机听到回复。记忆来源、手机断网注册/文字请求、远端 SDK 组合、macOS、麦克风来源对照、尾句和异常场景仍待验。追加的触控、佩戴与重连联动见 [Rise 联动](rise-controls.md)。当前会话前台结束后停止，没有实时双工、锁屏服务、ANC 或盒子接入。结果分别记入 [验收记录](acceptance.md)，不得把单轮通过扩展为全部硬件场景通过。
 

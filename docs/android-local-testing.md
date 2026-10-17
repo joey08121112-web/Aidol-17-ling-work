@@ -6,17 +6,17 @@
 
 安装 Python 3.11+、JDK 17、Android Studio、Android SDK Platform 35 和 Platform Tools。设置 `JAVA_HOME` 与 `ANDROID_HOME`，或在 Android Studio 指定 JDK/SDK。Windows 必要时安装手机厂商官方 USB 驱动；macOS 通常无需厂商驱动。使用可传数据的 USB 线，手机启用开发者选项 → USB 调试，解锁并接受本台电脑 RSA 授权。每机独立创建 `.venv`，不得跨 Windows/Mac 复制。
 
-先取得官方 Word 与 `demo_6_7.zip`，再导入固定 SDK：
+官方 Word 与包含原版 AAR 的 `demo_6_7.zip` 已随 Git 存放在 `vendor/rise/6.7/`（Demo 已去除示例签名私钥和密码），拉取后导入固定 SDK：
 
 ```powershell
 # Windows，在仓库根目录
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\import-rise-sdk.ps1 -DemoZip 'D:\Backup\Downloads\demo_6_7.zip'
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\import-rise-sdk.ps1 -DemoZip vendor/rise/6.7/demo_6_7.zip
 powershell -NoProfile -ExecutionPolicy Bypass -File .\start-android-backend.ps1
 ```
 
 ```sh
 # macOS，在仓库根目录；路径替换为本机收到的官方包
-bash scripts/import-rise-sdk.sh "$HOME/Downloads/demo_6_7.zip"
+bash scripts/import-rise-sdk.sh vendor/rise/6.7/demo_6_7.zip
 chmod +x android-app/gradlew
 sh ./start-android-backend.sh
 ```
@@ -186,7 +186,7 @@ release 保持证书和主机名验证。本地 HTTP 在所有构建中仅对精
 
 编译/单元测试、mock、供应商检查、完整链路和物理耳机测试分别填写 [验收记录](acceptance.md)。Windows 已有一次 USB 本地 SDK 6.7 短语音和用户听音确认，记忆来源、远端 SDK 组合、macOS 与异常场景仍需独立验证。历史模拟器源码保留用于参考，但入口已停用，历史运行记录不构成当前产品支持。
 
-按项目清理要求，仓库不启用 GitHub CI workflow；后端离线测试、Python 编译、启动器配置和官网 `website/app.js` 语法检查在本地执行。Android 所需固定官方 AAR 不进 Git；取得官方 Word 和 `demo_6_7.zip`、导入 SDK 后，使用 JDK 17 / SDK 35 执行 `testDebugUnitTest lintDebug assembleDebug`。软件检查通过不代表真机验收通过。
+按项目清理要求，仓库不启用 GitHub CI workflow；后端离线测试、Python 编译、启动器配置和官网 `website/app.js` 语法检查在本地执行。Android 所需固定官方 AAR 包含在 Git 中的 `vendor/rise/6.7/demo_6_7.zip`；导入 SDK 后，使用 JDK 17 / SDK 35 执行 `testDebugUnitTest lintDebug assembleDebug`。软件检查通过不代表真机验收通过。
 
 ## 常见排查
 
