@@ -43,7 +43,7 @@ def create_hosted_app(config=None, data_directory=None):
     from contextlib import asynccontextmanager
     from fastapi import Depends
     from fastapi.exceptions import RequestValidationError
-    from pydantic import BaseModel, Field, field_validator
+    from pydantic import BaseModel, Field, field_validator, model_validator
     from starlette.concurrency import run_in_threadpool
     from .storage import AccountStore, Store
     from .services.accounts import digest, password_hash, password_matches, DUMMY_PASSWORD
@@ -162,9 +162,31 @@ def create_hosted_app(config=None, data_directory=None):
         @field_validator('reminder_hours')
         @classmethod
         def reminder_choice(cls, value):
-            if value not in (1, 6, 24):
-                raise ValueError('提醒提前量仅支持1小时、6小时、1天')
+            if value not in (0, 1, 6, 24):
+                raise ValueError('提醒提前量仅支持不提醒、1小时、6小时、1天')
             return value
+
+    class TaskEdit(BaseModel):
+        content: str = Field(min_length=1, max_length=500)
+        owner: str = Field(default='', max_length=100)
+        due: str = Field(default='', max_length=500)
+        due_at: datetime | None = None
+        reminder_hours: int = 0
+
+        @model_validator(mode='after')
+        def valid_edit(self):
+            self.content = self.content.strip()
+            self.owner = self.owner.strip()
+            self.due = self.due.strip()
+            if not self.content:
+                raise ValueError('请输入待办内容')
+            if self.due_at is not None and self.due_at.tzinfo is None:
+                raise ValueError('截止时间需包含时区')
+            if self.reminder_hours not in (0, 1, 6, 24):
+                raise ValueError('提醒提前量仅支持不提醒、1小时、6小时、1天')
+            if self.reminder_hours and self.due_at is None:
+                raise ValueError('开启提醒前请选择具体截止时间')
+            return self
 
     class LocationRecord(LocationInput):
         accuracy: float = Field(default=0, ge=0, le=200)
@@ -1249,6 +1271,15 @@ def create_hosted_app(config=None, data_directory=None):
                     value.due_at.astimezone(timezone.utc).isoformat(), value.reminder_hours)
             except ValueError as exc:
                 raise HTTPException(409, str(exc)) from None
+
+    @api.put('/v1/tasks/{task_id}')
+    async def edit_task(task_id: str, value: TaskEdit, request: Request, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            task = rt.store.edit_action_task(task_id, value.content, value.owner, value.due,
+                value.due_at.astimezone(timezone.utc).isoformat() if value.due_at is not None else '', value.reminder_hours)
+            if task is None:
+                raise HTTPException(404, '待办不存在')
+            return task
 
     @api.delete('/v1/tasks/{task_id}')
     async def delete_task(task_id: str, request: Request, current=Depends(user)):

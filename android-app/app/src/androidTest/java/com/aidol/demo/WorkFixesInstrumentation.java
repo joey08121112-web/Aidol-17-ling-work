@@ -18,8 +18,8 @@ public final class WorkFixesInstrumentation extends Instrumentation {
     private ApiClient api;
     private final List<String> created = new ArrayList<>();
     private File output;
-    private boolean checkNotification = true, optionsOnly;
-    @Override public void onCreate(Bundle arguments) { super.onCreate(arguments); optionsOnly = arguments != null && "true".equals(arguments.getString("work_options_only")); checkNotification = arguments == null || !"true".equals(arguments.getString("skip_reminder_wait")); start(); }
+    private boolean checkNotification = true, optionsOnly, editOnly;
+    @Override public void onCreate(Bundle arguments) { super.onCreate(arguments); editOnly = arguments != null && "true".equals(arguments.getString("task_edit_only")); optionsOnly = arguments != null && "true".equals(arguments.getString("work_options_only")); checkNotification = arguments == null || !"true".equals(arguments.getString("skip_reminder_wait")); start(); }
     @Override public void onStart() {
         Bundle result = new Bundle(); int outcome = Activity.RESULT_CANCELED;
         try {
@@ -28,11 +28,16 @@ public final class WorkFixesInstrumentation extends Instrumentation {
             if (!api.serverUrl.startsWith("http://127.0.0.1:") || api.vault.token().isEmpty()) throw new AssertionError("Requires a signed-in local USB development build");
             if (!getTargetContext().getSystemService(NotificationManager.class).areNotificationsEnabled()) throw new AssertionError("Enable notifications before reminder smoke test");
             output = new File(getTargetContext().getExternalFilesDir(null), "work-fixes"); output.mkdirs();
-            if (optionsOnly) {
+            if (editOnly) {
+                reviewTaskEditing();
+                result.putString("stream", "PASS: real swipe exposes edit/delete; same task editor prefills content, owner, deadline and lead; cancel preserves data; date/time and lead changes save through PUT without moving page or changing ID/status/order; " + (checkNotification ? "rescheduled alarm delivers edited content; " : "notification timing skipped in layout rerun; ") + "location callback is silent and Bluetooth popup remains. Temporary task removed.");
+                outcome = Activity.RESULT_OK;
+            } else if (optionsOnly) {
                 reviewWorkOptions();
                 result.putString("stream", "PASS: rounded work pickers show current selection, highlight changes, confirm selection and preserve scrollY/header position on cancel and simulated save/report results. No server settings changed or AI requests made.");
                 finish(Activity.RESULT_OK, result); return;
             }
+            if (!editOnly) {
             String id = UUID.randomUUID().toString(), text = "Aidol UI smoke " + id.substring(0, 6);
             api.json("POST", "/v1/tasks", new JSONObject().put("task_id", id).put("content", text).put("owner", "Test")
                 .put("due_at", Instant.now().plusSeconds(3620).toString()).put("reminder_hours", 1)); created.add(id);
@@ -73,7 +78,7 @@ public final class WorkFixesInstrumentation extends Instrumentation {
             sendPointerSync(MotionEvent.obtain(down, SystemClock.uptimeMillis(), MotionEvent.ACTION_UP, x - 144 * density, y, 0)); SystemClock.sleep(300);
             if (shell.getChildAt(1).getTranslationX() > -60 * density) throw new AssertionError("Swipe did not reveal deletion");
             capture(activity.getWindow().getDecorView(), "02-swipe-delete");
-            main(() -> shell.getChildAt(0).performClick()); awaitStatus(id, null);
+            main(() -> find(shell.getChildAt(0), "删除").performClick()); awaitStatus(id, null);
             main(() -> ((ActionTaskBoard) field(activity, "taskBoard")).addDialog()); SystemClock.sleep(400);
             Dialog add = latestDialog();
             if (add == null) throw new AssertionError("Custom task dialog missing");
@@ -99,11 +104,102 @@ public final class WorkFixesInstrumentation extends Instrumentation {
             getTargetContext().getSharedPreferences("meeting_edit_drafts", Context.MODE_PRIVATE).edit().remove((String) field(editor[0], "draftKey")).commit();
             result.putString("stream", "PASS: checkbox/reopen preserve exact scroll; meeting updates preserve task viewport; " + (checkNotification ? "local alarm delivered system notification; " : "reminder timing skipped in layout-only rerun; ") + "swipe reveals deletion; custom form saves; correction editor retains text. Synthetic tasks cleaned up.");
             outcome = Activity.RESULT_OK;
+            }
         } catch (Throwable error) { result.putString("stream", "FAIL: " + android.util.Log.getStackTraceString(error)); }
         finally {
             if (api != null) for (String id : created) try { api.json("DELETE", "/v1/tasks/" + id, null); TaskReminders.cancel(getTargetContext(), id); } catch (Exception ignored) {}
         }
         finish(outcome, result);
+    }
+    private void reviewTaskEditing() throws Exception {
+        String id = UUID.randomUUID().toString(), text = "Aidol edit smoke " + id.substring(0, 6), changed = text + " updated";
+        String initialDue = Instant.now().plusSeconds(172800).toString();
+        JSONObject initial = api.json("POST", "/v1/tasks", new JSONObject().put("task_id", id).put("content", text).put("owner", "Before")
+            .put("due_at", initialDue).put("reminder_hours", 1)); created.add(id);
+        JSONObject state = api.json("GET", "/v1/state", null);
+        main(() -> { set(activity, "state", state); set(activity, "tab", 2); invoke(activity, "showApp"); }); SystemClock.sleep(500);
+        ScrollView scroll = (ScrollView) field(activity, "scroll");
+        CheckBox check = (CheckBox) find(activity.getWindow().getDecorView(), text);
+        if (check == null) throw new AssertionError("Edit fixture missing");
+        placeInViewport(scroll, check); int y = scroll.getScrollY();
+        FrameLayout shell = (FrameLayout) check.getParent().getParent();
+        int[] at = new int[2]; check.getLocationOnScreen(at); float density = activity.getResources().getDisplayMetrics().density;
+        float x = at[0] + check.getWidth() - 16 * density, sy = at[1] + check.getHeight() / 2f;
+        long down = SystemClock.uptimeMillis(); sendPointerSync(MotionEvent.obtain(down, down, MotionEvent.ACTION_DOWN, x, sy, 0));
+        for (int i = 1; i <= 10; i++) { SystemClock.sleep(25); sendPointerSync(MotionEvent.obtain(down, SystemClock.uptimeMillis(), MotionEvent.ACTION_MOVE, x - i * 20 * density, sy, 0)); }
+        sendPointerSync(MotionEvent.obtain(down, SystemClock.uptimeMillis(), MotionEvent.ACTION_UP, x - 200 * density, sy, 0)); SystemClock.sleep(250);
+        if (Math.abs(shell.getChildAt(1).getTranslationX() + 176 * density) > 2) throw new AssertionError("Edit/delete swipe width incorrect");
+        capture(activity.getWindow().getDecorView(), "07-task-edit-swipe");
+        main(() -> find(shell.getChildAt(0), "编辑").performClick()); SystemClock.sleep(300);
+        Dialog dialog = latestDialog(); List<EditText> inputs = new ArrayList<>(); edits(dialog.getWindow().getDecorView(), inputs);
+        if (!text.equals(inputs.get(0).getText().toString()) || !"Before".equals(inputs.get(1).getText().toString())) throw new AssertionError("Editor did not prefill content/owner");
+        if (find(dialog.getWindow().getDecorView(), TimeFormat.format(initial.optString("due_at"))) == null || !((RadioButton) find(dialog.getWindow().getDecorView(), "1h")).isChecked()) throw new AssertionError("Editor did not prefill deadline/reminder");
+        main(() -> { inputs.get(0).setText("Canceled draft"); find(dialog.getWindow().getDecorView(), "取消").performClick(); }); SystemClock.sleep(250);
+        if (!text.equals(taskById(id).optString("content")) || scroll.getScrollY() != y) throw new AssertionError("Cancel changed task/page");
+        main(() -> find(shell.getChildAt(0), "编辑").performClick()); SystemClock.sleep(200);
+        Dialog editing = latestDialog(); List<EditText> fields = new ArrayList<>(); edits(editing.getWindow().getDecorView(), fields);
+        main(() -> { fields.get(0).setText(changed); fields.get(1).setText("After"); find(editing.getWindow().getDecorView(), "6h").performClick(); find(editing.getWindow().getDecorView(), TimeFormat.format(initial.optString("due_at"))).performClick(); });
+        SystemClock.sleep(200);
+        java.time.ZonedDateTime target = java.time.ZonedDateTime.now().plusHours(6).plusSeconds(15).withSecond(0).withNano(0);
+        DatePicker picker = findType(activity, DatePicker.class);
+        if (picker == null) throw new AssertionError("Deadline date picker missing");
+        main(() -> { picker.updateDate(target.getYear(), target.getMonthValue() - 1, target.getDayOfMonth()); ((TextView) windowWith(picker).findViewById(android.R.id.button1)).performClick(); });
+        SystemClock.sleep(200); TimePicker time = findType(activity, TimePicker.class);
+        if (time == null) throw new AssertionError("Deadline time picker missing");
+        main(() -> { time.setHour(target.getHour()); time.setMinute(target.getMinute()); ((TextView) windowWith(time).findViewById(android.R.id.button1)).performClick(); });
+        SystemClock.sleep(250); capture(editing.getWindow().getDecorView(), "08-task-edit-form");
+        main(() -> find(editing.getWindow().getDecorView(), "保存修改").performClick());
+        for (int i = 0; i < 40 && !changed.equals(taskById(id).optString("content")); i++) SystemClock.sleep(100);
+        JSONObject saved = taskById(id);
+        if (!changed.equals(saved.optString("content")) || !"After".equals(saved.optString("owner")) || saved.optInt("reminder_hours") != 6
+                || !target.toInstant().equals(Instant.parse(saved.optString("due_at"))) || !initial.optString("created_at").equals(saved.optString("created_at")) || !"open".equals(saved.optString("status"))) throw new AssertionError("Edit did not preserve/save task fields");
+        SystemClock.sleep(500);
+        if (scroll != field(activity, "scroll") || scroll.getScrollY() != y) throw new AssertionError("Saving edit moved page");
+        JSONArray latest = api.json("GET", "/v1/tasks", null).getJSONArray("tasks");
+        if (!id.equals(latest.getJSONObject(0).optString("id"))) throw new AssertionError("Edit changed task order");
+        CheckBox updated = (CheckBox) find(activity.getWindow().getDecorView(), changed);
+        FrameLayout updatedRow = (FrameLayout) updated.getParent().getParent();
+        main(() -> find(updatedRow.getChildAt(0), "编辑").performClick()); SystemClock.sleep(250);
+        Dialog reopened = latestDialog();
+        if (reopened == null || find(reopened.getWindow().getDecorView(), changed) == null
+                || !((RadioButton) find(reopened.getWindow().getDecorView(), "6h")).isChecked()) throw new AssertionError("Saved editor did not reopen prefilled");
+        main(reopened::dismiss);
+        final ForegroundLocationMonitor.Listener listener = (ForegroundLocationMonitor.Listener) field(field(activity, "locationMonitor"), "listener");
+        main(() -> { ((TransientStatusPopup) field(activity, "statusPopup")).dismiss(); listener.updated(); });
+        Object popup = field(activity, "statusPopup");
+        if (field(popup, "bubble") != null || !((java.util.ArrayDeque<?>) field(popup, "pending")).isEmpty()) throw new AssertionError("Location still showed a popup");
+        main(() -> ((TransientStatusPopup) popup).show("蓝牙已连接"));
+        if (!"蓝牙已连接".equals(field(popup, "shown"))) throw new AssertionError("Bluetooth popup removed");
+        main(() -> ((TransientStatusPopup) popup).dismiss());
+        long until = SystemClock.elapsedRealtime() + 120000; boolean delivered = !checkNotification;
+        while (SystemClock.elapsedRealtime() < until && !delivered) {
+            for (android.service.notification.StatusBarNotification n : getTargetContext().getSystemService(NotificationManager.class).getActiveNotifications())
+                if (id.equals(n.getTag())) { delivered = changed.equals(n.getNotification().extras.getCharSequence(Notification.EXTRA_TEXT).toString()); }
+            if (!delivered) SystemClock.sleep(500);
+        }
+        if (!delivered) {
+            JSONObject local = new JSONObject(getTargetContext().getSharedPreferences("task_reminders", Context.MODE_PRIVATE).getString("tasks", "{}"));
+            JSONObject snapshot = local.optJSONObject(id);
+            throw new AssertionError("Edited reminder not delivered: now=" + Instant.now() + " testTask=" + snapshot
+                + " next=" + (snapshot == null ? -2 : TaskReminders.reminderAt(snapshot, System.currentTimeMillis())));
+        }
+    }
+    private JSONObject taskById(String id) throws Exception {
+        JSONArray tasks = api.json("GET", "/v1/tasks", null).getJSONArray("tasks");
+        for (int i = 0; i < tasks.length(); i++) if (id.equals(tasks.getJSONObject(i).optString("id"))) return tasks.getJSONObject(i);
+        throw new AssertionError("Task missing: " + id);
+    }
+    private View windowWith(View child) { return child.getRootView(); }
+    private <T extends View> T findType(Activity ignored, Class<T> type) throws Exception {
+        Class<?> globalType = Class.forName("android.view.WindowManagerGlobal"); Object global = globalType.getMethod("getInstance").invoke(null);
+        Field views = globalType.getDeclaredField("mViews"); views.setAccessible(true);
+        for (Object root : (List<?>) views.get(global)) { T found = findType((View) root, type); if (found != null) return found; }
+        return null;
+    }
+    private <T extends View> T findType(View root, Class<T> type) {
+        if (type.isInstance(root)) return type.cast(root);
+        if (root instanceof ViewGroup) for (int i = 0; i < ((ViewGroup) root).getChildCount(); i++) { T found = findType(((ViewGroup) root).getChildAt(i), type); if (found != null) return found; }
+        return null;
     }
     private void reviewWorkOptions() throws Exception {
         JSONObject original = api.json("GET", "/v1/state", null);

@@ -11,7 +11,7 @@ final class SwipeTaskRow extends FrameLayout {
     private boolean dragging;
     private final float reveal;
     private final int slop;
-    SwipeTaskRow(Context context) { super(context); reveal = 88 * getResources().getDisplayMetrics().density; slop = ViewConfiguration.get(context).getScaledTouchSlop(); }
+    SwipeTaskRow(Context context) { super(context); reveal = 176 * getResources().getDisplayMetrics().density; slop = ViewConfiguration.get(context).getScaledTouchSlop(); }
     void foreground(View value) { card = value; }
     @Override public boolean onInterceptTouchEvent(android.view.MotionEvent e) {
         if (e.getActionMasked() == MotionEvent.ACTION_DOWN) {

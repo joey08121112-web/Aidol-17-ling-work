@@ -380,6 +380,28 @@ class Store:
     def task_fingerprint(task):
         return hashlib.sha256(json.dumps([task['content'], task['owner'], task['due']], ensure_ascii=False).encode()).hexdigest()
 
+    def edit_action_task(self, task_id, content, owner, due, due_at, reminder_hours):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            task = db.execute('SELECT * FROM action_tasks WHERE id=?', (task_id,)).fetchone()
+            if not task:
+                return None
+            if (task['content'], task['owner'], task['due'], task['due_at'], task['reminder_hours']) == (content, owner, due_at or due, due_at, reminder_hours):
+                result = dict(task)
+                result['source_ids'] = json.loads(result['source_ids'])
+                return result
+            report = db.execute('SELECT payload FROM meeting_reports WHERE id=?', (task['report_id'],)).fetchone()
+            if report:
+                # A user-edited action is independent of the report's generated snapshot.
+                # Retain source_ids so forgetting source evidence still removes the action.
+                scope = json.loads(report['payload']).get('meeting_id') or task['report_id']
+                db.execute('INSERT OR IGNORE INTO action_task_dismissals VALUES(?,?)', (scope, self.task_fingerprint(task)))
+            db.execute("UPDATE action_tasks SET content=?,owner=?,due=?,due_at=?,reminder_hours=?,report_id='' WHERE id=?",
+                       (content, owner, due_at or due, due_at, reminder_hours, task_id))
+            result = dict(db.execute('SELECT * FROM action_tasks WHERE id=?', (task_id,)).fetchone())
+            result['source_ids'] = json.loads(result['source_ids'])
+            return result
+
     def delete_action_task(self, task_id):
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -1045,7 +1067,7 @@ class Store:
             payload = {**payload, 'location': json.loads(fresh['location'] or '{}')}
             old_id = current['report_id']
             old_tasks = { (task['content'], task['owner'], task['due'], tuple(sorted(json.loads(task['source_ids'])))): dict(task)
-                          for task in db.execute('SELECT * FROM action_tasks WHERE report_id=?', (old_id,)) }
+                          for task in db.execute("SELECT * FROM action_tasks WHERE report_id=? AND report_id!=''", (old_id,)) }
             if old_id:
                 db.execute('DELETE FROM action_tasks WHERE report_id=?', (old_id,))
                 db.execute('DELETE FROM meeting_reports WHERE id=?', (old_id,))

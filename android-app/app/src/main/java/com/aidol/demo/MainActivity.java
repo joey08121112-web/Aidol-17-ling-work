@@ -255,7 +255,7 @@ public final class MainActivity extends Activity {
             ? meetingPage.getWindow().getDecorView() : getWindow().getDecorView());
         locationMonitor = new ForegroundLocationMonitor(this, new ForegroundLocationMonitor.Listener() {
             @Override public void status(String message) { maintenanceLocationStatus = message; renderMaintenanceStatus(); }
-            @Override public void updated() { if (visible && !isDestroyed()) statusPopup.show("定位已更新"); }
+            @Override public void updated() { /* Location maintenance updates the status line silently. */ }
         });
         quickFeedback = new QuickFeedback(this, headset::matchesOutput, this::canSpeakFeedback);
         meetingPlayback = new MeetingPlayback(this, headset::matchesOutput, this::meetingPlaybackChanged);

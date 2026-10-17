@@ -18,6 +18,10 @@ public final class TaskReminders extends android.content.BroadcastReceiver {
             return Math.max(now + 1000, due - hours * 3600000L);
         } catch (Exception ignored) { return -1; }
     }
+    static boolean sameReminder(JSONObject previous, JSONObject current) {
+        return previous != null && previous.optString("due_at").equals(current.optString("due_at"))
+            && previous.optInt("reminder_hours") == current.optInt("reminder_hours");
+    }
     private static android.content.SharedPreferences prefs(Context c) { return c.getSharedPreferences(PREF, Context.MODE_PRIVATE); }
     private static JSONObject saved(Context c) {
         try { return new JSONObject(prefs(c).getString("tasks", "{}")); } catch (JSONException e) { return new JSONObject(); }
@@ -45,7 +49,9 @@ public final class TaskReminders extends android.content.BroadcastReceiver {
             String id = task.optString("id");
             try {
                 JSONObject copy = new JSONObject(task.toString()), previous = old.optJSONObject(id);
-                if (previous != null && previous.optString("due_at").equals(copy.optString("due_at"))) copy.put("notified", previous.optBoolean("notified"));
+                if (sameReminder(previous, copy)) copy.put("notified", previous.optBoolean("notified"));
+                if (previous != null && (!sameReminder(previous, copy) || !previous.optString("content").equals(copy.optString("content"))
+                        || !previous.optString("owner").equals(copy.optString("owner")))) c.getSystemService(NotificationManager.class).cancel(id, 1);
                 if (copy.optInt("reminder_hours") > 0) next.put(id, copy);
                 else next.remove(id);
                 schedule(c, copy);

@@ -20,4 +20,12 @@ public class TaskRemindersTest {
     @Test public void pastReminderForFutureDeadlineIsDueSoonInsteadOfSilentlyLost() throws Exception {
         assertEquals(2000, TaskReminders.reminderAt(task("open", 10000, 1), 1000));
     }
+    @Test public void changingDeadlineOrLeadRearmsButTextOnlyEditsKeepDeliveredState() throws Exception {
+        JSONObject old = task("open", 200_000_000, 1).put("content", "before");
+        assertTrue(TaskReminders.sameReminder(old, new JSONObject(old.toString()).put("content", "after").put("owner", "New")));
+        assertFalse(TaskReminders.sameReminder(old, task("open", 200_000_000, 6)));
+        assertFalse(TaskReminders.sameReminder(old, task("open", 300_000_000, 1)));
+        assertFalse(TaskReminders.sameReminder(old, task("open", 200_000_000, 0)));
+        assertFalse(TaskReminders.sameReminder(null, old));
+    }
 }
