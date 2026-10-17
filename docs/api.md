@@ -7,15 +7,23 @@
 | 请求 | 契约 |
 | --- | --- |
 | `POST /v1/work-meetings` | `{"meeting_id":"客户端生成16–64位唯一编号"}`；工作模式下幂等建场，已结束编号不能复用。成功后才开启采音。 |
-| `POST /v1/voice?request_id=…&meeting_id=…&segment_index=0` | PCM16/16kHz；`meeting_id` 与从0递增的 `segment_index` 必须同时提供，来源为 `ambient_capture`。每段独立 request_id；原文与场次关联在一个事务内提交。静音段保留无原文回执，不假装记录了文字。同一编号重试不重复 ASR 或原文，不同请求占用同一片段编号返回409。 |
+| `POST /v1/voice?request_id=…&meeting_id=…&segment_index=0&offset_ms=0` | PCM16/16kHz；`meeting_id` 与从0递增的 `segment_index` 必须同时提供，来源为 `ambient_capture`。`recognize=0` 表示该段文字已由实时字幕保存：只存录音，不做 ASR、不计额度。默认 `recognize=1` 时做整段识别，并删除起点落在该段内的实时字幕句子再写入识别结果（实时字幕中断时的兜底）。`offset_ms` 为该段在本场录音时间轴上的起点（只计已录 PCM，32 字节/毫秒，不含暂停）；旧客户端省略时按 `segment_index×20000`。只能与会议参数一起使用。每段独立 request_id；原文与场次关联在一个事务内提交。静音段保留无原文回执，不假装记录了文字。同一编号重试不重复 ASR 或原文，不同请求占用同一片段编号返回409。 |
 | `POST /v1/work-meetings/{id}/finish` | `{"segment_count":N,"complete":true}`；客户端排空后告知本场总片段数。核对0到N−1回执，完整且有文字才为 `saved`；无讲话为 `empty`，缺段／非正常结束为 `partial`。返回原文和后台整理状态；结束请求幂等，不再接受追加。异常中断可用 `complete:false` 收尾已保存部分。 |
 | `GET /v1/work-meetings` | `{"meetings":[…]}`；最近100场，含开始／结束时间、原文段数、标题、摘要和处理状态。只读 SQLite 快照不等待 ASR 账号锁。 |
-| `GET /v1/work-meetings/{id}` | 本场完整有序 `sources` 和 `report`；原文不按最近100条聊天裁剪。未知／其他账号编号返回404。 |
+| `GET /v1/work-meetings/{id}` | 本场完整有序 `sources`（含 `offset_ms/duration_ms`）、`utterances`、`events`、`audio` 和 `report`；原文不按最近100条聊天裁剪。未知／其他账号编号返回404。列表另含 `duration_ms`。 |
+| `WS /v1/work-meetings/{id}/live?offset_ms=N` | 实时字幕（仅请求头 Bearer 鉴权）。会议须为录音中且工作模式，否则以 4409 关闭；每条连接计一次额度，不占账号锁。客户端发送已录 PCM 二进制帧（16 kHz 单声道 PCM16，单帧 ≤64000 字节；暂停期间不发），控制消息 `{"type":"pause"}` / `{"type":"resume","offset_ms":N}` / `{"type":"end"}`。服务端发送 `ready`、`partial {text,start_ms}`（仅显示、不保存）、`final {sentences:[{id,transcript_id,start_ms,end_ms,text,speaker}]}`（已保存到本场）、`paused`、`done`（收到 end 后保存完最后几句）、`error`（上游失败，随后关闭）。时间轴为 `offset_ms` 起累计的已录 PCM；暂停或单次上游满10分钟时结束当前识别并另起一段。字幕句子以 `segment_index=-1` 进入 `utterances`/`sources`，纪要可直接引用。 |
+| `POST /v1/work-meetings/{id}/events` | `{"event_id":"16–64位","kind":"pause|resume|mark","offset_ms":N,"origin":"app|headset"}`；仅录音中可写。同一 event_id 重试返回原记录，内容不同返回409；已暂停再暂停、未暂停时继续返回409。读 SQLite 快照写入，不等待片段 ASR 持有的账号锁。 |
+| `GET /v1/work-meetings/{id}/audio?start_ms=0&duration_ms=600000` | 返回本场录音时间轴 `[start_ms, start_ms+duration_ms)` 的 16 kHz 单声道 WAV，单次最多 10 分钟，裁到最后一段已存音频；缺失片段补静音。无录音、已过期或已删除返回404。 |
+| `DELETE /v1/work-meetings/{id}/audio` | 只删除本场录音文件，保留原文、句子与纪要；录音中返回409。返回会议详情。 |
 | `POST /v1/work-meetings/{id}/retry-summary` | 只重新处理已保存的文字，不重新 ASR 或上传音频；并发轮询不重复启动后台任务。替换同场旧纪要和待办，保留相同待办的完成状态。 |
 
 `status` 是原文保存状态：`recording/saved/partial/empty`；`summary_status` 为 `waiting/pending/ready/fallback/failed/unavailable`。`summary_stage` 为 `waiting/queued/analyzing/synthesizing/done`，`processed_sections/total_sections` 是实际完成的分析组数，不伪造百分比。Android 在本机停止至上传排空间显示“正在转写并保存”。网络失败保留上次确认状态并提示同步重试；后端重启后，读取列表／详情／state 会恢复持久化的 pending 任务。
 
-`report` 含 `title/summary/topics/decisions/tasks/open_questions/source_ids/extraction/notice/capture_status`。原文不经 AI 改写；长会议先按有界片段分析，再分层汇总，覆盖所有已保存文字。每条要点、决策、待办、待确认项引用本场原文 id；负责人和截止日期必须能在来源中核对，身份不明时留空。模型不可用、结构不合法或额度不足返回明确的原文摘录 fallback，不宣称 AI 整理成功。原文保存不受聊天保留开关影响；新协议的录音不逐段进入个人记忆提取。原始音频不保存，不提供音频回放。ASR 和每次实际文字模型调用分别计入账号额度。
+`report` 含 `title/summary/topics/decisions/tasks/open_questions/chapters/highlights/source_ids/extraction/notice/capture_status`。`chapters` 最多12条 `{title, summary, source_ids, start_ms}`，按时间排序；`highlights` 最多8条 `{text, source_ids, start_ms}`，`text` 必须逐字出现在所引句子中，否则丢弃。`start_ms` 由服务端按所引句子计算，不由模型给出；格式不合格的章节或金句被丢弃，不导致整份纪要回退。旧纪要没有这两个字段，重试整理后补上。原文不经 AI 改写；长会议先按有界片段分析，再分层汇总，覆盖所有已保存文字。每条要点、决策、待办、待确认项引用本场句子 id（`<原文 id>.<序号>`，旧会议仍为原文 id）；负责人和截止日期必须能在来源中核对，身份不明时留空。模型不可用、结构不合法或额度不足返回明确的原文摘录 fallback，不宣称 AI 整理成功。原文保存不受聊天保留开关影响；新协议的录音不逐段进入个人记忆提取。ASR 和每次实际文字模型调用分别计入账号额度。
+
+2026-10-17 说话人与时刻：实时字幕与会议分段识别开启火山流式 ASR 2.0 说话人聚类（`enable_speaker_info`、`ssd_version="200"`），确认句的 `additions.speaker_id`（"0"、"1"…）映射为 `speaker`“说话人1/2…”，并写入该句原文的 `speaker` 供纪要使用；编号只在同一上游识别段内稳定，暂停或满10分钟换段后可能错位，不代表真实身份。`utterances` 增加 `speaker`、`wall_at`（秒级 ISO 时刻 = 录音起点 + 录音内偏移 + 之前各次暂停时长）；会议增加 `speakers`（去重标签）与 `audio_started_at`（第一帧实时字幕音频到达时推算，或首个分段到达时间减去音频长度，误差约一两秒）。2026-10-17 已用合成双音色语音实测火山返回 `speaker_id` 0/1/0。
+
+2026-10-17 时间轴与录音保存：`utterances` 每项 `{id, transcript_id, segment_index, start_ms, end_ms, text}`，时间为本场录音时间轴毫秒（段起点 + ASR 句内 `start_time/end_time`，裁到段长）；每条 ASR 句再按句末标点（。！？；）拆分：供应商返回逐字 `words` 且与文字吻合时按逐字时间，否则按字数比例估算时间；不足2字的语气词并入前句。供应商未给时间时整段按同样规则拆分并估算。`events` 为暂停、继续与重点标记（`offset_ms` 同一时间轴，`created_at` 为服务器时间）。`audio` 为 `{status: saved|partial|none|expired|deleted, bytes, segments_with_audio, retention_days, expires_at}`。设置 `work_audio_retention_days`（0–365，默认30，0 表示不保存）控制保存：每段 PCM 写入 `users/<UUID>/work-audio/<会议>/`，路径只由服务端生成；会议结束超过期限后，在读取列表/详情/音频或保存设置时删除录音并标为 `expired`，异常未结束的会议多宽限1天。缩短期限立即作用于已有录音。录音不进入导出；清除数据和删除账号删除整个录音目录。服务端不加密录音文件，依赖主机磁盘与访问控制；部署备份是否包含该目录需按 `deploy/` 另行配置。
 
 `/v1/state` 增加 `work_meetings`；`/v1/export` 版本4增加全部会议详情。清除数据／删除账号包含新表；遗忘原文会撤回关联纪要和待办，后台结果不会重新发布已撤回的原文。旧 `/v1/meetings` 按时间范围整理入口保留兼容，不能据此倒推旧片段属于哪一场会议。
 
@@ -48,7 +56,7 @@ APK 默认本地基址 `http://127.0.0.1:8108`，可切换内置远端 `https://
 
 | 方法/路径 | 请求与响应 |
 | --- | --- |
-| `GET /v1/state` | 返回 `user/settings/capabilities/agent/transcripts/memories/tasks/drafts/meeting_report`；刷新时重新判断当前模式 |
+| `GET /v1/state` | 返回 `user/settings/capabilities/agent/transcripts/memories/tasks/drafts/meeting_report`；刷新时重新判断当前模式。`agent.commute` 为最近一次定位解析的通勤去向（`target=home/work/custom`、`name`、`basis=near_home/near_work/time_of_day/only_saved_place`；无可用去向时 `target=null` 并给出 `reason`），`agent.route.target` 与之对应 |
 | `PUT /v1/settings` | 完整 `Settings` JSON；返回保存后的设置。固定 `provider=cascade`、`life_poll_enabled=false`；目的地/交通参数变化清除旧路线与提醒节流 |
 | `POST /v1/chat` | `{text,request_id,interaction_source?}`；text 1–6000 有效字符；返回 `text/mode/memories/response/extraction/interaction/speak/notice`，记忆操作另含 `citations/recall/deletion` 等回执 |
 | `POST /v1/voice?request_id=...&interaction_source=direct_question` | `Content-Type: audio/pcm`，16 kHz 单声道小端 PCM16 原始字节；不带 WAV 头；返回与 chat 相同结构，未识别时返回空 text、解释 response、`speak=false` |
@@ -133,7 +141,16 @@ M1 Android 复用 HTTP 短语音，无新增实时接口。含异步停止尾帧
   "transit_city": "上海",
   "destination_lon": null,
   "destination_lat": null,
-  "contact": "老板",
+  "commute_target": "auto",
+  "home_name": "家",
+  "home_city": "",
+  "home_lon": null,
+  "home_lat": null,
+  "work_name": "公司",
+  "work_city": "",
+  "work_lon": null,
+  "work_lat": null,
+  "contact": "同事",
   "arrival_notice_minutes": 5,
   "retain_transcripts": true
 }
@@ -148,6 +165,8 @@ M1 Android 复用 HTTP 短语音，无新增实时接口。含异步停止尾帧
 | 轮询间隔 / 监听时长 | `60..3600` 秒 / `5..60` 秒 |
 | `vad_threshold` | `0.005..0.2`，客户端 RMS 触发阈值 |
 | 目的地 | 经度 `-180..180`，纬度 `-90..90`，必须同时填写或同时为空，使用 GCJ-02 |
+| 家 / 公司 | `home_*`、`work_*`，坐标规则同目的地；`*_city` 为空时沿用 `transit_city` |
+| `commute_target` | `auto/home/work/custom`。`auto`：当前位置距家 1 公里内去公司、距公司 1 公里内回家，都不在附近时按工作时段中点前去公司、之后回家；家和公司都未设置时沿用 `destination_*`。`custom` 固定使用 `destination_*` |
 | `transport` / `transit_city` | `driving/walking/transit/bicycling`；公交规划目的城市，默认上海 |
 | 提醒分钟 | `1..60` |
 | `retain_transcripts` | 仅控制原始转写保存，不关闭记忆提取 |
@@ -197,12 +216,12 @@ M1 Android 复用 HTTP 短语音，无新增实时接口。含异步停止尾帧
 
 - `GET /v1/search?q=...&freshness=noLimit`：q 1–500 字，freshness 为 noLimit/oneDay/oneWeek/oneMonth/oneYear 或有效 ISO 日期、`开始日期..结束日期`；返回 `available/source/query/results/reason`。每条结果含 title/url/summary/site/published；供应商错误不回显凭证或响应正文。
 - `GET /v1/maps/geocode?address=...&city=...`：地址 1–100 字，城市最多 80；返回 GCJ-02 places（address/longitude/latitude/adcode/city）。
-- `POST /v1/maps/reverse`：WGS-84 LocationInput，先转换再逆解析，返回 address/city/district/adcode。
+- `POST /v1/maps/reverse`：WGS-84 LocationInput，先转换再逆解析，返回 address/city/district/adcode，以及转换后的 GCJ-02 `longitude/latitude`（`coordinate_system="GCJ-02"`），可直接写入 `home_*`/`work_*` 实现"用当前位置设为家/公司"。
 - `/v1/maps/nearby` 新增 radius（100–50000，默认3000）、metro_only（默认false）；地铁站类型固定150500。
 - `/v1/maps/weather` 新增 forecast=true；返回 forecast 数组（date/week/dayweather/nightweather/daytemp/nighttemp/daywind/daypower）和 report_time/city/note。
 - settings.transport 支持 bicycling，调用高德v4并核对errcode；其他路线沿用v3。公共交通 steps 新增 stations 列表，只来自选中路线，不合并备选线路；均为规划而非车辆实时位置。
 
-主动对话在同一 Agent 内执行最多三轮、六次工具调用；只读工具包括公开搜索、地点/地址/周边、天气、路线与时钟，整段工具对话流程限45秒。每个非时钟工具调用额外占一次账号业务额度，现有一轮对话和TTS额度保持原口径。无配置/失败/额度不足均返回明确不可用结果。路线只能使用本轮地点搜索的 ID 或本人已保存目的地，不接受模型提供的任意坐标；定位须来自用户最近五分钟的主动GPS更新且精度≤200米。
+主动对话在同一 Agent 内执行最多三轮、六次工具调用；只读工具包括公开搜索、地点/地址/周边、天气、路线与时钟，整段工具对话流程限45秒。每个非时钟工具调用额外占一次账号业务额度，现有一轮对话和TTS额度保持原口径。无配置/失败/额度不足均返回明确不可用结果。路线只能使用本轮地点搜索的 ID 或本人已保存的家/公司/目的地（`plan_route.target` 为 `auto/home/work`），不接受模型提供的任意坐标；定位须来自用户最近五分钟的主动GPS更新且精度≤200米。
 
 返回的 `tool_results:[{tool,result}]` 与对话结果一起进入账号幂等回执，用于手机展示查询来源；外部结果不当作命令，不作为用户私人事实写入记忆。公开查询中的“我/今天”不再单独触发私人记忆召回，明确历史/约定问题仍优先使用记忆。环境录音不启用工具。未接入任意MCP、本机文件操作、网页抓取、真实消息发送或自动导航。
 
@@ -290,3 +309,15 @@ Android 实际播放排空后发送 `{"type":"playback.done","turn":N}`，后端
 原始文稿按“发言人＋原话”逐条展示与复制，不展示上传边界。总结仍一次使用整场已保存原文，包含发言人标签，允许按整场匿名人物分别整理观点；明确第一人称承诺可使用该匿名标签作为任务负责人。旧记录没有整场音频可重做时不能凭局部编号建立整场身份。
 
 参考：https://platform.qianwenai.com/docs/developer-guides/speech/asr 和 https://platform.qianwenai.com/docs/api-reference/more/upload-file-get-temporary-url
+
+## 2026-10-17 双分支整合后的工作会议契约（覆盖前述冲突说明）
+
+- 当前 Android 使用 `whole_audio=false` 开场，保留开始时间与可用位置快照，通过 `/live` 接收实时字幕、通过 `/v1/voice` 上传含 `offset_ms` 的录音段。字幕覆盖时 `recognize=0` 不重复识别；字幕不可用时使用已配置的 Qwen Flash 或火山按段兜底。实时说话人仅在各上游识别段内稳定。
+- 结束后，在 Qwen 工作 ASR 已配置且音频可用时，以录音时间轴组装整场 WAV，提交一次 Filetrans 说话人识别，再一次性总结全部已保存原文。最终句子替换实时句子，保留时间轴、暂停、重点标记和录音回放；统一标签为 `说话人1/2/...`，仅最终整场结果标注 `speaker_scope=meeting`。完整录音缺失时保留原有转写，不伪造完整识别。
+- 无 Qwen 配置时保留火山实时/分段转写和文字纪要。`capabilities.work_asr` 表示至少一种工作转写可用；`work_whole_audio` 表示旧整场上传协议仍受支持，不是当前 Android 开场的必选门槛。
+- 兼容 `whole_audio=true` 的旧调用方和 `POST /v1/work-meetings/{id}/audio`。旧 SQLite 暂存上传在 Store 初始化时幂等导入账号音频目录，转写成功前保留旧副本。新上传在统一音频目录保存；同一个请求号携带不同 PCM 返回409。
+- `transcription_status` 补充 `failed`。整场识别失败后，有实时原文的会议仍可整理该原文，并明确提示整场说话人识别未完成；无原文则显示失败。手动重试可重试识别，终态失败清除 task_id，暂时性查询错误保留 task_id。已忘记的原文不得由正在返回的识别结果重建。
+- 当前 Android 的录音保存遵守 `work_audio_retention_days`（默认30天，0不落盘，因此不再做结束后的整场识别）。旧 `whole_audio=true` 客户端即使设0也需暂存以完成识别，成功立即删除，失败最多额外保留24小时供重试；不是所有录音都转写后立即删除。已保存录音窗口起点超出最后样本时返回404。
+- AI 纪要保留整场任务、人物观点、冲突、事件、议题、决策、待确认，并结合可选的 `chapters/highlights`；章节时间由服务端依据句子计算，非逐字摘录的重点丢弃。Android 全屏会议页及 Markdown 导出包含这些内容和对应时间引用。
+
+以上是本地源码/协议整合，真实服务配额、长会议、实体耳机和远端部署另行验收，见 [工作日志](work-log-2026-10-17.md)。

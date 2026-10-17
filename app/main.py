@@ -5,6 +5,7 @@ import json
 import logging
 from pathlib import Path
 import secrets
+import shutil
 import hashlib
 import time
 from datetime import datetime, timezone, timedelta
@@ -15,17 +16,19 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from .config import Config
 from .domain import Settings, LocationInput, MemoryInput, SpeechInput, NearbyInput
 from .domain import MeetingRequest, RecallRequest, TaskStatusInput, MemoryUpdate
-from .providers.volc_speech import VolcSpeechProvider, SpeechProviderError
+from .providers.volc_speech import VolcSpeechProvider, SpeechProviderError, pcm_to_wav
 from .providers.qwen_realtime import QwenRealtimeProvider
 from .providers.qwen_work_asr import QwenWorkAsrProvider
 from .providers.qwen_meeting_asr import QwenMeetingAsrProvider, MeetingTaskFailed
 from .services.insights import MeetingInsights, meeting_coverage
-from .services.work_meetings import WorkMeetingMinutes
+from .services.work_meetings import WorkMeetingMinutes, attach_times
+from .services.work_live import live_captions
 from .services.recall import RecallService
 from .services.voice_stream import CompletionBarrier, transcribe_live, reply_live
 from .services.qwen_voice import reply_qwen, realtime_instructions
 from .services.duplex_voice import duplex_call
 from .services.assistant_tools import AssistantTools
+from .services.commute import ROUTE_FIELDS, commute_destination
 from .providers.bocha import BochaSearch
 
 
@@ -123,6 +126,12 @@ def create_hosted_app(config=None, data_directory=None):
     class WorkMeetingFinish(BaseModel):
         segment_count: int = Field(ge=0, le=100000)
         complete: bool = True
+
+    class WorkMeetingEvent(BaseModel):
+        event_id: str = Field(pattern=r'^[a-zA-Z0-9-]{16,64}$')
+        kind: str = Field(pattern=r'^(pause|resume|mark)$')
+        offset_ms: int = Field(ge=0, le=86_400_000)
+        origin: str = Field(default='app', pattern=r'^(app|headset)$')
 
     @api.exception_handler(RequestValidationError)
     async def invalid(request, error):
@@ -274,6 +283,7 @@ def create_hosted_app(config=None, data_directory=None):
         path = directory / 'users' / (current['id'] + '.sqlite3')
         for suffix in ('', '-wal', '-shm'):
             Path(str(path) + suffix).unlink(missing_ok=True)
+        shutil.rmtree(path.with_suffix(''), ignore_errors=True)  # Meeting audio.
         return {'ok': True}
 
     @api.get('/v1/state')
@@ -297,19 +307,19 @@ def create_hosted_app(config=None, data_directory=None):
             value.life_poll_enabled = False
             value.provider = 'cascade'
             old = rt.store.settings()
-            if any(getattr(old, key) != getattr(value, key) for key in
-                   ('destination_lon', 'destination_lat', 'destination_name', 'transport', 'transit_city')):
-                rt.agent.route, rt.agent.last_route, rt.agent.last_notice = None, 0, 0
+            if any(getattr(old, key) != getattr(value, key) for key in ROUTE_FIELDS):
+                rt.agent.route, rt.agent.commute, rt.agent.last_route, rt.agent.last_notice = None, None, 0, 0
             rt.store.save_settings(value)
+            rt.store.purge_work_audio()
             await rt.agent.decide()
             return value
 
-    async def process(rt, current, request_id, fingerprint, text=None, pcm=None, interaction_source='ambient_capture', meeting_id=None, segment_index=None):
+    async def process(rt, current, request_id, fingerprint, text=None, pcm=None, interaction_source='ambient_capture', meeting_id=None, segment_index=None, offset_ms=None, recognize=True):
         with measured(request_id, 'turn'):
             return await process_turn(rt, current, request_id, fingerprint, text=text, pcm=pcm, interaction_source=interaction_source,
-                                      meeting_id=meeting_id, segment_index=segment_index)
+                                      meeting_id=meeting_id, segment_index=segment_index, offset_ms=offset_ms, recognize=recognize)
 
-    async def process_turn(rt, current, request_id, fingerprint, text=None, pcm=None, interaction_source='ambient_capture', meeting_id=None, segment_index=None):
+    async def process_turn(rt, current, request_id, fingerprint, text=None, pcm=None, interaction_source='ambient_capture', meeting_id=None, segment_index=None, offset_ms=None, recognize=True):
         try:
             cached = rt.store.mobile_turn(request_id, fingerprint, reserve=False)
         except ValueError as exc:
@@ -326,24 +336,31 @@ def create_hosted_app(config=None, data_directory=None):
             except ValueError as exc:
                 raise HTTPException(409, str(exc)) from None
         trace(request_id, 'cache', 'miss')
-        if not accounts.consume('usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400):
+        # Audio-only meeting segments (text came from live captions) use no ASR and no request quota.
+        if recognize and not accounts.consume('usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400):
             raise HTTPException(429, '今日体验额度已用完，请明天再试')
         rt.store.mobile_turn(request_id, fingerprint)
         utterances = ()
-        if pcm is not None:
+        if pcm is not None and not recognize:
+            text = ''
+        elif pcm is not None:
             async def chunks():
                 for offset in range(0, len(pcm), 3200):
                     yield pcm[offset:offset + 3200]
                     await asyncio.sleep(.02)
-            text = ''
+            text, utterances = '', ()
             with measured(request_id, 'asr'):
                 try:
                     async with asyncio.timeout(65):
-                        provider = api.state.work_asr if meeting_id else speech
-                        async for result in provider.stream_asr(chunks()):
+                        # Segment fallback: Qwen Flash (segment-local speakers) when configured, else Volcengine with speakers.
+                        qwen_segment = bool(meeting_id) and config.work_asr.ready
+                        provider = api.state.work_asr if qwen_segment else speech
+                        options = {'speakers': True} if meeting_id and not qwen_segment else {}
+                        async for result in provider.stream_asr(chunks(), **options):
                             if result.text:
                                 text = result.text
-                            utterances = result.utterances
+                            if result.utterances:
+                                utterances = result.utterances
                 except (SpeechProviderError, TimeoutError):
                     rt.store.fail_mobile_turn(request_id)
                     raise HTTPException(502, '识别暂不可用，请稍后重试')
@@ -358,7 +375,10 @@ def create_hosted_app(config=None, data_directory=None):
         try:
             with measured(request_id, 'business'):
                 if meeting_id:
-                    transcript_id = rt.store.save_work_segment(meeting_id, segment_index, request_id, text, utterances)
+                    transcript_id = rt.store.save_work_segment(
+                        meeting_id, segment_index, request_id, text, offset_ms=offset_ms,
+                        duration_ms=len(pcm) // 32, utterances=utterances, audio=pcm, recognized=recognize,
+                        keep_for_transcription=False)
                     result = {'text': text, 'transcript_id': transcript_id, 'meeting_id': meeting_id,
                               'segment_index': segment_index, 'mode': 'work', 'interaction': 'silent_capture',
                               'response': '', 'memories': [], 'speak': False}
@@ -384,8 +404,11 @@ def create_hosted_app(config=None, data_directory=None):
     async def mobile_voice(request: Request, request_id: str = Query(pattern=r'^[a-zA-Z0-9-]{16,64}$'),
                            interaction_source: str = Query(default='ambient_capture', pattern=r'^(direct_question|ambient_capture|continuous_call)$'),
                            meeting_id: str | None = Query(default=None, pattern=r'^[a-zA-Z0-9-]{16,64}$'),
-                           segment_index: int | None = Query(default=None, ge=0, le=100000), current=Depends(user)):
-        if not (config.work_asr.ready if meeting_id else config.speech.asr_ready):
+                           segment_index: int | None = Query(default=None, ge=0, le=100000),
+                           offset_ms: int | None = Query(default=None, ge=0, le=86_400_000),
+                           recognize: int = Query(default=1, ge=0, le=1), current=Depends(user)):
+        ready = (config.work_asr.ready or config.speech.asr_ready) if meeting_id else config.speech.asr_ready
+        if recognize and not ready:
             raise HTTPException(503, '服务器尚未配置语音识别')
         if request.headers.get('content-type', '').split(';')[0] != 'audio/pcm':
             raise HTTPException(415, '需要 16kHz 单声道 PCM16')
@@ -394,12 +417,20 @@ def create_hosted_app(config=None, data_directory=None):
             raise HTTPException(422, '录音太短或不完整，请重新录音')
         if (meeting_id is None) != (segment_index is None):
             raise HTTPException(422, '会议编号和片段编号必须同时提供')
+        if offset_ms is not None and meeting_id is None:
+            raise HTTPException(422, '录音时间偏移只用于会议片段')
+        if not recognize and meeting_id is None:
+            raise HTTPException(422, '只存录音不识别只用于会议片段')
         async with runtime(current, request) as rt:
             fingerprint = 'pcm:' + hashlib.sha256(pcm).hexdigest() + (':' + interaction_source if interaction_source != 'ambient_capture' else '')
             if meeting_id:
                 fingerprint += ':meeting:' + meeting_id + ':' + str(segment_index)
+                if offset_ms is not None:
+                    fingerprint += ':' + str(offset_ms)
+                if not recognize:
+                    fingerprint += ':audio-only'
             return await process(rt, current, request_id, fingerprint, pcm=pcm, interaction_source=interaction_source,
-                                 meeting_id=meeting_id, segment_index=segment_index)
+                                 meeting_id=meeting_id, segment_index=segment_index, offset_ms=offset_ms, recognize=bool(recognize))
 
     @api.websocket('/v1/voice/stream')
     async def mobile_voice_stream(socket: WebSocket):
@@ -785,13 +816,15 @@ def create_hosted_app(config=None, data_directory=None):
     @api.get('/v1/maps/weather')
     async def mobile_weather(request: Request, city: str = Query(default='', pattern=r'^([0-9]{6})?$'), forecast: bool = False, current=Depends(user)):
         async with runtime(current, request, True) as rt:
-            if not city and rt.store.settings().destination_lon is None:
-                raise HTTPException(422, '请先选择目的地，再查询当地天气')
+            fix = rt.agent.location
+            destination = None if city else commute_destination(
+                rt.store.settings(), (fix['longitude'], fix['latitude']) if fix else None)
+            if destination is not None and not destination['target']:
+                raise HTTPException(422, destination['reason'] + '，再查询当地天气')
             try:
                 if city:
                     return await rt.agent.maps.weather(city, forecast)
-                settings = rt.store.settings()
-                return await rt.agent.maps.weather_at(settings.destination_lon, settings.destination_lat, forecast)
+                return await rt.agent.maps.weather_at(destination['longitude'], destination['latitude'], forecast)
             except Exception:
                 raise HTTPException(502, '天气查询暂不可用，请稍后再试')
 
@@ -822,42 +855,54 @@ def create_hosted_app(config=None, data_directory=None):
                     meeting = store.work_meeting(meeting_id)
                     if meeting is None or meeting['summary_status'] != 'pending':
                         return
-                    rows = meeting['sources']
-                if meeting['whole_audio'] and meeting['transcription_status'] == 'pending':
+                if meeting['transcription_status'] == 'pending':
+                    # Whole-meeting diarization from the saved audio: one speaker namespace for the meeting.
                     import tempfile
                     store.work_summary_progress(meeting_id, 'transcribing', 0, 1)
-                    if not meeting['asr_task_id'] and not accounts.consume('usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400):
-                        raise ValueError('Meeting transcription quota reached')
-                    with tempfile.TemporaryFile(suffix='.wav') as wav:
-                        if not meeting['asr_task_id']:
-                            await run_in_threadpool(store.write_work_wav, meeting_id, wav)
-                        try:
+                    turns = None
+                    try:
+                        if not meeting['asr_task_id'] and not accounts.consume('usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400):
+                            raise SpeechProviderError('Meeting transcription quota reached')
+                        with tempfile.TemporaryFile(suffix='.wav') as wav:
+                            if not meeting['asr_task_id']:
+                                await run_in_threadpool(store.write_work_wav, meeting_id, wav)
+                            wav.seek(0)
                             turns = await api.state.meeting_asr.transcribe(wav, meeting['asr_task_id'],
                                 lambda task_id: store.work_asr_task(meeting_id, task_id))
-                        except MeetingTaskFailed:
-                            store.work_asr_task(meeting_id, '')
-                            raise
+                    except (SpeechProviderError, ValueError) as exc:
+                        # Keep the live sentences; a later retry can submit a new task.
+                        store.fail_work_transcription(meeting_id, reset_task=isinstance(exc, MeetingTaskFailed))
                     async with runtimes.use(current['id'], wait_seconds=10) as rt:
-                        if not rt.store.save_work_dialogue(meeting_id, turns):
+                        fresh = rt.store.work_meeting(meeting_id)
+                        if fresh is None or [row['id'] for row in fresh['sources']] != [row['id'] for row in meeting['sources']]:
+                            # A source was forgotten while the provider ran; never recreate it from audio.
+                            rt.store.fail_work_transcription(meeting_id)
+                            return
+                        if turns is not None and not rt.store.save_work_dialogue(meeting_id, turns):
                             return
                         meeting = rt.store.work_meeting(meeting_id)
-                        rows = meeting['sources']
-                        if not rows:
-                            return
+                rows = store.work_meeting_evidence(meeting)
+                source_ids = [row['id'] for row in meeting['sources']]
+                if not rows:
+                    store.fail_work_summary(meeting_id)
+                    return
                 charge = lambda: accounts.consume('usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400)
                 report = await WorkMeetingMinutes(config, charge).generate(rows,
                     lambda stage, done, total: store.work_summary_progress(meeting_id, stage, done, total))
+                if meeting['transcription_status'] == 'failed':
+                    report['notice'] = '整场说话人识别未完成，以下基于实时或分段原文整理，编号可能跨段变化。' + report.get('notice', '')
                 # The network work never holds the account's voice/control lock.
                 found = accounts.user(current['username'])
                 if found is None or found['id'] != current['id']:
                     return
                 async with runtimes.use(current['id'], wait_seconds=10) as rt:
+                    attach_times(report, meeting)
                     report['includes_demo'] = False
                     report['meeting_id'] = meeting_id
                     report['started_at'] = meeting['started_at']
                     report['location'] = meeting['location']
                     report['capture_status'] = meeting['status']
-                    if not rt.store.save_work_summary(meeting_id, report, [row['id'] for row in rows]):
+                    if not rt.store.save_work_summary(meeting_id, report, source_ids):
                         rt.store.fail_work_summary(meeting_id)
         except asyncio.CancelledError:
             # Keep the persisted pending job; the next page read resumes it.
@@ -934,6 +979,8 @@ def create_hosted_app(config=None, data_directory=None):
     @api.get('/v1/work-meetings')
     async def list_work_meetings(request: Request, background: BackgroundTasks, current=Depends(user)):
         store = read_work_store(current)
+        if store:
+            store.purge_work_audio()
         meetings = store.work_meetings() if store else []
         resume_work_summaries(background, current, meetings)
         return {'meetings': meetings}
@@ -941,17 +988,82 @@ def create_hosted_app(config=None, data_directory=None):
     @api.get('/v1/work-meetings/{meeting_id}')
     async def get_work_meeting(meeting_id: str, request: Request, background: BackgroundTasks, current=Depends(user)):
         store = read_work_store(current)
+        if store:
+            store.purge_work_audio()
         meeting = store.work_meeting(meeting_id) if store else None
         if meeting is None:
             raise HTTPException(404, '会议记录不存在')
         resume_work_summaries(background, current, [meeting])
         return meeting
 
+    @api.post('/v1/work-meetings/{meeting_id}/events')
+    async def work_meeting_event(meeting_id: str, value: WorkMeetingEvent, current=Depends(user)):
+        # Marks must not wait behind a segment's ASR, which holds the account lock for seconds.
+        store = read_work_store(current)
+        try:
+            event = store.add_work_event(meeting_id, value.event_id, value.kind, value.offset_ms, value.origin) if store else None
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+        if event is None:
+            raise HTTPException(404, '会议记录不存在')
+        return event
+
+    @api.websocket('/v1/work-meetings/{meeting_id}/live')
+    async def work_meeting_live(socket: WebSocket, meeting_id: str):
+        # Header auth only, like /v1/voice/stream. The account lock is not held: segment uploads
+        # run alongside, and each sentence is its own SQLite transaction.
+        current = accounts.authenticate(digest(token(socket)))
+        if not current:
+            await socket.close(code=4401)
+            return
+        try:
+            offset_ms = int(socket.query_params.get('offset_ms', '0'))
+        except ValueError:
+            offset_ms = -1
+        store = read_work_store(current)
+        meeting = store.work_meeting(meeting_id) if store else None
+        if not config.speech.asr_ready or not 0 <= offset_ms <= 86_400_000 or meeting is None \
+                or meeting['status'] != 'recording' or store.settings().mode != 'work':
+            await socket.close(code=4409)
+            return
+        if not accounts.consume('usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400):
+            await socket.close(code=4429)
+            return
+        await socket.accept()
+        await socket.send_text(json.dumps({'type': 'ready', 'offset_ms': offset_ms}))
+        await live_captions(socket, speech, store, meeting_id, offset_ms)
+
+    @api.get('/v1/work-meetings/{meeting_id}/audio')
+    async def work_meeting_audio(meeting_id: str, start_ms: int = Query(default=0, ge=0, le=86_400_000),
+                                 duration_ms: int = Query(default=600_000, ge=100, le=600_000), current=Depends(user)):
+        store = read_work_store(current)
+        if store:
+            store.purge_work_audio()
+        if store is None or store.work_meeting(meeting_id) is None:
+            raise HTTPException(404, '会议记录不存在')
+        pcm = await run_in_threadpool(store.work_audio, meeting_id, start_ms, start_ms + duration_ms)
+        if not pcm:
+            raise HTTPException(404, '本场没有保存的录音，或已过保存期限')
+        return Response(pcm_to_wav(pcm, 16000), media_type='audio/wav',
+                        headers={'X-Audio-Start-Ms': str(start_ms), 'Cache-Control': 'no-store'})
+
+    @api.delete('/v1/work-meetings/{meeting_id}/audio')
+    async def delete_work_meeting_audio(meeting_id: str, request: Request, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            try:
+                deleted = rt.store.delete_work_audio(meeting_id)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from None
+            if deleted is None:
+                raise HTTPException(404, '会议记录不存在')
+            return rt.store.work_meeting(meeting_id)
+
     @api.post('/v1/work-meetings/{meeting_id}/finish')
     async def finish_work_meeting(meeting_id: str, value: WorkMeetingFinish, request: Request, background: BackgroundTasks, current=Depends(user)):
         async with runtime(current, request) as rt:
             try:
-                meeting = rt.store.finish_work_meeting(meeting_id, value.segment_count, value.complete)
+                meeting = rt.store.finish_work_meeting(meeting_id, value.segment_count, value.complete,
+                                                       transcribe=config.work_asr.ready)
             except ValueError as exc:
                 raise HTTPException(409, str(exc)) from None
             if meeting is None:
@@ -965,7 +1077,7 @@ def create_hosted_app(config=None, data_directory=None):
             meeting = rt.store.work_meeting(meeting_id)
             if meeting is None:
                 raise HTTPException(404, '会议记录不存在')
-            if (not meeting['sources'] and not (meeting['whole_audio'] and meeting['transcription_status'] == 'pending')) or meeting['status'] == 'recording':
+            if (not meeting['sources'] and meeting['transcription_status'] not in ('pending', 'failed')) or meeting['status'] == 'recording':
                 raise HTTPException(409, '请先结束会议并保存原文')
             if (current['id'], meeting_id) in work_summaries_running:
                 return meeting
@@ -1016,7 +1128,7 @@ def create_hosted_app(config=None, data_directory=None):
             rt.store.clear()
             rt.agent.conversation.history = []
             rt.agent.memory_interaction.reset()
-            rt.agent.location, rt.agent.route = None, None
+            rt.agent.location, rt.agent.route, rt.agent.commute = None, None, None
             return {'ok': True}
 
     return api

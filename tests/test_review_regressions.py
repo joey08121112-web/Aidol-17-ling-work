@@ -24,7 +24,7 @@ def test_new_destination_cannot_reuse_old_eta(client, runtime):
 
 @pytest.mark.asyncio
 async def test_inflight_route_cannot_restore_changed_destination(agent):
-    settings = agent.store.settings().model_copy(update={"auto_mode": False, "mode": Mode.commute})
+    settings = agent.store.settings().model_copy(update={"auto_mode": False, "mode": Mode.commute, "destination_lon": 121.5, "destination_lat": 31.3})
     agent.store.save_settings(settings)
     started, release = asyncio.Event(), asyncio.Event()
 

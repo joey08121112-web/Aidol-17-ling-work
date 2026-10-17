@@ -106,6 +106,8 @@ public final class HeadsetController implements FusionDevice, AutoCloseable {
     private Boolean leftWorn, rightWorn;
     private OnResultListener<PowerEntity> powerListener;
     private volatile FusionDevice.Listener captureOwner;
+    private volatile FusionCaptureEvents captureEvents;
+    private boolean localRecordingStopPending;
     private final Object captureLease = new Object();
     private long captureGeneration, captureStarted, firstPcmElapsed, microphoneBytes;
     private Runnable connectionTimeout, cancelTimeout;
@@ -457,14 +459,23 @@ public final class HeadsetController implements FusionDevice, AutoCloseable {
             captureOwner = listener;
             final long token = ++captureGeneration;
             captureStarted = SystemClock.elapsedRealtime(); firstPcmElapsed = 0; microphoneBytes = 0;
+            FusionCaptureEvents events = new FusionCaptureEvents(listener,
+                    action -> main.post(() -> {
+                        // SDK 6.7 serializes transitions with this synchronized read. Wait for the
+                        // whole idle/onError callback stack before interpreting its cleanup state.
+                        HeadsetManager.isFusionRecordBusy();
+                        if (captureOwner == listener && token == captureGeneration) action.run();
+                    }),
+                    failure -> { lastCode = failure.diagnostics(); listener.error(failure.summary()); },
+                    () -> releaseCapture(listener));
+            captureEvents = events;
             try {
                 HeadsetManager.startFusionRecord(new OnAuraRecordListener() {
                     @Override public void onState(String state, int scene) {
                         if (captureOwner != listener || token != captureGeneration) return;
                         phase = state;
-                        listener.state(state, scene);
-                        if ("idle".equals(state)) main.post(() -> releaseCapture(listener));
-                        else main.post(() -> { if (captureOwner == listener) publish(snapshot.state, snapshot.message); });
+                        events.state(state, scene);
+                        if (!"idle".equals(state)) main.post(() -> { if (captureOwner == listener) publish(snapshot.state, snapshot.message); });
                     }
                     @Override public void onResult(RecordDataEntity data) {
                         if (captureOwner != listener || token != captureGeneration || data == null) return;
@@ -473,11 +484,11 @@ public final class HeadsetController implements FusionDevice, AutoCloseable {
                             microphoneBytes += bytes.length;
                             if (firstPcmElapsed == 0) firstPcmElapsed = SystemClock.elapsedRealtime() - captureStarted;
                         }
-                        listener.pcm(data.getChannel(), bytes);
+                        events.pcm(data.getChannel(), bytes);
                     }
-                    @Override public void onError(int code, String ignoredMessage) {
+                    @Override public void onError(int code, String message) {
                         if (captureOwner != listener || token != captureGeneration) return;
-                        lastCode = "fusion_" + code; listener.error("耳机录音失败（代码 " + code + "），请重新连接");
+                        events.error(code, message);
                     }
                 });
             } catch (RuntimeException | LinkageError failure) { listener.error("耳机录音无法启动，请重新连接"); }
@@ -501,7 +512,16 @@ public final class HeadsetController implements FusionDevice, AutoCloseable {
         });
     }
     @Override public void requireReconnect(FusionDevice.Listener owner) {
-        main.post(() -> { if (captureOwner == owner) recover("录音已中止，请重新连接耳机", "capture_recovery"); });
+        main.post(() -> {
+            if (captureOwner != owner) return;
+            boolean busy = HeadsetManager.isFusionRecordBusy();
+            FusionCaptureEvents.Failure failure = captureEvents == null ? null : captureEvents.failure();
+            if (failure != null && failure.rejectedStart() && deviceStillReady() && !busy) {
+                // A rejected start has already returned the SDK to idle; it never owned microphone audio.
+                releaseCapture(owner); lastCode = failure.diagnostics(); publish(State.READY, failure.summary());
+            } else recover(failure == null ? "录音已中止，请重新连接耳机" : failure.summary() + "；请重新连接耳机",
+                    failure == null ? "capture_recovery" : failure.diagnostics() + " capture_recovery");
+        });
     }
     private void releaseCapture(FusionDevice.Listener owner) {
         if (captureOwner != owner) return;
@@ -529,6 +549,31 @@ public final class HeadsetController implements FusionDevice, AutoCloseable {
         cancelReconnect(); explicitReconnect = false;
         requestDisconnect(State.DISCONNECTED, "耳机未连接");
     }); }
+    /** Explicit debug diagnostic; never automatically interrupts an existing headset recording. */
+    public void stopLocalRecording(java.util.function.Consumer<String> result) {
+        main.post(() -> {
+            if (!snapshot.ready() || !deviceStillReady()) { result.accept("请先连接耳机，等待显示就绪"); return; }
+            if (localRecordingStopPending || inCall || captureOwner != null || HeadsetManager.isFusionRecordBusy()) {
+                result.accept("请先结束当前通话或等待耳机操作完成"); return;
+            }
+            localRecordingStopPending = true;
+            long connection = connectionGeneration;
+            try { HeadsetManager.stopCurrentFlashRecord(new OnResultListener<Void>() {
+                @Override public void onResult(Void ignored) { main.post(() -> {
+                    if (closed || connection != connectionGeneration) return;
+                    localRecordingStopPending = false;
+                    result.accept("耳机已确认本地录音停止命令，请回到对话页重新尝试");
+                }); }
+                @Override public void onError(int code, String ignoredMessage) { main.post(() -> {
+                    if (closed || connection != connectionGeneration) return;
+                    localRecordingStopPending = false;
+                    result.accept("耳机本地录音停止命令未确认（代码 " + code + "）");
+                }); }
+            }); } catch (RuntimeException | LinkageError failure) {
+                localRecordingStopPending = false; result.accept("耳机本地录音停止命令未能执行");
+            }
+        });
+    }
     private void recover(String message, String code) {
         lastCode = code; requestDisconnect(State.ERROR, message);
     }
@@ -609,6 +654,7 @@ public final class HeadsetController implements FusionDevice, AutoCloseable {
         if (powerListener != null) { HeadsetManager.removeAuraPowerListener(powerListener); powerListener = null; }
     }
     private void resetProperties() {
+        localRecordingStopPending = false;
         model = "未知"; leftBattery = rightBattery = caseBattery = null; leftWorn = rightWorn = null;
         controlWearGate.reset(connectionGeneration);
     }

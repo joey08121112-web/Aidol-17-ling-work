@@ -137,7 +137,7 @@ def _decode(payload: bytes, compression: int) -> bytes:
         raise SpeechProviderError("speech protocol: corrupt gzip") from exc
 
 
-def build_asr_start(config: VolcSpeechConfig, uid: str = "aidol", language: str = "zh-CN") -> bytes:
+def build_asr_start(config: VolcSpeechConfig, uid: str = "aidol", language: str = "zh-CN", speakers: bool = False) -> bytes:
     body = {"user": {"uid": uid}, "audio": {"format": "pcm", "codec": "raw",
         "rate": config.input_rate, "bits": 16, "channel": 1, "language": language},
         "request": {"model_name": config.asr_model, "enable_itn": True,
@@ -150,6 +150,10 @@ def build_asr_start(config: VolcSpeechConfig, uid: str = "aidol", language: str 
         # request.enable_nonstream and end_window_size. vad_segment_duration
         # only splits semantic text and does NOT trigger definite=true.
         body["request"].update({"enable_nonstream": True, "end_window_size": 800})
+    if speakers:
+        # Speaker clustering (ASR 2.0): definite utterances carry additions.speaker_id ("0", "1", ...),
+        # stable within one upstream session only. Verified 2026-10-17 with synthetic two-voice audio.
+        body["request"].update({"enable_speaker_info": True, "ssd_version": "200"})
     payload = gzip.compress(_json_bytes(body))
     return b"\x11\x10\x11\x00" + struct.pack(">I", len(payload)) + payload
 
@@ -304,7 +308,8 @@ class VolcSpeechProvider:
             except (ValueError, AttributeError, TypeError) as exc:
                 raise SpeechProviderError("ASR flash returned invalid JSON") from exc
 
-    async def stream_asr(self, chunks: AsyncIterable[bytes], *, uid: str = "aidol", language: str = "zh-CN") -> AsyncIterator[AsrResult]:
+    async def stream_asr(self, chunks: AsyncIterable[bytes], *, uid: str = "aidol", language: str = "zh-CN",
+                         speakers: bool = False) -> AsyncIterator[AsrResult]:
         """Transcribe PCM16 chunks concurrently with capture; final result closes stream.
 
         End the input iterator to flush ASR. Cancelling or closing this generator
@@ -316,7 +321,7 @@ class VolcSpeechProvider:
             async with connect(cfg.asr_url, additional_headers=headers, proxy=cfg.proxy,
                     ssl=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT), open_timeout=12,
                     close_timeout=3, max_size=4 * 1024 * 1024) as ws:
-                await ws.send(build_asr_start(cfg, uid, language))
+                await ws.send(build_asr_start(cfg, uid, language, speakers))
 
                 async def send_audio():
                     async for chunk in chunks:

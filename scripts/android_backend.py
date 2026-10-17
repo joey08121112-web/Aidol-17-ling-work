@@ -25,10 +25,12 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="Print configuration without loading .env or starting a server")
     parser.add_argument("--reload", action="store_true", help="Reload backend source changes (interrupts active requests; off by default)")
+    parser.add_argument("--port", type=int, default=8108,
+                        help="Computer port (default 8108). With another value, map the phone's fixed 8108 to it: adb reverse tcp:8108 tcp:PORT")
     args = parser.parse_args(argv)
     project_root = Path(__file__).resolve().parents[1]
-    print("Local Android API: http://127.0.0.1:8108", flush=True)
-    print("Android USB server: http://127.0.0.1:8108 (requires adb reverse tcp:8108 tcp:8108)", flush=True)
+    print(f"Local Android API: http://127.0.0.1:{args.port}", flush=True)
+    print(f"Android USB server: phone http://127.0.0.1:8108 (requires adb reverse tcp:8108 tcp:{args.port})", flush=True)
     print(f"Isolated local accounts and data: {project_root / 'data' / 'android-local'}", flush=True)
     if args.check:
         print("Configuration check only; no .env, databases, provider APIs or server were opened.")
@@ -39,7 +41,7 @@ def main(argv=None):
     import uvicorn
 
     print("Real AI/ASR/TTS requires backend provider credentials in .env. Press Ctrl+C to stop.", flush=True)
-    options = dict(factory=True, host="127.0.0.1", port=8108, workers=1,
+    options = dict(factory=True, host="127.0.0.1", port=args.port, workers=1,
                    proxy_headers=False, ws_max_size=65536, ws_max_queue=8, reload=args.reload)
     if args.reload:
         print("Development reload enabled: editing backend source interrupts active requests.", flush=True)

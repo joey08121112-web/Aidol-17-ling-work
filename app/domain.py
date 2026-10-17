@@ -26,9 +26,21 @@ class Settings(BaseModel):
     transit_city: str = Field(default="上海", min_length=1, max_length=80)
     destination_lon: float | None = Field(default=None, ge=-180, le=180)
     destination_lat: float | None = Field(default=None, ge=-90, le=90)
-    contact: str = Field(default="老板", max_length=100)
+    # Commute endpoints in GCJ-02. destination_* remains the one-off "custom" target.
+    commute_target: str = Field(default="auto", pattern="^(auto|home|work|custom)$")
+    home_name: str = Field(default="家", max_length=100)
+    home_city: str = Field(default="", max_length=80)
+    home_lon: float | None = Field(default=None, ge=-180, le=180)
+    home_lat: float | None = Field(default=None, ge=-90, le=90)
+    work_name: str = Field(default="公司", max_length=100)
+    work_city: str = Field(default="", max_length=80)
+    work_lon: float | None = Field(default=None, ge=-180, le=180)
+    work_lat: float | None = Field(default=None, ge=-90, le=90)
+    contact: str = Field(default="同事", max_length=100)
     arrival_notice_minutes: int = Field(default=5, ge=1, le=60)
     retain_transcripts: bool = True
+    # Work-meeting audio is kept per account for playback; 0 means never store it.
+    work_audio_retention_days: int = Field(default=30, ge=0, le=365)
 
     @model_validator(mode="after")
     def valid_settings(self):
@@ -39,6 +51,8 @@ class Settings(BaseModel):
             raise ValueError("timezone 必须是有效 IANA 时区")
         if (self.destination_lon is None) != (self.destination_lat is None):
             raise ValueError("目的地经纬度必须同时填写")
+        if (self.home_lon is None) != (self.home_lat is None) or (self.work_lon is None) != (self.work_lat is None):
+            raise ValueError("家和公司的经纬度必须同时填写")
         if self.work_end <= self.work_start:
             raise ValueError("工作结束时间必须晚于开始时间")
         return self

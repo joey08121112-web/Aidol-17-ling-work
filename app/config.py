@@ -31,7 +31,7 @@ class Config:
                 "voice_prepare": self.qwen.ready,
                 "voice_continuous_qa": self.qwen.ready, "voice_duplex": self.qwen.ready,
                 "voice_barge_in": self.qwen.ready, "work_meetings": True,
-                "work_asr": self.work_asr.ready, "work_asr_model": "qwen-audio-3.1-asr-flash-filetrans",
+                "work_asr": self.work_asr.ready or self.speech.asr_ready, "work_asr_model": "qwen-audio-3.1-asr-flash-filetrans" if self.work_asr.ready else "volcengine",
                 "work_whole_audio": True,
                 "voice_realtime_provider": "qwen" if self.qwen.ready else "",
                 "asr": self.speech.asr_ready, "tts": self.speech.tts_ready, "asr_mode": self.asr_mode,

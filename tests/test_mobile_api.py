@@ -643,4 +643,4 @@ def test_weather_without_city_or_destination_requires_selection(mobile):
     _, headers = register(mobile)
     for path in ("/v1/maps/weather", "/v1/maps/weather?city="):
         result = mobile.get(path, headers=headers)
-        assert result.status_code == 422 and "目的地" in result.json()["detail"]
+        assert result.status_code == 422 and "家和公司" in result.json()["detail"]

@@ -8,7 +8,7 @@ import java.util.List;
 /** Gesture decisions within a visible or explicitly enabled foreground-service session. */
 final class HeadsetInteractionPolicy {
     enum Gesture { TOGGLE, NEXT_MODE, CANCEL, DISCARD_COMBINATION, IGNORE }
-    enum Action { START, STOP_AND_SEND, INTERRUPT, CANCEL, CHANGE_MODE, DEFER_MODE }
+    enum Action { START, STOP_AND_SEND, INTERRUPT, CANCEL, CHANGE_MODE, DEFER_MODE, MARK }
     static final long GESTURE_SETTLE_MS = 400;
     private static final long DEBOUNCE_MS = 800, MAX_EVENT_AGE_MS = 1500;
 
@@ -17,6 +17,8 @@ final class HeadsetInteractionPolicy {
         final String mode;
         final long sessionGeneration;
         final boolean modeCue, replying;
+        /** A work meeting is capturing (not saving): double tap marks a key point instead of switching mode. */
+        final boolean workRecording;
         Context(boolean foreground, boolean controlsEnabled, boolean loggedIn, boolean ready, boolean inCall,
                 boolean busy, boolean active, boolean recording, boolean notWorn, String mode) {
             this(foreground, controlsEnabled, loggedIn, ready, inCall, busy, active, recording, notWorn, mode, 0);
@@ -31,6 +33,12 @@ final class HeadsetInteractionPolicy {
         }
         Context(boolean foreground, boolean controlsEnabled, boolean loggedIn, boolean ready, boolean inCall,
                 boolean busy, boolean active, boolean recording, boolean notWorn, String mode, long sessionGeneration, boolean modeCue, boolean replying) {
+            this(foreground, controlsEnabled, loggedIn, ready, inCall, busy, active, recording, notWorn, mode, sessionGeneration, modeCue, replying, false);
+        }
+        Context(boolean foreground, boolean controlsEnabled, boolean loggedIn, boolean ready, boolean inCall,
+                boolean busy, boolean active, boolean recording, boolean notWorn, String mode, long sessionGeneration, boolean modeCue, boolean replying,
+                boolean workRecording) {
+            this.workRecording = workRecording;
             this.foreground = foreground; this.controlsEnabled = controlsEnabled; this.loggedIn = loggedIn;
             this.ready = ready; this.inCall = inCall; this.busy = busy; this.active = active;
             this.recording = recording; this.notWorn = notWorn; this.mode = mode; this.sessionGeneration = sessionGeneration;
@@ -82,6 +90,14 @@ final class HeadsetInteractionPolicy {
             return context.active ? new Decision(null, "正在结束会话；工作记录会提交", Action.CANCEL) : Decision.none();
         }
         if (context.notWorn) { clearPending(); return new Decision(null, "双耳已摘下，请佩戴后操作"); }
+        if (gesture == Gesture.NEXT_MODE && context.workRecording) {
+            // Overrides a settling single tap; a following triple still discards it.
+            clearPending();
+            pendingActionAt = now + GESTURE_SETTLE_MS;
+            pendingAction = Action.MARK;
+            pendingSessionGeneration = context.sessionGeneration;
+            return Decision.none();
+        }
         if (gesture == Gesture.NEXT_MODE) {
             clearPending();
             if (context.busy) return new Decision(null, "正在同步，请稍后再切换模式");
@@ -109,6 +125,8 @@ final class HeadsetInteractionPolicy {
         clearPending();
         if (!context.enabled() || context.busy || generation != context.sessionGeneration) return Decision.none();
         if (context.notWorn) return new Decision(null, "双耳已摘下，请佩戴后操作");
+        if (intended == Action.MARK) return context.workRecording
+            ? new Decision(null, "", Action.MARK) : Decision.none();  // Never a mode switch after saving began.
         if (intended == Action.CHANGE_MODE) {
             if (context.active && !context.modeCue) return new Decision(intendedMode, "结束当前会话后切换模式；工作记录会提交", Action.DEFER_MODE);
             return new Decision(intendedMode, "", Action.CHANGE_MODE);
