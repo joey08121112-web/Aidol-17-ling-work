@@ -50,7 +50,10 @@ public final class MainActivity extends Activity {
     private static final int INK = 0xff202632, MUTED = 0xff697381, ACCENT = 0xff2468db, RED = 0xffb42318;
     private static final int SOFT = 0xffedf1f7;
     private static final int MEMORY = 0xff7356a6, WORK = 0xff305fb5, COMMUTE = 0xff24786d;
+    // User actions stay on one ordered queue; polling, lazy loads and exports share two IO
+    // threads so a request hitting the 100s read timeout cannot monopolise the action queue.
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    private final ExecutorService ioPool = Executors.newFixedThreadPool(2);
     private ApiClient api;
     private DevelopmentSettings development;
     private HeadsetController headset;
@@ -582,7 +585,7 @@ public final class MainActivity extends Activity {
             else {
                 label(box, "正在加载最近一场会议的文字记录…", 13, MUTED);
                 ApiClient client = api;
-                worker.execute(() -> {
+                ioPool.execute(() -> {
                     JSONObject detail = null;
                     try { detail = client.json("GET", "/v1/work-meetings/" + Uri.encode(latestId), null); } catch (Exception ignored) {}
                     JSONObject loaded = detail;
@@ -936,7 +939,7 @@ public final class MainActivity extends Activity {
         ApiClient client = api;
         long readGeneration = workMeetingReadGeneration;
         String detailId = openWorkMeetingId;
-        worker.execute(() -> {
+        ioPool.execute(() -> {
             JSONObject list = null, detail = null;
             try {
                 list = client.json("GET", "/v1/work-meetings", null);
@@ -1954,7 +1957,7 @@ public final class MainActivity extends Activity {
         byte[] payload = exportData; exportData = null;
         if (result != RESULT_OK || data == null || payload == null) return;
         Uri uri = data.getData();
-        worker.execute(() -> { try (OutputStream output = getContentResolver().openOutputStream(uri)) { if (output == null) throw new Exception("文件无法写入"); output.write(payload); runOnUiThread(() -> feedback(notice, LocalCue.EXPORTED)); } catch (Exception e) { runOnUiThread(() -> showError("导出失败，请选择其他保存位置")); } });
+        ioPool.execute(() -> { try (OutputStream output = getContentResolver().openOutputStream(uri)) { if (output == null) throw new Exception("文件无法写入"); output.write(payload); runOnUiThread(() -> feedback(notice, LocalCue.EXPORTED)); } catch (Exception e) { runOnUiThread(() -> showError("导出失败，请选择其他保存位置")); } });
     }
 
     private void privacyInfo() {
@@ -2446,7 +2449,7 @@ public final class MainActivity extends Activity {
         else if (listenMode != VoiceInteraction.CALL && session != null && sessionUsesCapture) endVoice();
         stopLocation(); super.onPause();
     }
-    @Override protected void onDestroy() { if (quickFeedback != null) quickFeedback.close(); if (meetingPlayback != null) meetingPlayback.close(); handler.removeCallbacks(workMeetingPlaybackTick); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); super.onDestroy(); }
+    @Override protected void onDestroy() { if (quickFeedback != null) quickFeedback.close(); if (meetingPlayback != null) meetingPlayback.close(); handler.removeCallbacks(workMeetingPlaybackTick); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } if (meetingPage != null) meetingPage.dismiss(); stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); ioPool.shutdownNow(); super.onDestroy(); }
     @Override public void onBackPressed() { if (session != null) { endVoice(); return; } if (!api.vault.token().isEmpty() && tab != 0) { switchTab(0); return; } if (api.vault.token().isEmpty() && authMode != 0) { showAuth(0); return; } super.onBackPressed(); }
 
     private void syncHeadsetControls() {
