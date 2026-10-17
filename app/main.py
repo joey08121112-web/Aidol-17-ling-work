@@ -53,7 +53,13 @@ def create_hosted_app(config=None, data_directory=None):
     runtimes = MobileRuntimes(config, directory / 'users')
     meeting_addresses = MeetingAddresses(config)
     speech = VolcSpeechProvider(config.speech)
-    api = FastAPI(title='Aidol Android API', version='0.2.0', docs_url=None, redoc_url=None, openapi_url=None)
+    @asynccontextmanager
+    async def lifespan(app):
+        try:
+            yield
+        finally:
+            await meeting_addresses.close()
+    api = FastAPI(title='Aidol Android API', version='0.2.0', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     api.state.accounts, api.state.runtimes, api.state.speech = accounts, runtimes, speech
     api.state.qwen = QwenRealtimeProvider(config.qwen)
     api.state.work_asr = QwenWorkAsrProvider(config.work_asr)
@@ -123,6 +129,19 @@ def create_hosted_app(config=None, data_directory=None):
         def aware_start(cls, value):
             if value is not None and (value.tzinfo is None or abs((datetime.now(timezone.utc) - value).total_seconds()) > 86400):
                 raise ValueError('会议开始时间需包含时区且在一天内')
+            return value
+
+    class LocationRecord(LocationInput):
+        accuracy: float = Field(default=0, ge=0, le=200)
+        record_id: str = Field(pattern=r'^[a-zA-Z0-9-]{16,64}$')
+        observed_at: datetime
+        trigger: str = Field(pattern=r'^(app_open|page_return|interval)$')
+
+        @field_validator('observed_at')
+        @classmethod
+        def fresh_observation(cls, value):
+            if value.tzinfo is None or not -120 <= (datetime.now(timezone.utc) - value).total_seconds() <= 600:
+                raise ValueError('定位时间必须是近期带时区的时间')
             return value
 
     class WorkMeetingFinish(BaseModel):
@@ -808,6 +827,27 @@ def create_hosted_app(config=None, data_directory=None):
         async with runtime(current, request, True) as rt:
             return await rt.agent.update_location(value)
 
+    @api.post('/v1/location-records')
+    async def record_location(value: LocationRecord, current=Depends(user)):
+        # Passive maintenance never acquires the voice lock, invokes a provider,
+        # changes modes/routes, or consumes the voice/business request quota.
+        store = read_work_store(current) or Store(str(directory / 'users' / (current['id'] + '.sqlite3')))
+        point = value.model_dump(exclude={'record_id', 'observed_at'})
+        observed_at = value.observed_at.astimezone(timezone.utc).isoformat()
+        try:
+            record = store.save_location_record(value.record_id, observed_at, point)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+        existing = runtimes.items.get(current['id'])
+        if existing is not None:
+            existing.record_passive_location({**value.model_dump(include={'longitude', 'latitude', 'accuracy', 'source', 'speed'}), 'observed_at': observed_at})
+        return record
+
+    @api.get('/v1/location-records')
+    async def recorded_locations(limit: int = Query(default=100, ge=1, le=1000), current=Depends(user)):
+        store = read_work_store(current)
+        return {'records': store.location_records(limit) if store else []}
+
     @api.post('/v1/maps/nearby')
     async def mobile_nearby(value: NearbyInput, request: Request, current=Depends(user)):
         async with runtime(current, request, True) as rt:
@@ -1112,6 +1152,7 @@ def create_hosted_app(config=None, data_directory=None):
         async with runtime(current, request) as rt:
             return {'user': current, 'settings': rt.store.settings().model_dump(), 'memories': rt.store.list('memories', 10000),
                     'version': 4, 'drafts': rt.store.list('drafts', 10000),
+                    'location_records': rt.store.location_records(10000),
                     'transcripts': rt.store.list('transcripts', 10000), 'reports': rt.store.all_meeting_reports(), 'tasks': rt.store.list('action_tasks', 10000),
                     'work_meetings': [rt.store.work_meeting(row['id']) for row in rt.store.work_meetings(10000)]}
 
@@ -1126,6 +1167,7 @@ def create_hosted_app(config=None, data_directory=None):
             rt.agent.conversation.history = []
             rt.agent.memory_interaction.reset()
             rt.agent.location, rt.agent.route, rt.agent.commute = None, None, None
+            rt.pending_location = None
             return {'ok': True}
 
     return api

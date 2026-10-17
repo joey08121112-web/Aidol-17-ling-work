@@ -310,6 +310,19 @@ public final class HeadsetController implements FusionDevice, AutoCloseable {
     }
     public void connect(String address) { main.post(() -> { cancelReconnect(); connectSelected(address); }); }
 
+    /** Silent foreground maintenance reuses this sole SDK owner and any in-flight reconnect. */
+    public void connectAutomatically() { main.post(() -> {
+        if (closed || initializing || releasing || reconnectPending || reconnectTask != null || !hasPermissions()
+                || snapshot.state != State.DISCONNECTED && snapshot.state != State.ERROR) return;
+        List<DeviceChoice> devices = pairedDevices();
+        String previous = app.getSharedPreferences("headset_connection", Context.MODE_PRIVATE).getString("last_ready", "");
+        String selected = null;
+        for (DeviceChoice device : devices) if (device.address.equalsIgnoreCase(previous)) selected = device.address;
+        if (selected == null && devices.size() == 1) selected = devices.get(0).address;
+        // Multiple unknown targets require the existing explicit selector; never connect arbitrarily.
+        if (selected != null) connectSelected(selected);
+    }); }
+
     private void connectSelected(String address) {
         if (closed) return;
         if (initializing || releasing) {
@@ -387,6 +400,7 @@ public final class HeadsetController implements FusionDevice, AutoCloseable {
                         recover("当前设备未通过 Rise 通信确认", "wrong_device"); return;
                     }
                     connectedMac = mac; model = "Rise / Aura 耳机 (6510)";
+                    app.getSharedPreferences("headset_connection", Context.MODE_PRIVATE).edit().putString("last_ready", mac).apply();
                     cancelReconnect();
                     readyElapsed = SystemClock.elapsedRealtime() - connectionStarted;
                     main.removeCallbacks(connectionTimeout); publish(State.READY, "耳机已就绪");

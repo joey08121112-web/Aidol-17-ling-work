@@ -55,6 +55,13 @@ public final class MainActivity extends Activity {
     private DevelopmentSettings development;
     private HeadsetController headset;
     private QuickFeedback quickFeedback;
+    private ForegroundLocationMonitor locationMonitor;
+    private TransientStatusPopup statusPopup;
+    private TextView maintenanceStatus, meetingMaintenanceStatus;
+    private String maintenanceLocationStatus = "定位：等待更新", maintenanceEntry = "app_open";
+    private boolean maintenanceHeadsetReady, automaticHeadsetSuppressed;
+    private long automaticHeadsetAttempt = -30000;
+    private final Runnable automaticHeadsetTick = this::maintainHeadset;
     private TextView dialogFeedback;
     private TextView headsetStatus, deviceDetails, voiceHint, developmentSummary;
     private long sessionGeneration;
@@ -130,7 +137,10 @@ public final class MainActivity extends Activity {
     });
     private final HeadsetController.Listener headsetListener = snapshot -> runOnUiThread(() -> {
         if (isDestroyed()) return;
+        if (snapshot.ready() && !maintenanceHeadsetReady && this.visible && statusPopup != null) statusPopup.show("蓝牙已连接");
+        maintenanceHeadsetReady = snapshot.ready();
         renderHeadset();
+        renderMaintenanceStatus();
         if (quickFeedback != null && !canSpeakFeedback()) quickFeedback.stop();
         if (development.audioMode() == AudioMode.RISE_SDK) {
             HeadsetInteractionPolicy.DeviceUpdate update = headsetPolicy.device(new HeadsetInteractionPolicy.Device(
@@ -235,6 +245,12 @@ public final class MainActivity extends Activity {
         development = new DevelopmentSettings(this);
         headsetControlsOptIn = getSharedPreferences("headset_controls", MODE_PRIVATE).getBoolean("touch_enabled", true);
         headset = new HeadsetController(getApplicationContext());
+        statusPopup = new TransientStatusPopup(this, () -> meetingPage != null && meetingPage.isShowing()
+            ? meetingPage.getWindow().getDecorView() : getWindow().getDecorView());
+        locationMonitor = new ForegroundLocationMonitor(this, new ForegroundLocationMonitor.Listener() {
+            @Override public void status(String message) { maintenanceLocationStatus = message; renderMaintenanceStatus(); }
+            @Override public void updated() { if (visible && !isDestroyed()) statusPopup.show("定位已更新"); }
+        });
         quickFeedback = new QuickFeedback(this, headset::matchesOutput, this::canSpeakFeedback);
         meetingPlayback = new MeetingPlayback(this, headset::matchesOutput, this::meetingPlaybackChanged);
         headset.addListener(headsetListener);
@@ -244,6 +260,7 @@ public final class MainActivity extends Activity {
     }
 
     private void base() {
+        maintenanceStatus = null;
         diagnosticsView = null;
         turnDetails = null;
         voiceButton = null; cancelButton = null; orb = null; chatInput = null;
@@ -347,6 +364,9 @@ public final class MainActivity extends Activity {
         avatar.setBackground(ripple(SOFT, 24, LINE)); avatar.setTextColor(ACCENT); avatar.setContentDescription("打开我的空间");
         status = label(root, "", 11, MUTED); status.setPadding(dp(24), 0, dp(24), dp(6));
         status.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        maintenanceStatus = label(root, "", 10, MUTED);
+        maintenanceStatus.setPadding(dp(24), 0, dp(24), dp(5));
+        renderMaintenanceStatus();
         if (tab != 0 && repeatArmed && listenMode == VoiceInteraction.CALL) {
             LinearLayout activeCall = row(); activeCall.setPadding(dp(24), dp(4), dp(24), dp(4)); root.addView(activeCall);
             button(activeCall, "AI 通话中 · 返回", false, () -> switchTab(0));
@@ -388,6 +408,7 @@ public final class MainActivity extends Activity {
         boolean keepCall = sessionUsesCapture && session != null || repeatArmed;
         if (session != null && !keepCall) cancelSession("已结束当前操作");
         if (!keepCall) stopRepeat(); tab = next; if (next == 0) followingConversation = true; hideKeyboard(); showApp();
+        enterMaintenance("page_return");
     }
 
     private void conversation() {
@@ -900,6 +921,7 @@ public final class MainActivity extends Activity {
         meetingTitle = label(titles, "会议记录", 20, INK); meetingTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         meetingTitle.setMaxLines(2); meetingTitle.setEllipsize(TextUtils.TruncateAt.END);
         meetingMeta = label(titles, "", 12, MUTED);
+        meetingMaintenanceStatus = label(titles, "", 10, MUTED); renderMaintenanceStatus();
         TextView save = label(header, "保存", 14, ACCENT); save.setGravity(Gravity.CENTER); save.setMinHeight(dp(48));
         save.setPadding(dp(12), 0, dp(4), 0); save.setBackground(ripple(BG, 12, BG)); save.setFocusable(true);
         save.setContentDescription("把本场会议纪要和原文保存为文件"); save.setOnClickListener(v -> saveMeetingFile());
@@ -921,8 +943,10 @@ public final class MainActivity extends Activity {
             openWorkMeetingId = ""; workMeetingDetail = null; workMeetingAudioText = "";
             workMeetingPlayer = null; workMeetingPlayerStatus = null; workMeetingTimeline = null; workMeetingLines.clear(); workMeetingPlayingId = "";
             meetingSections.clear(); meetingPlayback.stop(); workMeetingOpen = null;
+            meetingMaintenanceStatus = null; enterMaintenance("page_return");
         });
         meetingPage.show();
+        enterMaintenance("page_return");
         handler.removeCallbacks(workMeetingPoll); handler.post(workMeetingPoll);
     }
     private void renderWorkMeetingDetail(JSONObject meeting) {
@@ -1599,21 +1623,67 @@ public final class MainActivity extends Activity {
         return checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
             || checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
     }
+    private void enterMaintenance(String trigger) {
+        if (!visible || isDestroyed()) return;
+        maintenanceEntry = trigger;
+        startupLocationAttempted = false;
+        handler.removeCallbacks(startupLocationTick); handler.post(startupLocationTick);
+        handler.removeCallbacks(automaticHeadsetTick); handler.post(automaticHeadsetTick);
+    }
+    private boolean hasMaintenanceBluetoothPermission() {
+        if (Build.VERSION.SDK_INT < 31) return checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+        return checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+            && checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED;
+    }
+    private void maintainHeadset() {
+        handler.removeCallbacks(automaticHeadsetTick);
+        if (!visible || isDestroyed() || headset == null || api == null) return;
+        handler.postDelayed(automaticHeadsetTick, 1000);
+        renderMaintenanceStatus();
+        if (api.vault.token().isEmpty() || automaticHeadsetSuppressed || busy || permissionPending || session != null
+                || repeatArmed || callStartPending || meetingPlayback != null && meetingPlayback.active()) return;
+        HeadsetController.State connection = headset.snapshot().state;
+        if (connection != HeadsetController.State.DISCONNECTED && connection != HeadsetController.State.ERROR) return;
+        if (!hasMaintenanceBluetoothPermission()) {
+            if (Build.VERSION.SDK_INT >= 31 && !getPreferences(MODE_PRIVATE).getBoolean("auto_bluetooth_asked", false)) {
+                getPreferences(MODE_PRIVATE).edit().putBoolean("auto_bluetooth_asked", true).apply();
+                permissionPending = true;
+                requestPermissions(new String[]{Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN}, 6);
+            }
+            return;
+        }
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (now - automaticHeadsetAttempt < 30000) return;
+        automaticHeadsetAttempt = now;
+        headset.connectAutomatically();
+    }
+    private void renderMaintenanceStatus() {
+        if (headset == null) return;
+        HeadsetController.Snapshot device = headset.snapshot();
+        String bluetooth = !hasMaintenanceBluetoothPermission() ? "需要附近设备权限"
+            : device.ready() ? "已连接" : device.state == HeadsetController.State.CONNECTING
+            || device.state == HeadsetController.State.INITIALIZING || device.state == HeadsetController.State.CONNECTED ? "连接中" : "未连接";
+        String text = "蓝牙：" + bluetooth + " · " + maintenanceLocationStatus;
+        if (maintenanceStatus != null && !text.contentEquals(maintenanceStatus.getText())) maintenanceStatus.setText(text);
+        if (meetingMaintenanceStatus != null && !text.contentEquals(meetingMaintenanceStatus.getText())) meetingMaintenanceStatus.setText(text);
+    }
     private void updateStartupLocation() {
         handler.removeCallbacks(startupLocationTick);
         if (!visible || isDestroyed() || api == null || startupLocationAttempted) return;
-        if (busy || permissionPending) { handler.postDelayed(startupLocationTick, 500); return; }
-        if (session != null || repeatArmed || locationListener != null) return;
+        if (permissionPending) { handler.postDelayed(startupLocationTick, 500); return; }
+        if (api.vault.token().isEmpty()) return;
         if (!hasLocationPermission()) {
-            if (getPreferences(MODE_PRIVATE).getBoolean("startup_location_asked", false)) return;
+            if (getPreferences(MODE_PRIVATE).getBoolean("startup_location_asked", false)) {
+                maintenanceLocationStatus = "定位：需要位置权限"; renderMaintenanceStatus(); return;
+            }
+            if (busy || session != null || repeatArmed) { handler.postDelayed(startupLocationTick, 1000); return; }
             getPreferences(MODE_PRIVATE).edit().putBoolean("startup_location_asked", true).apply();
             permissionPending = true;
             requestPermissions(new String[]{Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION}, 5);
             return;
         }
-        if (api.vault.token().isEmpty() || state.optJSONObject("settings") == null) return;
         startupLocationAttempted = true;
-        locate(false);
+        locationMonitor.enter(api, maintenanceEntry);
     }
     private void locationFailed(String message) {
         boolean quiet = automaticLocation;
@@ -2238,6 +2308,7 @@ public final class MainActivity extends Activity {
     }
     @Override public void onRequestPermissionsResult(int code, String[] permissions, int[] grants) {
         super.onRequestPermissionsResult(code, permissions, grants);
+        if (code == 6) { permissionPending = false; renderMaintenanceStatus(); return; }
         if (code == 4) {
             permissionPending = false;
             if (grants.length == 0) return;
@@ -2268,8 +2339,8 @@ public final class MainActivity extends Activity {
     }
     @Override protected void onResume() {
         super.onResume(); visible = true; syncHeadsetControls();
-        startupLocationAttempted = false;
-        handler.post(startupLocationTick);
+        automaticHeadsetSuppressed = false;
+        enterMaintenance("app_open");
         prepareVoice();
         if (!pendingHeadsetNotice.isEmpty()) { String notice = pendingHeadsetNotice; pendingHeadsetNotice = ""; headsetNotice(notice); }
         if (orb != null) orb.invalidate();
@@ -2277,6 +2348,9 @@ public final class MainActivity extends Activity {
     }
     private void stopRepeat() { repeatArmed = false; continuingCall = false; handler.removeCallbacks(repeatTick); if (session == null) getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON); }
     @Override protected void onPause() {
+        handler.removeCallbacks(automaticHeadsetTick);
+        if (locationMonitor != null) locationMonitor.stop();
+        if (statusPopup != null) statusPopup.dismiss();
         handler.removeCallbacks(startupLocationTick);
         handler.removeCallbacks(workMeetingPoll);
         clearVoicePreparation();
@@ -2285,7 +2359,7 @@ public final class MainActivity extends Activity {
         else if (listenMode != VoiceInteraction.CALL && session != null && sessionUsesCapture) endVoice();
         stopLocation(); super.onPause();
     }
-    @Override protected void onDestroy() { if (quickFeedback != null) quickFeedback.close(); if (meetingPlayback != null) meetingPlayback.close(); handler.removeCallbacks(workMeetingPlaybackTick); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); super.onDestroy(); }
+    @Override protected void onDestroy() { if (locationMonitor != null) locationMonitor.close(); if (statusPopup != null) statusPopup.dismiss(); handler.removeCallbacks(automaticHeadsetTick); if (quickFeedback != null) quickFeedback.close(); if (meetingPlayback != null) meetingPlayback.close(); handler.removeCallbacks(workMeetingPlaybackTick); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); super.onDestroy(); }
     @Override public void onBackPressed() { if (session != null) { endVoice(); return; } if (!api.vault.token().isEmpty() && tab != 0) { switchTab(0); return; } if (api.vault.token().isEmpty() && authMode != 0) { showAuth(0); return; } super.onBackPressed(); }
 
     private void syncHeadsetControls() {
@@ -2392,6 +2466,8 @@ public final class MainActivity extends Activity {
         if (callCaption != null && session == null) callCaption.setText(InteractionCopy.ready(listenMode));
     }
     private void connectBackend() {
+        if (locationMonitor != null) locationMonitor.stop();
+        startupLocationAttempted = false;
         clearVoicePreparation(); preparationAttemptAt = -60000;
         ApiClient next = new ApiClient(this, development.serverUrl());
         api = next;
@@ -2507,7 +2583,7 @@ public final class MainActivity extends Activity {
         label(body, "先在手机系统配对 Rise，再连接耳机。显示就绪后，点一下接通 AI 就可以一直聊。", 12, MUTED);
         if (development.audioMode() == AudioMode.RISE_SDK) {
             button(body, "连接 / 重新连接 Rise", true, () -> { if (canAct()) connectHeadset(); });
-            button(body, "断开耳机", false, () -> { cancelSession("耳机已断开"); headset.disconnect(); });
+            button(body, "断开耳机", false, () -> { automaticHeadsetSuppressed = true; cancelSession("耳机已断开"); headset.disconnect(); });
             if (BuildConfig.DEBUG) button(body, "结束耳机本地录音（调试）", false, () -> confirm("结束耳机本地录音？",
                 "这会结束耳机自身正在进行的录音片段。确认当前录音可以结束后再继续；结束后可回到对话页接通 AI。",
                 () -> headset.stopLocalRecording(message -> { if (!isDestroyed()) feedback(message, null); })));
@@ -2529,6 +2605,7 @@ public final class MainActivity extends Activity {
     }
     private void connectHeadset() {
         if (permissionPending || !canAct()) return;
+        automaticHeadsetSuppressed = false;
         ArrayList<String> missing = audioPermissions(true);
         if (!missing.isEmpty()) { permissionPending = true; requestPermissions(missing.toArray(new String[0]), 3); return; }
         try {

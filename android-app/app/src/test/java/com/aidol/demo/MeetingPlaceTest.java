@@ -31,4 +31,13 @@ public class MeetingPlaceTest {
         assertEquals("开始地点：测试会议室", MeetingPlace.label(new JSONObject()
             .put("location", new JSONObject().put("address", "测试会议室"))));
     }
+
+    @Test public void exhaustedRetriesAreShownWithoutCoordinatesOrAnEndlessRetryPromise() throws Exception {
+        JSONObject meeting = new JSONObject().put("location", new JSONObject().put("longitude", 116.4).put("latitude", 39.9))
+            .put("address_attempts", 4).put("address_retry_at", JSONObject.NULL);
+        assertEquals("开始地点：地址暂未获取（已重试3次）", MeetingPlace.label(meeting));
+        assertFalse(MeetingExport.markdown(meeting, ZoneId.of("Asia/Shanghai")).contains("116.4"));
+        meeting.put("address_retry_at", 123456);
+        assertFalse(MeetingPlace.label(meeting).contains("已重试3次"));
+    }
 }

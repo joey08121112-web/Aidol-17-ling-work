@@ -74,10 +74,12 @@ APK 默认本地基址 `http://127.0.0.1:8108`，可切换内置远端 `https://
 | `PATCH /v1/tasks/{id}` | `{status:"open"或"done"}`；`{ok:true}`；可修改的任务 ID 从 state.tasks 取得 |
 | `GET /v1/maps/search?q=...&city=...` | q 1–100 字符，city 最多 80；高德地点搜索结果，沿用下方地图结构 |
 | `POST /v1/location` | `{longitude,latitude,accuracy?,speed?,source?}`，WGS-84 定位；返回 agent 快照，可能更新模式、路线与提醒草稿 |
+| `POST /v1/location-records` | 前台被动位置记录，见下文；不触发模式判断、路线或提示音 |
+| `GET /v1/location-records?limit=100` | 当前账号最近位置，`limit` 1–1000，返回 `{records:[…]}`，按观测时间倒序 |
 | `POST /v1/maps/nearby` | 定位字段加 `{keyword}`，默认“美食”；高德 3 km 周边结果 |
 | `GET /v1/maps/weather?city=310000` | city 可选，为六位 adcode；省略/留空则用本人保存的目的地坐标反查区域后查询天气，无目的地 422；返回高德实况天气结构 |
 | `POST /v1/drafts/{id}/{action}` | action 仅 `copied/dismissed`；返回 `{ok:true,status,sent:false}`；不支持真实发送 |
-| `GET /v1/export` | v3 JSON：`version/user/settings/memories/transcripts/reports/tasks/drafts` |
+| `GET /v1/export` | v4 JSON：`version/user/settings/memories/transcripts/reports/tasks/drafts/work_meetings/location_records` |
 | `DELETE /v1/data` | `{password}`；清空业务数据和对话幂等结果，保留账号与设置；返回 `{ok:true}` |
 
 `PUT /v1/settings` 是完整替换：先取 state.settings 再合并修改。字段取值范围沿用下方“设置”，Android 强制值优先；新账号默认手动生活模式，偏好为空。关闭 `retain_transcripts` 阻止新增转写历史，但不清除旧数据，也不阻止抽取记忆或幂等结果保存；完整清除使用 `/v1/data`。
@@ -95,6 +97,14 @@ APK 默认本地基址 `http://127.0.0.1:8108`，可切换内置远端 `https://
 纪要 `coverage` 披露可用/纳入/遗漏片段、截短来源与记录首尾时间；`continuous_capture_verified=false` 明示这些信息不能证明没有采集缺段。模型仍最多使用 80 条、18000 字材料。新增片段后重生成纪要时，仅内容、负责人、期限相同且来源重叠的任务复用旧 ID/完成状态；语义改写仍需后续任务关联设计。
 
 state 最多返回 100 条转写（按时间正序）、300 条记忆、300 条行动项、30 条草稿及最新纪要；记忆按收藏优先及时间倒序。导出各集合最多 10000 条，暂不提供分页。纪要中的 tasks 是生成时的草稿快照，当前完成状态以 state.tasks 或 export.tasks 为准。`include_demo` 为兼容模型字段，不会为托管账号注入模拟内容。
+
+### 前台位置记录（2026-10-18）
+
+`POST /v1/location-records` 接收 `{record_id, observed_at, trigger, longitude, latitude, accuracy, source, speed?}`。`record_id` 为16–64位字母、数字或连字符；`observed_at` 必须含时区，接受过去10分钟至未来2分钟，统一保存为UTC；`trigger` 仅 `app_open/page_return/interval`；坐标为手机系统 WGS-84，精度0–200米。响应 `{id, observed_at, trigger, longitude, latitude, accuracy, source, speed}`。同一编号和相同内容幂等返回；编号已存在但内容不同返回409。Android 进一步只接收60秒内、带精度的系统结果，每次等待最多25秒。
+
+记录按账号隔离持久保存，可通过上述GET读取并包含在v4导出中；清空业务数据/注销账号同时删除。它使用独立接口和手机网络线程，不等待语音业务锁，不调用地图或文字模型，不扣语音/业务请求额度。最新坐标可供后续请求使用；业务处理期间暂存，待原有业务释放锁后再更新上下文，不主动重算模式、路线、提醒或播报。手动定位仍走原 `/v1/location`。
+
+Android 在已登录且前台可见时，打开App、切换主页面、进入/退出会议详情即尝试获取位置，此后每180秒发起一次；同一轮未结束时合并重复触发。退到后台或锁屏停止监听、计时和未完成的上传，返回前台重新刷新；不启用后台常驻定位或新增后台定位权限。取得位置并收到保存成功回执后，显示无声、非模态“定位已更新”浮层3秒；失败仅更新状态文字。
 
 ### 幂等、限流和失败语义
 
@@ -191,7 +201,7 @@ M1 Android 复用 HTTP 短语音，无新增实时接口。含异步停止尾帧
 
 问记忆检索当前账号的有界记忆、转写和行动项，返回引用与原文摘录。引用 ID 和摘录子串需通过校验，资料不足时 `insufficient=true`；不得补造事实或将记录内容当成系统指令。
 
-`GET /v1/export` 返回 v3 快照，当前没有导入接口。`DELETE /v1/data` 要求当前密码，删除业务数据及幂等结果、保留账号和设置；账号注销使用 `DELETE /auth/account`。删除在线数据不自动删除运维历史备份，备份规则见部署文档。
+`GET /v1/export` 返回 v4 快照，包含工作会议及位置记录，当前没有导入接口。`DELETE /v1/data` 要求当前密码，删除业务数据及幂等结果、保留账号和设置；账号注销使用 `DELETE /auth/account`。删除在线数据不自动删除运维历史备份，备份规则见部署文档。
 
 ## 当前范围
 
@@ -274,7 +284,7 @@ Android 实际播放排空后发送 `{"type":"playback.done","turn":N}`，后端
 `location: {longitude, latitude, accuracy, source: "gps"}`。Android 在开始时读取最多两分钟内的定位，必要时最多等待三秒新定位；无授权/无定位不阻塞会议。后端在响应发送后后台使用高德将保存的开始坐标转换为 `location.address`，每次转换最多12秒，不等待地址结果才开始录音。首次创建的时间地点不可被重试覆盖，也不使用会议结束时的位置替换。
 
 列表、详情均返回 `location` 对象；无位置为 `{}`。完成的 report 同样包含 `started_at`、`location`。
-创建会议、读取 `/v1/state` 或会议列表/详情时，对缺失地址的历史坐标自动安排补查；失败后至少60秒才允许重试，同一账号会议不重复排队，地址成功后持久保存并同步已有 report。每次读取最多安排两条、全局最多八条待办和两条并发转换；未配置地图 Key 时不发请求。读取本次返回的地址可能尚未补齐，后续刷新取得新值。App 纪要列表、详情与导出只展示地址；有坐标但未解析时显示“地址暂未解析，稍后刷新”，不展示经纬度。地址结果仅可补入仍存在、开始坐标未改变的会议，不恢复已清空的记录。
+创建会议、读取 `/v1/state` 或会议列表/详情时，对缺失地址且尚未用尽次数的历史坐标安排补查。每场首次失败后，服务端每隔30秒重试一次，最多额外3次；间隔从上次请求失败返回起算，每次请求最多12秒。`address_attempts`（0–4）与 `address_retry_at`（Unix秒或null）持久保存，重启不会重置次数，重启后下一次鉴权读取恢复未到期/到期的任务。成功后停止并同步已有 report，重试用尽后停止。正常运行时重试不依赖页面轮询；同一账号会议去重，每次读取最多安排两条、全局最多八条待办和两条并发转换；未配置地图 Key 时不发请求、不消耗尝试。App 列表、详情和导出只展示地址，等待时显示待解析，重试用尽显示“地址暂未获取（已重试3次）”，不展示经纬度。仅使用会议开始时保存的坐标，不用后来的定位替代；没有开始坐标时无法反查。晚到地址仅可补入仍存在且开始坐标未改变的会议，不恢复已清空记录。
 每条 sources 保留原始 `text`，另有 `utterances: [{text,speaker_id,begin_time,end_time}]`。
 时间单位为片段内毫秒，speaker_id 仅在该片段内有效，不代表真实身份或跨片段稳定身份。
 

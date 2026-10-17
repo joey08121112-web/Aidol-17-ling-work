@@ -156,6 +156,8 @@ class Store:
                   meeting_id TEXT NOT NULL, segment_index INTEGER NOT NULL,
                   request_id TEXT NOT NULL UNIQUE, transcript_id TEXT,
                   PRIMARY KEY(meeting_id, segment_index));
+                CREATE TABLE IF NOT EXISTS location_records (
+                  id TEXT PRIMARY KEY, observed_at TEXT NOT NULL, payload TEXT NOT NULL);
             """)
             # Preserve existing local databases; serialize schema checks and ALTERs
             # so two startup instances cannot both add the same missing column.
@@ -179,7 +181,9 @@ class Store:
             meeting_columns = {row['name'] for row in db.execute('PRAGMA table_info(work_meetings)')}
             for name, definition in (('whole_audio', 'INTEGER NOT NULL DEFAULT 0'),
                                      ('transcription_status', "TEXT NOT NULL DEFAULT 'legacy'"),
-                                     ('asr_task_id', "TEXT NOT NULL DEFAULT ''")):
+                                     ('asr_task_id', "TEXT NOT NULL DEFAULT ''"),
+                                     ('address_attempts', 'INTEGER NOT NULL DEFAULT 0'),
+                                     ('address_retry_at', 'REAL')):
                 if name not in meeting_columns:
                     db.execute(f'ALTER TABLE work_meetings ADD COLUMN {name} {definition}')
             db.execute('CREATE TABLE IF NOT EXISTS work_audio_uploads (meeting_id TEXT NOT NULL, '
@@ -416,7 +420,7 @@ class Store:
 
     def clear(self):
         with self.connect() as db:
-            for table in ("work_audio_uploads", "work_utterances", "work_meeting_events", "work_meeting_segments", "work_meetings", "memories", "transcripts", "events", "drafts", "processed", "meeting_reports", "action_tasks", "mobile_turns", "recall_exclusions"):
+            for table in ("location_records", "work_audio_uploads", "work_utterances", "work_meeting_events", "work_meeting_segments", "work_meetings", "memories", "transcripts", "events", "drafts", "processed", "meeting_reports", "action_tasks", "mobile_turns", "recall_exclusions"):
                 db.execute(f"DELETE FROM {table}")
         shutil.rmtree(self.audio_root, ignore_errors=True)
 
@@ -541,11 +545,56 @@ class Store:
                 return False
             location['address'] = address
             encoded = json.dumps(location, ensure_ascii=False)
-            db.execute('UPDATE work_meetings SET location=? WHERE id=?', (encoded, meeting_id))
+            db.execute('UPDATE work_meetings SET location=?,address_retry_at=NULL WHERE id=?', (encoded, meeting_id))
             if row['report_id']:
                 db.execute("UPDATE meeting_reports SET payload=json_set(payload,'$.location',json(?)) WHERE id=?",
                            (encoded, row['report_id']))
         return True
+
+    def claim_meeting_address(self, meeting_id, expected_location, stamp):
+        """Persist an attempt before the request; one initial attempt plus three retries."""
+        if not Path(self.path).exists():
+            return None
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT location,address_attempts,address_retry_at FROM work_meetings WHERE id=?', (meeting_id,)).fetchone()
+            if row is None or json.loads(row['location'] or '{}') != expected_location:
+                return None
+            if row['address_retry_at'] is not None and row['address_retry_at'] > stamp:
+                return {'wait': row['address_retry_at'] - stamp}
+            if row['address_attempts'] >= 4:
+                # A crash during the final request must not leave the UI pending forever.
+                db.execute('UPDATE work_meetings SET address_retry_at=NULL WHERE id=?', (meeting_id,))
+                return None
+            attempt = row['address_attempts'] + 1
+            # A restart during a request keeps both the consumed attempt and its bounded lease.
+            db.execute('UPDATE work_meetings SET address_attempts=?,address_retry_at=? WHERE id=?', (attempt, stamp + 42, meeting_id))
+            return {'attempt': attempt}
+
+    def finish_meeting_address_attempt(self, meeting_id, expected_location, attempt, retry_at):
+        if not Path(self.path).exists():
+            return False
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT location,address_attempts FROM work_meetings WHERE id=?', (meeting_id,)).fetchone()
+            if row is None or row['address_attempts'] != attempt or json.loads(row['location'] or '{}') != expected_location:
+                return False
+            return db.execute('UPDATE work_meetings SET address_retry_at=? WHERE id=?', (retry_at, meeting_id)).rowcount > 0
+
+    def save_location_record(self, record_id, observed_at, point):
+        encoded = json.dumps(point, ensure_ascii=False, sort_keys=True)
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            existing = db.execute('SELECT observed_at,payload FROM location_records WHERE id=?', (record_id,)).fetchone()
+            if existing and (existing['observed_at'] != observed_at or existing['payload'] != encoded):
+                raise ValueError('位置记录标识已存在且内容不同')
+            db.execute('INSERT OR IGNORE INTO location_records VALUES(?,?,?)', (record_id, observed_at, encoded))
+        return {'id': record_id, 'observed_at': observed_at, **point}
+
+    def location_records(self, limit=100):
+        with self.connect() as db:
+            return [{'id': row['id'], 'observed_at': row['observed_at'], **json.loads(row['payload'])}
+                    for row in db.execute('SELECT * FROM location_records ORDER BY observed_at DESC,id DESC LIMIT ?', (limit,))]
 
     def work_meeting(self, meeting_id):
         retention = self.settings().work_audio_retention_days

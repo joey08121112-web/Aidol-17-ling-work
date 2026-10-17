@@ -1,4 +1,5 @@
 from uuid import uuid4
+import asyncio
 
 from fastapi import BackgroundTasks
 import pytest
@@ -54,17 +55,21 @@ async def test_provider_failure_keeps_coordinates_and_throttles_poll_retries(con
         return {'available': True, 'address': '重试后的地址'}
 
     monkeypatch.setattr('app.services.maps.MapService.reverse', reverse)
-    resolver, background = MeetingAddresses(config), BackgroundTasks()
+    stamp, delays = [1000], []
+    async def advance(delay):
+        delays.append(delay); stamp[0] += delay
+        await asyncio.sleep(0)
+    resolver, background = MeetingAddresses(config, clock=lambda: stamp[0], sleep=advance), BackgroundTasks()
     resolver.schedule(background, store, [meeting])
     await background()
     assert store.work_meeting(meeting['id'])['location'] == POINT
     retry = BackgroundTasks()
     resolver.schedule(retry, store, [meeting])
     assert not retry.tasks and len(calls) == 1
-    resolver.retry_after.clear()  # Advance past the retry window without sleeping.
-    resolver.schedule(retry, store, [meeting])
-    await retry()
+    await asyncio.gather(*list(resolver.tasks))
     assert store.work_meeting(meeting['id'])['location']['address'] == '重试后的地址'
+    assert delays == [30]
+    assert store.work_meeting(meeting['id'])['address_attempts'] == 2
 
 
 @pytest.mark.asyncio
@@ -127,3 +132,93 @@ def test_late_lookup_cannot_overwrite_a_different_location_or_saved_address(stor
     assert store.save_work_meeting_address(meeting_id, POINT, '原始地址')
     assert not store.save_work_meeting_address(meeting_id, POINT, '覆盖地址')
     assert store.work_meeting(meeting_id)['location'] == {**POINT, 'address': '原始地址'}
+
+
+@pytest.mark.asyncio
+async def test_three_thirty_second_retries_stop_even_after_a_service_restart(config, store, monkeypatch):
+    config.amap_key = 'offline-only'
+    meeting = store.start_work_meeting(uuid4().hex, location=POINT)
+    stamp, delays, calls = [1000], [], []
+    async def advance(delay):
+        delays.append(delay); stamp[0] += delay
+        await asyncio.sleep(0)
+    async def unavailable(self, point):
+        calls.append(stamp[0])
+        return {'available': False}
+    monkeypatch.setattr('app.services.maps.MapService.reverse', unavailable)
+    resolver = MeetingAddresses(config, clock=lambda: stamp[0], sleep=advance)
+    background = BackgroundTasks(); resolver.schedule(background, store, [meeting]); await background()
+    await asyncio.gather(*list(resolver.tasks))
+    assert calls == [1000, 1030, 1060, 1090] and delays == [30, 30, 30]
+    saved = store.work_meeting(meeting['id'])
+    assert saved['address_attempts'] == 4 and saved['address_retry_at'] is None
+    assert saved['location'] == POINT
+    restarted = MeetingAddresses(config, clock=lambda: stamp[0], sleep=advance)
+    again = BackgroundTasks(); restarted.schedule(again, store, [saved]); await again()
+    assert not again.tasks and len(calls) == 4
+
+
+@pytest.mark.asyncio
+async def test_pending_retry_survives_restart_and_does_not_repeat_initial_attempt(config, store, monkeypatch):
+    config.amap_key = 'offline-only'
+    meeting = store.start_work_meeting(uuid4().hex, location=POINT)
+    stamp, delays, calls = [1000], [], []
+    async def blocked(delay):
+        await asyncio.Event().wait()
+    async def advance(delay):
+        delays.append(delay); stamp[0] += delay
+        await asyncio.sleep(0)
+    async def reverse(self, point):
+        calls.append(stamp[0])
+        return {'available': len(calls) > 1, 'address': '重启后完成'}
+    monkeypatch.setattr('app.services.maps.MapService.reverse', reverse)
+    old = MeetingAddresses(config, clock=lambda: stamp[0], sleep=blocked)
+    background = BackgroundTasks(); old.schedule(background, store, [meeting]); await background()
+    await old.close()
+    saved = store.work_meeting(meeting['id'])
+    assert saved['address_attempts'] == 1 and saved['address_retry_at'] == 1030
+    new = MeetingAddresses(config, clock=lambda: stamp[0], sleep=advance)
+    background = BackgroundTasks(); new.schedule(background, store, [saved]); await background()
+    assert calls == [1000]
+    await asyncio.gather(*list(new.tasks))
+    assert calls == [1000, 1030] and delays == [30]
+    assert store.work_meeting(meeting['id'])['location']['address'] == '重启后完成'
+
+
+@pytest.mark.asyncio
+async def test_clearing_data_during_retry_wait_cancels_future_provider_requests(config, store, monkeypatch):
+    config.amap_key = 'offline-only'
+    meeting = store.start_work_meeting(uuid4().hex, location=POINT)
+    stamp, calls = [1000], []
+    async def advance(delay):
+        stamp[0] += delay
+        await asyncio.sleep(0)
+    async def unavailable(self, point):
+        calls.append(point); return {'available': False}
+    monkeypatch.setattr('app.services.maps.MapService.reverse', unavailable)
+    resolver = MeetingAddresses(config, clock=lambda: stamp[0], sleep=advance)
+    background = BackgroundTasks(); resolver.schedule(background, store, [meeting]); await background()
+    store.clear()
+    await asyncio.gather(*list(resolver.tasks))
+    assert len(calls) == 1 and store.work_meeting(meeting['id']) is None
+
+
+@pytest.mark.asyncio
+async def test_restart_during_final_attempt_expires_pending_status_without_a_fifth_request(config, store, monkeypatch):
+    config.amap_key = 'offline-only'
+    meeting = store.start_work_meeting(uuid4().hex, location=POINT)
+    for attempt in range(4):
+        assert store.claim_meeting_address(meeting['id'], POINT, 1000 + attempt * 42)['attempt'] == attempt + 1
+    stamp, delays = [1126], []
+    async def advance(delay):
+        delays.append(delay); stamp[0] += delay
+        await asyncio.sleep(0)
+    async def forbidden(self, point):
+        pytest.fail('A fifth address request must never be issued')
+    monkeypatch.setattr('app.services.maps.MapService.reverse', forbidden)
+    resolver = MeetingAddresses(config, clock=lambda: stamp[0], sleep=advance)
+    background = BackgroundTasks()
+    resolver.schedule(background, store, [store.work_meeting(meeting['id'])]); await background()
+    await asyncio.gather(*list(resolver.tasks))
+    saved = store.work_meeting(meeting['id'])
+    assert delays == [42] and saved['address_attempts'] == 4 and saved['address_retry_at'] is None

@@ -32,6 +32,21 @@ class MobileRuntime:
         self.agent = Agent(config, self.store, EventBus(self.store))
         self.agent.conversation = MobileConversation(config)
         self.lock = asyncio.Lock()
+        self.pending_location = None
+
+    def record_passive_location(self, point):
+        previous = self.pending_location or self.agent.location or {}
+        if previous.get('observed_at', '') <= point['observed_at']:
+            self.pending_location = point
+        if not self.lock.locked():
+            self.apply_passive_location()
+
+    def apply_passive_location(self):
+        if self.pending_location is not None:
+            previous = self.agent.location or {}
+            if previous.get('observed_at', '') <= self.pending_location['observed_at']:
+                self.agent.location = self.pending_location
+            self.pending_location = None
 
     def conversation_history(self):
         history = list(reversed(self.store.conversation_history(12)))
@@ -83,6 +98,8 @@ class MobileRuntimes:
         except TimeoutError:
             raise HTTPException(409, '上一项操作仍在收尾，请稍后再开始') from None
         try:
+            runtime.apply_passive_location()
             yield runtime
         finally:
             runtime.lock.release()
+            runtime.apply_passive_location()
