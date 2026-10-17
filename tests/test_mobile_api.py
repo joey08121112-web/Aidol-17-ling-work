@@ -184,6 +184,82 @@ def test_voice_idempotency_formats_and_speech_failure(mobile, monkeypatch):
     assert failure.status_code == 502 and "private-provider-detail" not in failure.text
 
 
+def test_voice_source_and_saved_memory_stay_with_current_account(mobile):
+    _, alice = register(mobile)
+    _, bob = register(mobile, "bob")
+    request_id = uuid4().hex
+    pcm_headers = {**alice, "Content-Type": "audio/pcm"}
+    response = mobile.post("/v1/voice?request_id=" + request_id, headers=pcm_headers,
+                           content=b"\x01\x00" * 1600)
+    assert response.status_code == 200
+    alice_state = mobile.get("/v1/state", headers=alice).json()
+    source = next(row for row in alice_state["transcripts"] if row["speaker"] == "用户")
+    assert source["source"] == "asr" and source["text"] == response.json()["text"]
+    saved = mobile.post("/v1/memories/from-transcript/" + source["id"], headers=alice)
+    assert saved.status_code == 200
+    source_path = "/v1/memories/" + saved.json()["id"] + "/source"
+    assert mobile.get(source_path, headers=alice).json()["id"] == source["id"]
+    assert mobile.get(source_path, headers=bob).status_code == 404
+    bob_state = mobile.get("/v1/state", headers=bob).json()
+    assert bob_state["memories"] == [] and bob_state["transcripts"] == []
+
+
+def test_turn_and_speech_diagnostics_correlate_without_private_content(mobile, caplog):
+    caplog.set_level("INFO", logger="uvicorn.error.aidol.mobile")
+    account, headers = register(mobile)
+    request_id = uuid4().hex
+    text = "private diagnostic test utterance"
+    assert chat(mobile, headers, text, request_id).status_code == 200
+    assert chat(mobile, headers, text, request_id).status_code == 200
+    assert chat(mobile, headers, "conflicting private utterance", request_id).status_code == 409
+    spoken = mobile.post("/v1/speech", headers={**headers, "X-Aidol-Request-ID": request_id}, json={"text": text})
+    assert spoken.status_code == 200
+    logs = [row.getMessage() for row in caplog.records if row.name == "uvicorn.error.aidol.mobile"]
+    assert all("request_id=" + request_id in row and "elapsed_ms=" in row for row in logs)
+    for event in ("stage=cache status=miss", "stage=business status=done", "stage=cache status=hit",
+                  "stage=cache status=conflict", "stage=turn status=failed", "stage=tts status=done"):
+        assert any(event in row for row in logs)
+    for private in (text, "conflicting private utterance", account["token"], account["user"]["id"],
+                    account["user"]["username"], account["recovery_code"], "offline-test-only"):
+        assert all(private not in row for row in logs)
+
+
+def test_diagnostics_report_asr_failure_without_exception_details(mobile, monkeypatch, caplog):
+    caplog.set_level("INFO", logger="uvicorn.error.aidol.mobile")
+    _, headers = register(mobile)
+
+    async def fail(chunks):
+        raise SpeechProviderError("private-provider-key-and-payload")
+        yield  # Makes the mock an async generator like stream_asr.
+
+    monkeypatch.setattr(mobile.app.state.speech, "stream_asr", fail)
+    request_id = uuid4().hex
+    response = mobile.post("/v1/voice?request_id=" + request_id,
+                           headers={**headers, "Content-Type": "audio/pcm"}, content=b"\0\0" * 1600)
+    assert response.status_code == 502
+    logs = [row.getMessage() for row in caplog.records if row.name == "uvicorn.error.aidol.mobile"]
+    assert any("stage=asr status=failed" in row for row in logs)
+    assert any("stage=turn status=failed" in row for row in logs)
+    assert all("request_id=" + request_id in row for row in logs)
+    assert all("private-provider-key-and-payload" not in row for row in logs)
+
+
+@pytest.mark.parametrize("diagnostic_id", [None, "invalid private diagnostic value", "x" * 65])
+def test_missing_or_invalid_speech_diagnostic_id_does_not_change_contract(mobile, caplog, diagnostic_id):
+    import re
+
+    caplog.set_level("INFO", logger="uvicorn.error.aidol.mobile")
+    _, headers = register(mobile)
+    if diagnostic_id is not None:
+        headers["X-Aidol-Request-ID"] = diagnostic_id
+    response = mobile.post("/v1/speech", headers=headers, json={"text": "synthetic speech"})
+    assert response.status_code == 200 and response.headers["content-type"] == "audio/wav"
+    logs = [row.getMessage() for row in caplog.records if row.name == "uvicorn.error.aidol.mobile"]
+    assert len(logs) == 1 and re.search(r"request_id=[a-f0-9]{32} stage=tts status=done", logs[0])
+    if diagnostic_id is not None:
+        assert diagnostic_id not in logs[0]
+
+
 def test_work_life_modes_and_recording_privacy(mobile):
     _, headers = register(mobile)
     state = mobile.get("/v1/state", headers=headers).json()

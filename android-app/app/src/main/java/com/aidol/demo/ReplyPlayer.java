@@ -7,82 +7,157 @@ import android.media.AudioDeviceInfo;
 import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioTrack;
+import android.media.AudioRouting;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.SystemClock;
 import java.io.IOException;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 
-/** Plays one short reply after capture has released the SCO recording route. */
+/** Plays a short reply using the same routing policy as the capture source. */
 public final class ReplyPlayer {
     private final AudioManager manager;
+    private final AudioMode mode;
+    private final Predicate<AudioDeviceInfo> outputIdentity;
     private volatile boolean cancelled;
-    public ReplyPlayer(Context context) { manager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE); }
-    private static boolean headset(AudioDeviceInfo device) {
-        return device != null && (device.getType() == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP || BluetoothCapture.isBluetoothInput(device)
-            || (Build.VERSION.SDK_INT >= 31 && device.getType() == AudioDeviceInfo.TYPE_BLE_SPEAKER));
+    private volatile String interruption;
+    private volatile AudioTrack activeTrack;
+
+    public ReplyPlayer(Context context) { this(context, AudioMode.BLUETOOTH); }
+    public ReplyPlayer(Context context, AudioMode mode) {
+        this(context, mode, device -> false);
     }
+    public ReplyPlayer(Context context, AudioMode mode, Predicate<AudioDeviceInfo> outputIdentity) {
+        this.mode = AudioMode.requirePhysical(mode);
+        manager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
+        this.outputIdentity = outputIdentity == null ? device -> false : outputIdentity;
+    }
+
+    private boolean acceptable(AudioDeviceInfo device) {
+        if (device == null || !mode.acceptsOutputType(device.getType())) return false;
+        try { return !mode.requiresTargetIdentity() || outputIdentity.test(device); }
+        catch (RuntimeException deniedOrDisconnected) { return false; }
+    }
+
     public void play(byte[] pcm, Consumer<String> log) throws Exception {
-        if (pcm.length == 0 || (pcm.length & 1) != 0 || pcm.length > 6 * 1024 * 1024) throw new IOException("回复音频为空或格式不正确");
+        play(pcm, log, description -> log.accept("实际播放：" + description));
+    }
+
+    public void play(byte[] pcm, Consumer<String> log, Consumer<String> output) throws Exception {
+        if (pcm.length == 0 || (pcm.length & 1) != 0 || pcm.length > 6 * 1024 * 1024)
+            throw new IOException("回复音频为空或格式不正确");
         AudioDeviceInfo target = null;
-        long routeDeadline = SystemClock.elapsedRealtime() + 4000;
-        while (!cancelled && target == null && SystemClock.elapsedRealtime() < routeDeadline) {
-            for (AudioDeviceInfo device : manager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
-                if (device.getType() == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP || (Build.VERSION.SDK_INT >= 31 && device.getType() == AudioDeviceInfo.TYPE_BLE_HEADSET)) { target = device; break; }
+        if (mode.requiresVerifiedHeadsetOutput()) {
+            long routeDeadline = SystemClock.elapsedRealtime() + 4000;
+            while (!cancelled && target == null && SystemClock.elapsedRealtime() < routeDeadline) {
+                for (AudioDeviceInfo device : manager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+                    if (acceptable(device) && (device.getType() == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+                        || (Build.VERSION.SDK_INT >= 31 && device.getType() == AudioDeviceInfo.TYPE_BLE_HEADSET))) {
+                        target = device; break;
+                    }
+                }
+                if (target == null) Thread.sleep(100);
             }
-            if (target == null) Thread.sleep(100);
+            if (cancelled) { return; }
+            if (target == null) throw new IOException(mode.requiresTargetIdentity()
+                ? "未核验到所连接 Rise 的媒体输出，请检查目标耳机的媒体音频和连接状态"
+                : "没有蓝牙媒体输出，请打开耳机的“媒体音频”开关");
         }
-        if (cancelled) return;
-        if (target == null) throw new IOException("没有蓝牙媒体输出，请打开耳机的“媒体音频”开关");
+        if (cancelled) { return; }
         AudioAttributes attributes = new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA)
             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build();
         AudioFocusRequest focus = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
             .setAudioAttributes(attributes).setOnAudioFocusChangeListener(change -> {
-                if (change == AudioManager.AUDIOFOCUS_LOSS || change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) cancelled = true;
+                if (change < 0) {
+                    interruption = "语音播放被其他音频或来电打断，请结束通话后重试";
+                    cancel();
+                }
             }).build();
         if (manager.requestAudioFocus(focus) != AudioManager.AUDIOFOCUS_REQUEST_GRANTED)
             throw new IOException("无法取得音频焦点，请关闭正在通话或播放的应用后重试");
         AudioTrack track = null;
+        AudioRouting.OnRoutingChangedListener routeListener = router -> {
+            if (!acceptable(router.getRoutedDevice())) {
+                interruption = "实际播放已离开目标耳机，已停止，请重新连接后重试";
+                AudioTrack active = activeTrack;
+                if (active != null) { try { active.setVolume(0); } catch (RuntimeException ignored) {} }
+                cancel();
+            }
+        };
+        boolean routeObserved = false;
         try {
-        int minimum = AudioTrack.getMinBufferSize(24000, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
-        if (minimum <= 0) throw new IOException("设备不支持 24kHz 语音播放");
-        // MODE_STATIC starts in STATE_NO_STATIC_DATA until write(): treating that
-        // state as an error was the cause of the original no-sound regression.
-        // A small streaming buffer also supports prompt cancellation of long replies.
-        track = new AudioTrack.Builder()
-            .setAudioAttributes(attributes)
-            .setAudioFormat(new AudioFormat.Builder().setSampleRate(24000).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
-            .setBufferSizeInBytes(Math.max(minimum * 2, 9600)).setTransferMode(AudioTrack.MODE_STREAM).build();
+            interrupted();
+            if (cancelled) { return; }
+            int minimum = AudioTrack.getMinBufferSize(24000, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
+            if (minimum <= 0) throw new IOException("设备不支持 24kHz 语音播放");
+            // Streaming mode supports cancelling long replies with a small buffer.
+            track = new AudioTrack.Builder().setAudioAttributes(attributes)
+                .setAudioFormat(new AudioFormat.Builder().setSampleRate(24000).setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
+                .setBufferSizeInBytes(Math.max(minimum * 2, 9600)).setTransferMode(AudioTrack.MODE_STREAM).build();
+            activeTrack = track;
             if (track.getState() != AudioTrack.STATE_INITIALIZED) throw new IOException("音频播放器初始化失败");
-            if (!track.setPreferredDevice(target)) log.accept("系统未接受首选设备，正在核验实际蓝牙输出…");
-            // Prime with silence: never play private speech before proving the route.
+            if (target != null && !track.setPreferredDevice(target))
+                log.accept("系统未接受首选设备，正在核验实际蓝牙输出…");
+            // Prime with silence: never play private speech before proving a Bluetooth route.
             track.setVolume(0);
             byte[] silence = new byte[2400];
             if (track.write(silence, 0, silence.length) != silence.length) throw new IOException("音频缓冲初始化失败");
             track.play();
-            long readyDeadline = SystemClock.elapsedRealtime() + 3000;
-            while (!cancelled && !headset(track.getRoutedDevice()) && SystemClock.elapsedRealtime() < readyDeadline) Thread.sleep(40);
-            if (cancelled) return;
-            if (!headset(track.getRoutedDevice())) throw new IOException("播放未路由至蓝牙耳机，请检查媒体音频开关");
-            log.accept("实际播放：" + track.getRoutedDevice().getProductName());
-            track.pause(); track.flush(); track.setVolume(1); track.play();
-            if (manager.getStreamVolume(AudioManager.STREAM_MUSIC) == 0) log.accept("媒体音量为 0，请按手机音量加键");
+            long readyDeadline = SystemClock.elapsedRealtime() + (mode.requiresVerifiedHeadsetOutput() ? 3000 : 500);
+            while (!cancelled && (track.getRoutedDevice() == null || !acceptable(track.getRoutedDevice()))
+                && SystemClock.elapsedRealtime() < readyDeadline) Thread.sleep(40);
+            interrupted();
+            if (cancelled) { return; }
+            AudioDeviceInfo actual = track.getRoutedDevice();
+            if (!acceptable(actual)) throw new IOException("播放未路由至目标耳机，请检查媒体音频开关");
+            output.accept(actual.getProductName() + " / type=" + actual.getType());
+            // Keep the silent primer in the same playing track: pausing would invalidate
+            // getRoutedDevice on some phones and force another unverified route transition.
+            track.addOnRoutingChangedListener(routeListener, new Handler(Looper.getMainLooper()));
+            routeObserved = true;
+            if (!acceptable(track.getRoutedDevice())) {
+                throw new IOException("播放路由已改变，请重新连接目标耳机");
+            }
+            track.setVolume(1);
+            if (manager.getStreamVolume(AudioManager.STREAM_MUSIC) == 0) {
+                log.accept("媒体音量为 0，请按音量加键");
+            }
+            long writeDeadline = SystemClock.elapsedRealtime() + 5000;
             for (int offset = 0; !cancelled && offset < pcm.length;) {
-                if (!headset(track.getRoutedDevice())) throw new IOException("播放路由离开蓝牙耳机，已停止");
-                int count = track.write(pcm, offset, Math.min(4096, pcm.length - offset), AudioTrack.WRITE_BLOCKING);
-                if (count <= 0) throw new IOException("回复音频写入失败：" + count);
-                offset += count;
+                if (!acceptable(track.getRoutedDevice())) throw new IOException("播放路由离开蓝牙耳机，已停止");
+                int count = track.write(pcm, offset, Math.min(4096, pcm.length - offset), AudioTrack.WRITE_NON_BLOCKING);
+                if (count < 0) throw new IOException("回复音频写入失败：" + count);
+                if (count == 0) {
+                    if (SystemClock.elapsedRealtime() >= writeDeadline) throw new IOException("回复音频写入超时");
+                    Thread.sleep(20);
+                } else { offset += count; writeDeadline = SystemClock.elapsedRealtime() + 5000; }
             }
             long deadline = SystemClock.elapsedRealtime() + pcm.length / 48 + 5000;
-            while (!cancelled && Integer.toUnsignedLong(track.getPlaybackHeadPosition()) < pcm.length / 2L) {
-                if (SystemClock.elapsedRealtime() >= deadline) throw new IOException("蓝牙播放超时，请检查音量和媒体输出");
-                AudioDeviceInfo actual = track.getRoutedDevice();
-                if (!headset(actual)) throw new IOException("播放路由离开蓝牙耳机，已停止");
+            long expectedFrames = (pcm.length + silence.length) / 2L;
+            while (!cancelled && Integer.toUnsignedLong(track.getPlaybackHeadPosition()) < expectedFrames) {
+                if (SystemClock.elapsedRealtime() >= deadline) throw new IOException("语音播放超时，请检查音量和媒体输出");
+                if (!acceptable(track.getRoutedDevice())) throw new IOException("播放路由离开蓝牙耳机，已停止");
                 Thread.sleep(40);
             }
+            interrupted();
         } finally {
-            if (track != null) { try { track.stop(); } catch (Exception ignored) {} track.release(); }
+            activeTrack = null;
+            if (track != null) {
+                if (routeObserved) track.removeOnRoutingChangedListener(routeListener);
+                try { track.stop(); } catch (Exception ignored) {} track.release();
+            }
             manager.abandonAudioFocusRequest(focus);
         }
     }
-    public void cancel() { cancelled = true; }
+
+    private void interrupted() throws IOException { if (interruption != null) throw new IOException(interruption); }
+
+    public void cancel() {
+        cancelled = true;
+        AudioTrack track = activeTrack;
+        if (track != null) { try { track.pause(); track.flush(); } catch (Exception ignored) {} }
+    }
 }

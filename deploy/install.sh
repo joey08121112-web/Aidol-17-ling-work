@@ -22,7 +22,7 @@ chown root:aidol "$base/shared/.env"
 chmod 640 "$base/shared/.env"
 release="$base/releases/$(date -u +%Y%m%dT%H%M%SZ)-$$"
 install -d -m 755 "$release"
-cp -a "$source_dir/app" "$source_dir/web" "$source_dir/requirements.txt" "$release/"
+cp -a "$source_dir/app" "$source_dir/requirements.txt" "$release/"
 find "$release" -type d -name __pycache__ -prune -exec rm -rf -- {} +
 python3 -m venv "$release/.venv"
 "$release/.venv/bin/python" -m pip install --disable-pip-version-check -q -r "$release/requirements.txt"
@@ -36,7 +36,7 @@ chown aidol:aidol "$smoke_data"
 cleanup() { test -z "${smoke_pid:-}" || kill "$smoke_pid" 2>/dev/null || true; rm -rf -- "$smoke_data"; }
 trap cleanup EXIT
 cd "$release"
-runuser -u aidol -- env AIDOL_HOSTED=true AIDOL_DATA_DIR="$smoke_data/hosted" DATABASE_PATH="$smoke_data/legacy.sqlite3" \
+runuser -u aidol -- env AIDOL_DATA_DIR="$smoke_data/hosted" \
     "$release/.venv/bin/python" -m uvicorn app.main:create_hosted_app --factory --host 127.0.0.1 --port 18108 --no-access-log >"$smoke_data/check.log" 2>&1 &
 smoke_pid=$!
 ready=false

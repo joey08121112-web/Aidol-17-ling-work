@@ -18,8 +18,16 @@ public final class AuthVault {
     private final SharedPreferences prefs;
     private String token = "", username = "";
     private static final String ALIAS = "aidol.session.v1";
+    /** Local presence only; never decrypts credentials or claims the server session is valid. */
+    public static boolean hasSavedSession(Context context, String namespace) {
+        String saved = context.getSharedPreferences(namespace, Context.MODE_PRIVATE).getString("encrypted", "");
+        return saved != null && !saved.isEmpty();
+    }
     public AuthVault(Context context) {
-        prefs = context.getSharedPreferences("session", Context.MODE_PRIVATE);
+        this(context, "session");
+    }
+    public AuthVault(Context context, String namespace) {
+        prefs = context.getSharedPreferences(namespace, Context.MODE_PRIVATE);
         try {
             String saved = prefs.getString("encrypted", "");
             if (saved.isEmpty()) return;
@@ -28,7 +36,11 @@ public final class AuthVault {
             cipher.init(Cipher.DECRYPT_MODE, key(), new GCMParameterSpec(128, Base64.decode(parts[0], Base64.NO_WRAP)));
             JSONObject data = new JSONObject(new String(cipher.doFinal(Base64.decode(parts[1], Base64.NO_WRAP)), StandardCharsets.UTF_8));
             token = data.getString("token"); username = data.getString("username");
-        } catch (Exception ignored) { clear(); }
+        } catch (Exception ignored) {
+            // A locked/unavailable Keystore can recover later. Reading the vault must not
+            // destroy its encrypted credential; explicit logout still clears it below.
+            token = ""; username = "";
+        }
     }
     private SecretKey key() throws Exception {
         KeyStore store = KeyStore.getInstance("AndroidKeyStore"); store.load(null);

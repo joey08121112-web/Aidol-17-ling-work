@@ -4,7 +4,116 @@
 
 更新日期：2026-10-17。服务测试是本轮开发时的结果，不保证未来配额、网络和账号状态。真实凭证仅留在受控的本地/服务器配置，本文不含 Key。
 
-当前交付形态为 Android APK + 共享服务器，每账号隔离数据；原本的本地 Web 仍可独立运行。部署与更新见 [Android 部署](android-deployment.md)，测试者流程见 [Android 交接](android-handoff.md)。本文不记录 SSH 密码、供应商 Key 或恢复码。
+## 2026-10-17 追加耳机联动：当前交付
+
+用户明确追加：触控切模式、开始/结束/取消单轮对话、摘下暂停、断连停止、有界重连恢复就绪、电量和佩戴提醒，然后整理推送 Git。代码和操作见 [Rise 联动](rise-controls.md)，同事配置传递见 [团队交接](team-delivery.md)。
+
+最终手势按用户后续要求改为：**单击/单捏开始或结束发送，双击/双捏切模式，长按/长捏取消；三击不绑定动作**。此前三击切模式和双击录音的反馈仅对应旧映射，不能作为新映射通过证据。
+
+| 层级 | 结果 | 边界 |
+| --- | --- | --- |
+| Android | `testDebugUnitTest lintDebug assembleDebug compileReleaseJavaWithJavac` 成功；94 项单测，0 失败；Lint 0 错误、14 警告 | 包括 20 项交互策略、6 项设置重试、7 项真实 socket 传输、5 项事件代码门禁、5项触控错误归因；覆盖停止/切模式竞争和首帧通知顺序 |
+| 后端及交接脚本 | Python 全量 243 passed，50.19 秒；1 条既有 AnyIO 弃用提示 | 新增私密配置白名单和引用拒绝测试；无供应商调用 |
+| 当前 APK | v2 签名验证成功，已同签名覆盖安装到 23113RKC6C / Android 16，登录自动保留 | SHA-256 `3551d2a459b3df05a84d98f23d724613547edf858b70b6f2cd55e0ae2f6eeeb3`；未发布公网 |
+| 已完成代码审查修复 | 延迟触控固定动作与会话代次；SDK入口复制事件时间和数据；纯文字不被设备断连误取消；录音取消与停止原子竞争，首帧不能越过就绪通知 | 注册/取消和设备切换都隔离旧回调，READY/佩戴恢复不自动录音 |
+| 修复版 USB 页面复测 | `138714be…`版重启为当前源码本地后端，App 自动登录；间隔6秒选四次生活/工作/通勤模式均 HTTP 200，再刷新 GET state 200；每次不同连接，无 EOF；最终版沿用同一传输修复 | 只证明这组真机页面操作，不等同耳机手势或长时间稳定性 |
+| 触控实物 | 用户确认有时能切换，但报告偶发 `unexpected end of stream`；日志另见设置409，尚未通过稳定性验收 | 不将偶尔成功、SDK枚举或注册应答冒充全部手势通过；修复版结果另记 |
+| 最终版监听 | `3551d2a…`版实际显示 VI-A10、SDK 6.7 READY、`controls=ENABLED`、固件已确认开启、`error=none`；ready_ms=567，左未佩戴/右已佩戴，事件计数0 | 先前重连发生过2401；已修复其覆盖原始错误的问题。2401是SDK清理忙，不能解释为未佩戴或固件不支持；当次原始拒绝status未留存，不追认原因。新手势实测用户选择“稍后测试” |
+| 佩戴/电量/异常/自动重连 | 离线策略和事件门禁已验证，真机逐项待验 | macOS、其他固件、低电阈值和来电仍需独立实测 |
+
+前序 SDK 收音→本地 USB→ASR/回复→实际 Rise 听音已经通过，详见下方请求 ID。早先只读刷新恢复测试通过，但用户随后在联动测试再次遇到断流，说明仅恢复 GET 连接还不足够。收尾修复改为 debug 精确 USB 源每次使用新连接；语音/TTS/聊天写请求仍不自动重发。语音处理中切模式不再取消已提交业务，明确被拒绝的设置更新才有界延后。软件回归和真机复测分别记录，不能凭异常提示变成中文认定断流已解决。
+
+## 2026-10-17 项目范围收窄
+
+当前产品模块为 `android-app/`、`app/`、`website/`；旧浏览器应用、直连 Android Demo 和两套供应商参考 Demo 已退出当前源码。后端统一使用 `create_hosted_app`，不再提供单用户 `/api/*`、SSE 或浏览器音频 WebSocket。旧目录相关历史测试、命令、数量和结果保留作为当时证据，不表示那些入口仍可运行，也不作为本次精简后的回归通过证明。
+
+当前开发以 USB 安卓真机连接本地账号后端，模拟器已经退出产品入口。下面 Rise M0/M1 的真实握手、待验门槛和既有发布包记录仍按各自版本解释；目录精简不会自动更新公网 APK、后端或官网。
+
+本次精简的实际验证：
+
+| 检查 | 结果与边界 |
+| --- | --- |
+| 后端全量回归 | `.venv/Scripts/python.exe -m pytest tests -q`：**241 passed，50.03 秒**；1 条既有 Starlette/AnyIO 弃用警告。使用临时账号库和 mock 供应商 |
+| 后端发布包 | 临时目录只复制 `app/` 与 `requirements.txt`，导入无数据库副作用，账号工厂启动成功；`/healthz` 200、未登录 `/v1/state` 401、旧网页与 `/api/state` 404 |
+| Android | 本机固定 JDK 17、SDK 35、Gradle 8.9 执行 `testDebugUnitTest lintDebug assembleDebug` 成功；51 项任务中 2 项执行、49 项复用缓存。结果对应检查时的源码，不作为其他并行 App 改动或物理耳机验收 |
+| 静态检查 | `compileall app scripts run.py`、官网 `node --check website/app.js`、10 个 Shell 与 6 个 PowerShell 文件语法、文档相对链接及 `git diff --check` 通过 |
+| 自动检查 | 按用户要求删除 GitHub CI workflow；上述验证命令仍可在本地执行 |
+
+整目录删除命令被工具安全策略拦截后，四个旧项目目录已移出源码树，保存在 Git 忽略的 `artifacts/retired-projects-20261017/` 中；版本控制记录为源码删除。旧探针、后端浏览器音频模块及专用测试也已移除。现有 `.env`、账号数据库、签名资料与正式 APK 未由本次清理修改。本次未调用真实供应商、未做实物耳机验收、未发布服务器或官网；Docker 配置已调整，未执行镜像构建。
+
+## 安卓真机设置与登录体验更新：2026-10-17
+
+后端只保留“本地电脑服务（USB）/远端服务器”，音频只保留“系统蓝牙兼容/Rise SDK 麦克风”。只切音频时保持同一 ApiClient、账号、当前页面和草稿，不再清空后重建。后端选项只读密文存在状态，提示“已保存登录/未登录”，不会为显示状态重新登录或解密、删除凭证。临时 Keystore 读取失败保留密文；会话仍按各后端隔离，保持现有 30 天有效期。
+
+| 层级 | 本次实际结果 | 边界 |
+| --- | --- | --- |
+| Android 回归和构建 | `testDebugUnitTest lintDebug assembleDebug compileReleaseJavaWithJavac` 成功；46 项单测、0 失败，Lint 0 错误、13 警告 | 含 SDK 适配与真机限定逻辑；不是物理收音证明 |
+| 当前开发 APK | `android-app/aidol-android-rise-dev.apk`，v2 签名验证成功，同签名 `install -r` 覆盖安装并启动 | SHA-256：`d13dc31e7dc499f9561ab26ab77981fb8959e4074ca677e4452e76f23fd1ee63`；未发布公网 |
+| 手机设置页 | 23113RKC6C / Android 16 实际显示两个音频与两个后端选项；远端显示已保存登录、本地显示未登录；登录页标明本地目标 | 密文存在不代表会话未过期；尚不能据此把两个后端完整业务都记为成功 |
+| Windows USB 健康正负验证 | 手机 Wi-Fi=0、移动数据=0 时本地 App 健康检查成功；移除 reverse、强停重开后显示无法连接 127.0.0.1:8108；恢复 reverse 后再次显示后端可达 | 测试后 Wi-Fi 恢复为 1，移动数据保持原值 0；断网注册/文字业务另验 |
+| 当前后端源码回归 | 另一个任务收窄目录后重新执行 Python 全量：241 passed，48.95 秒，1 条既有 AnyIO 弃用警告；`compileall -q app` 成功 | 使用临时库/mock；此前 278 和 Node 27 是精简前历史结果，不能混计 |
+
+### 本地 USB + Rise SDK 短语音闭环
+
+本轮已取得实际 SDK 收音、服务处理、目标输出和人工听音证据。测试提示曾写“远端”，但手机实际诊断为 `http://127.0.0.1:8108`，故本条记录为 **Windows 本地 USB**；不冒充远端 SDK 验收。此轮 Wi-Fi 已恢复，USB 无手机网络可达另有上表的健康正负检查，不能把这轮当成断网业务用例。
+
+- 手机 23113RKC6C / Android 16，Rise VI-A10，官方 SDK 6.7；输入显示 `Rise SDK 麦克风 · 16 kHz 单声道`。
+- 设备诊断：`state=READY capture=2 phase=idle mic_bytes=107520 first_pcm_ms=273 ready_ms=659 error=none`。录音仪表最后一次采样为 99840 字节 / RMS 0.2104；仪表按 300ms 采样，不是最终上传长度。固件版本未知。
+- 请求 `61d894ae-9a05-4e85-aecd-26d30e64edf5`、会话 `f4af226c-22b6-41a0-8d91-11ff55de686e`。手机显示实际输出已核验、Rise / type=8、`phase=ENDED`、最近错误无；speech HTTP 200。
+- 本地日志同一请求：ASR done 2015ms，business done 4702ms，turn done 7078ms，TTS done 2108ms；`POST /v1/voice` 200。均为本轮观测，不是性能承诺或人耳首音延迟。
+- 用户明确回复：**“转写正确，也听到耳机回复”**。本轮缓存只读检查确认已有回复，但实际转写不包含提示中的“清淡”偏好，因此不将本轮计为“清淡饮食”记忆验收，不公开用户实际语句。
+
+`state=READY` 仅证明握手，本次结合 channel 2 的麦克风数据及真实听音确认短语音路径。成功上传后内部缓冲 `bytes=0` 是释放行为，不表示丢音频。播放之后刷新出现过 `unexpected end of stream`，初次修复后仍有用户复现，修复和复测进展见本文当前交付记录。记忆来源、手机远放输入对照、断网注册/文字业务、macOS 真机组合及来电/断连/锁屏异常验收仍分别待验。
+
+## Rise M0/M1 本轮实施与验证：2026-10-17（前序快照）
+
+基线 `main@5fa8a552b471c001dc8389be7cb3c48a2ad3403b` 加当前未提交工作区；没有提交/推送/更新公网release。开始时已有安卓本地开发、网站和文档改动，已保留，新增实现与交接清单见 [M0/M1](android-m0-m1-handoff.md)。以下是本轮重新执行的结果，后面的历史记录不作为新SDK证据。
+
+| 层级 | 本轮观察与结果 | 边界 |
+| --- | --- | --- |
+| Python全量 | `.venv/Scripts/python.exe -m pytest tests -q`：**278 passed**，53.76秒；1条既有Starlette/AnyIO弃用warning | 临时库/mock供应商；包括USB脚本、多源启动、语音记忆归属、诊断脱敏与账号隔离，不消耗真实供应商配额 |
+| Web音频回归 | 两个指定Node测试文件：**27 passed** | 保留Web回归，不是Android物理证据 |
+| Python静态 | `python -m compileall -q app`通过，`git diff --check`通过 | 无业务语法或补丁空白错误 |
+| Android | JDK17.0.20.1、Gradle8.9、SDK35运行 `testDebugUnitTest lintDebug assembleDebug compileReleaseJavaWithJavac`：**成功，41项单测、0失败** | 本机使用仓库忽略目录中已安装的Gradle8.9，版本与wrapper一致；release只编译，不签名或发布 |
+| Lint | **0错误、12警告** | 8条既有风格的文本国际化、3条BLE整数常量API提示、1条scan权限flag版本提示；没有屏蔽错误 |
+| 首个SDK APK | `android-app/aidol-android-rise-dev.apk`，`com.aidol.app.debug`，0.2.0-dev，9,566,198字节，v2签名验证通过；已安装并启动 | 首次哈希 `69228a8e6a4af2a883ac81bce9d86938c51b2b687bb01b43cdc965aaf2998d81`；随后按用户要求简化后端选项，新构建另记 |
+| SDK依赖 | 官方6.7 AAR经PowerShell脚本导入、构建再次核验SHA；保留ARM原生库、Rx/JNA/Gson与原OkHttp解析成功 | AAR `e074506fd3a46346272fdd2ab632a59b4cef2597f4cb37fd160737eb536e2b2c`；部分厂商so无可剥离调试符号，构建按原样打包 |
+| 异步/假硬件 | 13项硬件测试包含通道、缓冲复制、奇字节拼接、尾帧/idle、取消旧回调、超时/时限、队列/段超限和未知属性；会话状态/事件/占用门禁另测 | Fake FusionDevice和纯Java状态机，不伪造SDK握手或实物收音 |
+| Windows启动/脚本 | 后端`-Check`通过；启动真实本机hosted入口，电脑 `127.0.0.1:8108/healthz` 返回 `ok=true,ready=true`，监听仅127.0.0.1 | ready仅配置齐备，未触发真实ASR/文本/TTS调用；后台日志在忽略目录artifacts/ |
+| Windows USB设备/转发 | 初始无设备；随后接入型号23113RKC6C、Android16/API36、arm64-v8a并授权。ADB37.0.1 devpath=unknown导致助手误拒，已增加USB选择器精确身份核验并修复；reverse与助手`--check`通过 | 修复针对测试**14 passed**；USB身份/转发/电脑健康通过，手机断网注册/文字门槛仍待验 |
+| macOS | Shell启动/USB脚本语法检查通过；Mac导入脚本与独立环境步骤已提供 | **macOS电脑、USB手机、构建/运行组合均待验**，不能用Windows结果代替 |
+| Rise真实握手 | 手机设备页实际显示Rise SDK麦克风、VI-A10、SDK6.7 state=READY，ready_ms=318，左右耳电量100%，左未佩戴/右已佩戴；用户确认耳机配对手机 | SDK握手及真实属性已回报；固件未知，318ms只是一轮观察，不是延迟承诺；mic_bytes=0时尚不证明采音 |
+| 实物完整语音 | 已提示用户用合成句验证SDK收音→转写→回复听音 | 实际麦克风对照、尾句、记忆、耳机听音、来电/断连/锁屏仍待验 |
+
+本轮M0/M1代码、离线测试、构建、文档与交接准备已完成；**M0强制USB断网真机门槛和M1实物短语音门槛未达成，不能标阶段整体验收通过**。M2持续语音/会议ID、M3锁屏前台服务、M4按键/闪录/盒子没有扩入。release继续原系统蓝牙+HTTPS；Rise在debug显式选择。Android8/8.1无法读取实际输出地址，Rise回复会拒播；Android9+仍要真机确认系统地址可用。SDK的PCM小端字节序、实际帧速率与字节数不由mock证明。
+
+### 手机连接后最小实测单
+
+1. 每台Windows/Mac分别记录系统、源码状态、APK哈希、手机/Android、耳机/固件、SDK版本、输入来源和目标后端。USB授权后指定serial建立reverse，App选USB源。
+2. 手机关闭Wi-Fi与移动数据（保留蓝牙与电脑联网），从App健康检查、注册/登录、发合成文字。移除reverse并强停重开App制造新连接，确认失败；恢复转发后重新请求成功。
+3. 选Rise输入，设备页连接并记录SDK就绪；不会自动开麦。以耳机近讲/手机远放或硬件静音对照确认来源，再说合成句并结束，记录尾句是否完整、只提交一次、记忆来源和所属账号。
+4. 生活回复必须实际由同一目标耳机听到；工作`speak=false`不得请求speech。分别记SDK就绪、首PCM、结束→转写、转写→回复、首可听音频；不预填性能成绩。
+5. 各自在录音/上传/播放时取消，测试快启停、切来源、权限拒绝/撤销、断连/重连、来电/焦点丢失、切页/后台/锁屏。异常后不自动续录，不回落手机麦克风或扬声器；旧结果不得进入新会话。已提交后取消不承诺撤销服务器保存。
+6. 用独立账号复查既有记忆编辑/来源/问记忆、工作纪要/待办、通勤、导出/清空；共享环境只用已记录App+后端版本。按规划第8节提供脱敏session/request ID与日志。
+
+当前交付形态为同一个 Android 项目：手机连接远端服务，开发手机经 USB 连接本机账号后端，每账号隔离数据。部署与更新见 [Android 部署](android-deployment.md)，操作见 [Android 交接](android-handoff.md) 与 [USB 真机测试](android-local-testing.md)。下方模拟器与旧 Web 内容仅保留历史观察，不记录 SSH 密码、供应商 Key 或恢复码。
+
+## 历史：Android 模拟器与本地后端适配（已退出产品入口）
+
+本次增加 debug 模拟器/真机蓝牙音频模式、独立后端选择、按服务器隔离的登录会话及天气缓存、录音与播放诊断。debug 包名为 `com.aidol.app.debug`，与现有发布版并存；HTTP 仅允许 debug 连接指定的 `10.0.2.2:8108`，发布版保持 HTTPS。API 契约与业务实现共用，未改供应商协议。
+
+| 层级 | 本轮实际结果 | 边界 |
+| --- | --- | --- |
+| Python 离线回归 | `python -m pytest tests -q`：**260 passed**，39.70 秒；1 个既有 AnyIO 弃用提示 | 新增临时目录启动配置回归：忽略旧 Web/部署数据路径，两个账号记忆隔离，无 ASR/TTS 配置明确 503；无真实供应商调用 |
+| Node 回归 | 指定两个音频测试文件：**27 passed** | 保留的 Web 离线测试，不是 Android 耳机证据 |
+| Python 编译 | `python -m compileall -q app` 退出码 0；启动 helper 编译通过 | 静态编译 |
+| Android 构建 | JDK 17 / SDK 35 执行 `testDebugUnitTest lintDebug assembleDebug compileReleaseJavaWithJavac` 成功；**9 项单元测试通过**，Lint **0 错误、10 警告** | 覆盖 WAV、音频模式路由策略、debug HTTP 限定及会话命名隔离；警告为文本国际化。发布版仅编译代码，本轮未重新签名或发布正式 APK |
+| 开发 APK | `android-app/aidol-android-dev.apk`，`com.aidol.app.debug` / `0.2.0-dev`；`apksigner verify` 通过，APK 元数据核验通过 | SHA-256：`497287d1ba57734228b169a89224056c457632cdacce138b495995fdc3e03a6b`；本机生成文件被 Git 忽略，尚未安装运行 |
+| 本地启动器 | Windows `-Check`、Python `--check`、Unix Shell 语法检查通过；临时复制目录中实际启动 uvicorn，`healthz` 返回 `ok=true, ready=false`，创建本地独立账号库 | 使用合成配置、清空凭证环境；未启动开发者真实数据库，未调用付费供应商；Mac 实机仍未验证 |
+| 模拟器环境 | 本机 `emulator -accel-check` 返回 `Android Emulator hypervisor driver is not installed on this machine`；`adb devices` 列表为空 | 此前两版模拟器宿主原生进程崩溃的记录仍有效；本轮未完成 AVD 启动、页面或声音验收，未安装系统驱动 |
+| 物理耳机与完整交互 | 待同事按测试指南验证注册→真实采音→转写→回复→实际听音，以及历史、记忆、会议、停止/重试 | 模拟器无法证明主机实际麦克风来源；真机蓝牙路由、断连重连、来电与锁屏另验，不能由构建通过代替 |
+
+电脑测试使用 Android Studio 的虚拟设备 AVD，不需要实体安卓手机；后端终端需单独运行。真实 AI 语音仍依赖本机后端的供应商配置与网络。本轮仅提供代码、开发 APK 和测试步骤，未更新共享服务器或公网下载的旧发布 APK。
 
 ## Android 托管版：2026-10-17 本轮证据
 
@@ -47,7 +156,7 @@
 
 Android 已增加前台手动、连续轮次及生活定时采集。后两者需本次主动开启，停止/离开前台/错误取消接续；每轮仍有时长上限，非工作模式可按静音收尾，**不是实时双工或后台监听**。这些新增前台生命周期仍需真机验收。
 
-## 保留的本地 Web 历史验收
+## 已移除的本地 Web：历史验收
 
 以下矩阵和服务记录属于原本本机单用户 Web 路径。表中“单用户”“无账号隔离”“持续监听”等描述只适用于该历史入口，不覆盖新增 Android 多账号服务。
 
@@ -111,7 +220,7 @@ Android 已增加前台手动、连续轮次及生活定时采集。后两者需
 - **模拟演示：** 「演示完整一天」的发言有 `source=demo`，记忆加 `demo_` 来源；不能充当硬件和实时服务证明。
 - **等待外部条件：** Viaim SDK、真实设备联调、交通实时数据、消息发送渠道。
 
-## 最新：本机连续 stream 完整链路
+## 历史 Web：本机连续 stream 完整链路
 
 执行入口：`python -m scripts.probe_e2e`，使用本机 `127.0.0.1:8000` 主应用，`SPEECH_ASR_MODE=stream`。公共测试句为「我喜欢清淡的食物，请推荐一份晚餐。」；先 TTS 合成，转换为与浏览器相同的 16 kHz 单声道 PCM16，以 40 ms 帧按实际速度送入 WebSocket。报告来源标记 `synthetic audio via live APIs`，没有采集用户麦克风。
 
@@ -145,13 +254,3 @@ Android 已增加前台手动、连续轮次及生活定时采集。后两者需
 | 记忆 | 当时 SQLite 快照为 **2 条** |
 | 总用时 | **13.282 秒**，含约 **3.87 秒**输入及全部输出接收，不是首包时延 |
 | 适用范围 | 证明 flash 备用可运行，不取代上面的最新 stream 证据，也不构成性能基准比较 |
-
-## 本地 Web 历史提交检查
-
-2026-10-17 较早的本地 Web 提交快照：**203 项 Python 测试通过、27 项 Node 音频测试通过**；Python 编译、前端 JavaScript 语法、95 个 HTML ID 与 89 个脚本所需 ID 的契约检查通过。当时提交暂存区 76 个变更文件对本地实际凭证值扫描无命中。这不是当前 Android 新增文件的扫描记录，托管版测试结果见本文顶部。仅有 Starlette/AnyIO 测试依赖的弃用提示，不影响测试通过。该次 Web UI 浏览器自动截图未完成：CUA 浏览器连接持续返回 `nodeRepl.fetch request failed`；静态与接口检查不能替代桌面/手机视觉和真实耳机验收。
-
-1. 执行 `python -m pytest tests -q`、`node --test tests/audio-worklet.test.mjs tests/audio-session.test.mjs`、`python -m compileall -q app`，记录最终结果与提交。新增回归测试后的总数以最终运行输出为准。根目录 pytest 配置限定 `tests/`，避免采集保留的独立供应商 Demo 脚本。
-2. 用真实浏览器授权耳机，分别记录转写与回放是否成功。
-3. 默认 stream 与备用 flash 已分别记录完整链路，协议或生命周期变更后按需重测，不混用结果；真实探测不在 CI 自动运行。
-4. 按三种模式完成演示，核对模型来源、模拟标签、草稿状态和数据持久化。
-5. 确认 main 推送提交与验收代码一致；真实服务结果只输出状态、模型和字节数，不包含 Key。

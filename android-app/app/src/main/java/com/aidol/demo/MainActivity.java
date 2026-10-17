@@ -28,6 +28,8 @@ import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.RadioButton;
+import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -39,6 +41,8 @@ import java.util.ArrayList;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import com.aidol.demo.hardware.HeadsetController;
+import com.aidol.demo.hardware.VendorCaptureSource;
 
 /** Foreground Android client. Credentials and provider protocols stay outside the UI. */
 public final class MainActivity extends Activity {
@@ -46,6 +50,39 @@ public final class MainActivity extends Activity {
     private static final int INK = 0xffedf7f6, MUTED = 0xff91a7ac, TEAL = 0xff8ce8d4, RED = 0xffff9c99;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private ApiClient api;
+    private DevelopmentSettings development;
+    private HeadsetController headset;
+    private TextView headsetStatus, deviceDetails, voiceHint, developmentSummary;
+    private long sessionGeneration;
+    private String diagnosticSession = "尚未开始";
+    private boolean sessionUsesCapture;
+    private ModeChangeRetry modeChange;
+    private Runnable modeChangeDelay;
+    private boolean sessionIsReplay;
+    private boolean headsetControlsOptIn, controlsRequested;
+    private String pendingHeadsetNotice = "";
+    private final HeadsetInteractionPolicy headsetPolicy = new HeadsetInteractionPolicy();
+    private final Runnable settleHeadsetGesture = () -> applyHeadsetDecision(headsetPolicy.flush(
+        android.os.SystemClock.elapsedRealtime(), headsetInteractionContext()));
+    private final HeadsetController.ControlListener headsetControlListener = event -> runOnUiThread(() -> {
+        if (!isDestroyed()) handleHeadsetControl(event);
+    });
+    private final HeadsetController.Listener headsetListener = snapshot -> runOnUiThread(() -> {
+        if (isDestroyed()) return;
+        renderHeadset();
+        if (development.audioMode() == AudioMode.RISE_SDK) {
+            HeadsetInteractionPolicy.DeviceUpdate update = headsetPolicy.device(new HeadsetInteractionPolicy.Device(
+                snapshot.ready(), snapshot.inCall, snapshot.leftWorn, snapshot.rightWorn,
+                snapshot.leftBattery, snapshot.rightBattery), hasHeadsetBoundSession() || this.repeatArmed);
+            if (update.stopReason != null) cancelSession(update.stopReason);
+            if (!update.notices.isEmpty()) headsetNotice(android.text.TextUtils.join("；", update.notices));
+        }
+        syncHeadsetControls();
+    });
+    private TextView diagnosticsView;
+    private String diagnosticInput = "尚未录音", diagnosticOutput = "尚未播放", diagnosticRequest = "尚未请求", diagnosticStage = "空闲", diagnosticError = "无";
+    private double diagnosticRms;
+    private long diagnosticBytes;
     private JSONObject state = new JSONObject();
     private LinearLayout root, page, content, composer;
     private ScrollView scroll;
@@ -81,11 +118,20 @@ public final class MainActivity extends Activity {
         getWindow().setStatusBarColor(BG);
         getWindow().setNavigationBarColor(BG);
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
-        api = new ApiClient(this);
+        development = new DevelopmentSettings(this);
+        headsetControlsOptIn = getSharedPreferences("headset_controls", MODE_PRIVATE).getBoolean("touch_enabled", false);
+        headset = new HeadsetController(getApplicationContext());
+        headset.addListener(headsetListener);
+        headset.addControlListener(headsetControlListener);
+        connectBackend();
         if (api.vault.token().isEmpty()) showAuth(0); else { showApp(); refresh(); }
     }
 
     private void base() {
+        diagnosticsView = null;
+        headsetStatus = null;
+        voiceHint = null;
+        developmentSummary = null;
         root = column(); root.setBackgroundColor(BG);
         root.setFitsSystemWindows(false);
         setContentView(root);
@@ -105,6 +151,7 @@ public final class MainActivity extends Activity {
         OrbView mark = new OrbView(); body.addView(mark, new LinearLayout.LayoutParams(-1, dp(156)));
         label(body, mode == 1 ? "开启你的专属空间" : mode == 2 ? "找回与你的连接" : "让每一刻，都被听见。", 27, INK).setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         label(body, mode == 1 ? "一个账号，连接对话、记忆和工作。" : mode == 2 ? "使用注册时保存的恢复码设置新密码。" : "一个懂你的随身伙伴，随时倾听，记住重要。", 14, MUTED);
+        if (BuildConfig.DEBUG) label(body, "当前：" + (development.localBackend() ? "本地电脑服务（USB）" : "远端服务器") + " · 两处账号独立", 12, TEAL);
         gap(body, 18);
         if (mode != 2) {
             LinearLayout tabs = row(); body.addView(tabs);
@@ -130,7 +177,7 @@ public final class MainActivity extends Activity {
             if (confirm != null && !pass.equals(confirm.getText().toString())) { authError.setText("两次密码不一致，请检查。"); return; }
             if (mode == 1 && !consent.isChecked()) { authError.setText("请先阅读并勾选数据处理说明。"); return; }
             if (recovery != null && value(recovery).length() < 16) { authError.setText("请输入完整的账号恢复码。"); return; }
-            hideKeyboard(); authError.setText("正在安全连接…");
+            hideKeyboard(); authError.setText("正在连接…");
             JSONObject bodyJson = json("username", name, "password", pass);
             if (recovery != null) put(bodyJson, "recovery_code", value(recovery));
             request(() -> api.json("POST", "/auth/" + (mode == 1 ? "register" : mode == 2 ? "recover" : "login"), bodyJson), result -> {
@@ -143,8 +190,9 @@ public final class MainActivity extends Activity {
         });
         submit.setEnabled(!busy);
         button(body, mode == 0 ? "忘记密码？使用恢复码" : "返回登录", false, () -> { if (!busy) showAuth(mode == 0 ? 2 : 0); });
-        TextView note = label(body, "无需邮箱或短信 · 账号不区分大小写\n测试体验版  /  前台按次录音", 11, MUTED);
+        TextView note = label(body, "登录后自动记住，下次打开直接进入\n无需邮箱或短信 · 账号不区分大小写\n测试体验版  /  前台按次录音", 11, MUTED);
         note.setGravity(Gravity.CENTER); gap(body, 8);
+        developmentEntry(body);
     }
 
     private void recoveryDialog(String code) {
@@ -183,17 +231,21 @@ public final class MainActivity extends Activity {
         }
         if (tab == 0) conversation(); else if (tab == 1) memories(); else if (tab == 2) work(); else if (tab == 3) commute(); else profile();
         updateStatus();
+        syncHeadsetControls();
     }
 
     private void switchTab(int next) {
         if (tab == next) return;
-        if (session != null) { toast("请先结束录音或停止播放"); return; }
+        clearHeadsetGesture();
+        if (session != null) cancelSession("已离开对话页，本轮已取消");
         stopRepeat(); tab = next; hideKeyboard(); showApp();
     }
 
     private void conversation() {
         label(page, "此刻，与你同频", 24, INK).setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         label(page, "说出想法，其余交给聆。", 13, MUTED);
+        headsetStatus = label(page, "", 12, TEAL);
+        headsetStatus.setOnClickListener(v -> showDeviceDetails()); renderHeadset();
         LinearLayout modes = row(); modes.setPadding(0, dp(14), 0, 0); page.addView(modes);
         String[] keys = {"life", "work", "commute"}, names = {"日常陪伴", "工作记录", "出行交流"};
         for (int i = 0; i < keys.length; i++) {
@@ -203,7 +255,7 @@ public final class MainActivity extends Activity {
         orb = new OrbView(); hero.addView(orb, new LinearLayout.LayoutParams(-1, dp(155)));
         label(hero, "LISTEN. REMEMBER. CONNECT.", 8, TEAL).setLetterSpacing(.2f);
         TextView hint = label(hero, "work".equals(mode()) ? "工作模式 · 安静记录，稍后整理" : "你的声音，有了回响", 17, INK); hint.setGravity(Gravity.CENTER);
-        label(hero, "连接蓝牙耳机后，轻触下方开始\n每次最长 60 秒 · 离开页面自动停止", 11, MUTED).setGravity(Gravity.CENTER);
+        voiceHint = label(hero, voiceHintText(), 11, MUTED); voiceHint.setGravity(Gravity.CENTER);
         LinearLayout listenChoices = row(); hero.addView(listenChoices);
         String[] listenNames = {"手动", "连续对话", "定时聆听"};
         for (int i = 0; i < listenNames.length; i++) { final int selection = i; segment(listenChoices, listenNames[i], listenMode == i, () -> {
@@ -218,11 +270,19 @@ public final class MainActivity extends Activity {
             else if (session == null) startVoice();
         });
         voiceButton.setLayoutParams(new LinearLayout.LayoutParams(0, dp(50), 1));
-        cancelButton = action(voiceRow, "停止", () -> { stopRepeat(); if (session != null) { session.cancel(); status.setText("正在停止…"); } else { lastNotice = "已停止自动聆听"; showApp(); } });
+        cancelButton = action(voiceRow, "取消", () -> { cancelSession("已取消；未提交的录音已丢弃，已提交内容请查看历史"); });
         cancelButton.setVisibility(session == null && !repeatArmed ? View.GONE : View.VISIBLE);
+        if (BuildConfig.DEBUG) {
+            LinearLayout diagnosticCard = card(page);
+            label(diagnosticCard, "开发诊断", 15, TEAL);
+            diagnosticsView = label(diagnosticCard, "", 11, MUTED);
+            diagnosticsView.setTextIsSelectable(true);
+            renderDiagnostics();
+            button(diagnosticCard, "开发测试设置", false, this::showDevelopmentSettings);
+        }
         LinearLayout histHead = row(); histHead.setGravity(Gravity.CENTER_VERTICAL); page.addView(histHead);
         TextView historyTitle = label(histHead, "最近对话", 17, INK); histHead.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
-        label(histHead, settings().optBoolean("retain_transcripts", true) ? "云端同步" : "不保存转写", 10, MUTED);
+        label(histHead, settings().optBoolean("retain_transcripts", true) ? (development.localBackend() ? "本地后端同步" : "云端同步") : "不保存转写", 10, MUTED);
         content = column(); page.addView(content);
         JSONArray history = array(state, "transcripts");
         if (history.length() == 0 && lastAnswer.isEmpty()) empty(content, "从一句你好开始", "可以聊今天的计划，也可以让聆记住你的偏好。");
@@ -252,7 +312,7 @@ public final class MainActivity extends Activity {
         TextView copyable = label(bubble, text, 15, INK); copyable.setTextIsSelectable(true);
         if (assistant && !text.isEmpty()) {
             LinearLayout actions = row(); bubble.addView(actions);
-            small(actions, "播放", () -> { if (canAct()) { newSession(); session.speak(text); } });
+            small(actions, "播放", () -> { if (canAct()) { newSession(); sessionIsReplay = true; session.speak(text); } });
             small(actions, "复制", () -> copy("Aidol 回复", text));
         }
     }
@@ -390,7 +450,7 @@ public final class MainActivity extends Activity {
             request(() -> api.json("POST", "/v1/maps/nearby", payload), this::poiResults);
         });
         button(around, "查看目的地天气", false, () -> {
-            if (!canAct()) return; String code = getPreferences(MODE_PRIVATE).getString("weather." + api.vault.username(), "");
+            if (!canAct()) return; String code = getPreferences(MODE_PRIVATE).getString(weatherPreferenceKey(), "");
             if (settings().isNull("destination_lon")) { toast("先从搜索结果选择目的地，即可查询当地天气"); return; }
             String weatherCode = code.matches("[0-9]{6}") ? code : "";
             request(() -> api.json("GET", "/v1/maps/weather?city=" + Uri.encode(weatherCode), null), weather -> {
@@ -424,7 +484,7 @@ public final class MainActivity extends Activity {
             LinearLayout item = card(body); label(item, poi.optString("name"), 16, INK); label(item, poi.optString("city") + " · " + poi.optString("address"), 12, MUTED);
             button(item, "设为目的地", false, () -> {
                 if (!canAct()) return; JSONObject payload = cloneJson(settings()); put(payload, "destination_name", poi.optString("name")); put(payload, "destination_lon", poi.optDouble("longitude")); put(payload, "destination_lat", poi.optDouble("latitude")); put(payload, "transit_city", fallback(poi.optString("city"), settings().optString("transit_city", "上海")));
-                request(() -> api.json("PUT", "/v1/settings", payload), r -> { getPreferences(MODE_PRIVATE).edit().putString("weather." + api.vault.username(), poi.optString("adcode")).apply(); dialog.dismiss(); refresh(); });
+                request(() -> api.json("PUT", "/v1/settings", payload), r -> { getPreferences(MODE_PRIVATE).edit().putString(weatherPreferenceKey(), poi.optString("adcode")).apply(); dialog.dismiss(); refresh(); });
             });
         }
         dialog.show();
@@ -456,14 +516,18 @@ public final class MainActivity extends Activity {
     private void stopLocation() { handler.removeCallbacks(locationTimeout); if (locationListener != null) { try { ((android.location.LocationManager) getSystemService(LOCATION_SERVICE)).removeUpdates(locationListener); } catch (Exception ignored) {} locationListener = null; } }
 
     private void profile() {
+        developmentEntry(page);
         label(page, "你的专属空间", 24, INK).setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        LinearLayout device = card(page); label(device, "耳机与音频", 17, INK);
+        headsetStatus = label(device, "", 12, TEAL); renderHeadset();
+        button(device, "设备详情", false, this::showDeviceDetails);
         LinearLayout account = card(page); label(account, "@" + api.vault.username(), 24, TEAL);
         label(account, "每个账号独立保存对话、记忆和工作记录。", 12, MUTED);
         LinearLayout settings = card(page); label(settings, "陪伴偏好", 17, INK);
         EditText name = field(settings, "助手称呼", "你想怎么称呼聆", false, 40); name.setText(settings().optString("name", "小聆"));
         EditText preferences = field(settings, "关于你的偏好", "喜欢什么、如何与你交流…", false, 2000); preferences.setMinLines(2); preferences.setText(settings().optString("preferences"));
         CheckBox retain = new CheckBox(this); retain.setText("保存转写与对话历史"); retain.setTextColor(INK); retain.setTextSize(13); retain.setButtonTintList(android.content.res.ColorStateList.valueOf(TEAL)); retain.setChecked(settings().optBoolean("retain_transcripts", true)); settings.addView(retain);
-        label(settings, "关闭后不保存新的对话转写；手动记忆与已有数据仍保留。需要彻底移除请使用清空数据。", 11, MUTED);
+        label(settings, "关闭后不新增转写历史；仍可能自动提取记忆并保存请求结果，已有数据也会保留。需要移除账号业务数据请使用清空数据。", 11, MUTED);
         CheckBox autoMode = new CheckBox(this); autoMode.setText("按工作时间自动切换模式"); autoMode.setTextColor(INK); autoMode.setTextSize(13); autoMode.setButtonTintList(android.content.res.ColorStateList.valueOf(TEAL)); autoMode.setChecked(settings().optBoolean("auto_mode", false)); settings.addView(autoMode);
         LinearLayout hours = row(); settings.addView(hours); EditText start = input("上班小时", false, 2), end = input("下班小时", false, 2); start.setInputType(InputType.TYPE_CLASS_NUMBER); end.setInputType(InputType.TYPE_CLASS_NUMBER); start.setText(String.valueOf(settings().optInt("work_start", 9))); end.setText(String.valueOf(settings().optInt("work_end", 18))); hours.addView(start, new LinearLayout.LayoutParams(0, -2, 1)); hours.addView(end, new LinearLayout.LayoutParams(0, -2, 1));
         label(settings, "自动模式按以上小时及下方时区判断；手动切换会关闭自动模式。", 11, MUTED);
@@ -495,7 +559,7 @@ public final class MainActivity extends Activity {
             if (!canAct()) return;
             confirm("退出当前账号？", "服务器数据会保留，下次登录后继续使用。", () -> request(() -> api.json("POST", "/auth/logout", json()), r -> signOut()));
         });
-        TextView foot = label(page, "Aidol · 聆  /  " + BuildConfig.VERSION_NAME + "\n" + BuildConfig.SERVER_URL + "\n安卓体验版 · 不提供后台持续监听", 10, MUTED); foot.setGravity(Gravity.CENTER);
+        TextView foot = label(page, "Aidol · 聆  /  " + BuildConfig.VERSION_NAME + "\n" + api.serverUrl + "\n安卓体验版 · 不提供后台持续监听", 10, MUTED); foot.setGravity(Gravity.CENTER);
     }
 
     private void changePassword() {
@@ -554,7 +618,80 @@ public final class MainActivity extends Activity {
     }
 
     private void changeMode(String mode) {
-        if (!canAct()) return; stopRepeat(); JSONObject body = cloneJson(settings()); put(body, "mode", mode); put(body, "auto_mode", false); mutate("PUT", "/v1/settings", body);
+        if (busy || locationListener != null || permissionPending) { toast("上一项操作正在进行，请稍后切换模式"); return; }
+        if (session != null && !session.cancelIfRecording()) { headsetNotice("本轮正在处理，请结束后再切换模式"); return; }
+        if (session != null) cancelSession("正在切换模式，未发送的录音已取消");
+        stopRepeat(); clearHeadsetGesture();
+        JSONObject body = cloneJson(settings()); put(body, "mode", mode); put(body, "auto_mode", false);
+        ModeChangeRetry change = new ModeChangeRetry(mode, api, sessionGeneration, android.os.SystemClock.elapsedRealtime());
+        modeChange = change; busy = true; lastNotice = "正在切换" + modeName(mode); updateStatus();
+        submitModeChange(change, api, body);
+    }
+    private boolean currentModeChange(ModeChangeRetry change) {
+        return !isDestroyed() && modeChange == change && change.matches(api, sessionGeneration);
+    }
+    private void finishModeChange(ModeChangeRetry change) {
+        if (modeChange != change) return;
+        modeChange = null; busy = false;
+        if (modeChangeDelay != null) handler.removeCallbacks(modeChangeDelay);
+        modeChangeDelay = null;
+    }
+    private void abandonModeChange(ModeChangeRetry change) {
+        if (modeChange != change) return;
+        finishModeChange(change);
+        if (!isDestroyed()) {
+            lastNotice = "模式切换已停止，请刷新确认当前模式"; updateStatus();
+        }
+    }
+    private void pauseModeChange() {
+        if (modeChange == null) return;
+        modeChange.stopRetrying();
+        // A scheduled retry follows a confirmed rejection: there is no update to wait for.
+        // An in-flight request may already have applied, so let its existing response finish.
+        if (modeChangeDelay != null) {
+            finishModeChange(modeChange);
+            lastNotice = "模式尚未切换，请稍后重新选择"; updateStatus();
+        }
+    }
+    private void submitModeChange(ModeChangeRetry change, ApiClient client, JSONObject body) {
+        if (!currentModeChange(change) || !change.canAttempt(android.os.SystemClock.elapsedRealtime(), api, sessionGeneration, visible)) {
+            abandonModeChange(change); return;
+        }
+        modeChangeDelay = null;
+        worker.execute(() -> {
+            try {
+                JSONObject result = client.json("PUT", "/v1/settings", body);
+                runOnUiThread(() -> {
+                    if (!currentModeChange(change)) { abandonModeChange(change); return; }
+                    finishModeChange(change);
+                    put(state, "settings", result);
+                    JSONObject agent = state.optJSONObject("agent"); if (agent == null) agent = new JSONObject();
+                    put(agent, "mode", change.mode); put(state, "agent", agent);
+                    diagnosticError = "无";
+                    lastNotice = "已切换" + modeName(change.mode) + "；等待你手动开始";
+                    showApp(); if (visible) toast(lastNotice);
+                });
+            } catch (Exception error) { runOnUiThread(() -> {
+                if (!currentModeChange(change)) { abandonModeChange(change); return; }
+                int statusCode = error instanceof ApiClient.ApiException ? ((ApiClient.ApiException) error).status : 0;
+                long delay = change.delayAfterFailure(statusCode, error.getMessage(), android.os.SystemClock.elapsedRealtime(),
+                    api, sessionGeneration, visible);
+                if (delay >= 0) {
+                    lastNotice = "上一轮正在收尾，稍后切换" + modeName(change.mode); updateStatus();
+                    modeChangeDelay = () -> submitModeChange(change, client, body);
+                    handler.postDelayed(modeChangeDelay, delay);
+                    return;
+                }
+                finishModeChange(change);
+                if (statusCode == 401) client.vault.clear();
+                lastNotice = statusCode == 409 ? "上一轮仍在处理，模式尚未切换；请稍后再试"
+                    : statusCode == 401 ? "登录已失效，请重新登录"
+                    : statusCode == 429 ? "操作较频繁，请稍后再切换模式"
+                    : "未能确认模式切换，请检查连接并刷新确认";
+                diagnosticError = lastNotice; renderDiagnostics(); updateStatus();
+                if (visible) headsetNotice(lastNotice);
+            }); }
+        });
     }
     private void saveModeAndOpenWork() {
         JSONObject body = cloneJson(settings()); put(body, "mode", "work"); put(body, "auto_mode", false);
@@ -569,38 +706,64 @@ public final class MainActivity extends Activity {
         if (busy) return; busy = true; updateStatus();
         worker.execute(() -> {
             try { JSONObject value = job.run(); runOnUiThread(() -> {
-                busy = false; if (isDestroyed()) return; updateStatus();
+                busy = false; if (isDestroyed()) return; lastNotice = ""; updateStatus();
                 try { result.accept(value); } catch (Exception e) { showError("操作未完成，请稍后重试"); }
-            }); } catch (Exception e) { runOnUiThread(() -> { busy = false; if (!isDestroyed()) { lastNotice = fallback(e.getMessage(), "无法连接服务器，请检查网络后重试"); updateStatus(); showError(lastNotice); } }); }
+            }); } catch (Exception e) { runOnUiThread(() -> { busy = false; if (!isDestroyed()) { lastNotice = fallback(e.getMessage(), "无法连接服务器，请检查网络后重试"); diagnosticError = lastNotice; renderDiagnostics(); updateStatus(); showError(lastNotice); } }); }
         });
     }
-    private void signOut() { stopRepeat(); if (session != null) session.cancel(); api.vault.clear(); state = new JSONObject(); lastAnswer = ""; lastUser = ""; lastNotice = ""; showAuth(0); }
+    private void signOut() { cancelSession(""); api.vault.clear(); syncHeadsetControls(); state = new JSONObject(); lastAnswer = ""; lastUser = ""; lastNotice = ""; showAuth(0); }
     private boolean canAct() { if (busy || session != null || locationListener != null) { toast("上一项操作正在进行，请稍候"); return false; } return true; }
 
     private void startVoice() {
-        if (permissionPending || !canAct()) return;
-        ArrayList<String> missing = new ArrayList<>();
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) missing.add(Manifest.permission.RECORD_AUDIO);
-        if (Build.VERSION.SDK_INT >= 31 && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) missing.add(Manifest.permission.BLUETOOTH_CONNECT);
+        if (!visible || permissionPending || !canAct()) return;
+        if (development.audioMode() == AudioMode.RISE_SDK) {
+            HeadsetController.Snapshot snapshot = headset.snapshot();
+            if (snapshot.inCall) { stopRepeat(); toast("通话期间不能开启 AI 录音"); return; }
+            if (Boolean.FALSE.equals(snapshot.leftWorn) && Boolean.FALSE.equals(snapshot.rightWorn)) {
+                stopRepeat(); toast("耳机当前未佩戴，请佩戴后再开始"); return;
+            }
+        }
+        ArrayList<String> missing = audioPermissions(development.audioMode() == AudioMode.RISE_SDK);
         if (!missing.isEmpty()) { permissionPending = true; requestPermissions(missing.toArray(new String[0]), 1); return; }
+        if (development.audioMode() == AudioMode.RISE_SDK && !headset.snapshot().ready()) {
+            stopRepeat(); showDeviceDetails(); toast("请先连接耳机，显示就绪后再点击开始"); return;
+        }
         repeatArmed = listenMode != 0; handler.removeCallbacks(repeatTick); hideKeyboard(); startSession(null);
     }
-    private void startSession(String text) { if (text != null) stopRepeat(); newSession(); if (text == null) {
+    private ArrayList<String> audioPermissions(boolean rise) {
+        ArrayList<String> missing = new ArrayList<>();
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) missing.add(Manifest.permission.RECORD_AUDIO);
+        if ((rise || development.audioMode().requiresBluetooth()) && Build.VERSION.SDK_INT >= 31) {
+            if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) missing.add(Manifest.permission.BLUETOOTH_CONNECT);
+            if (rise && checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) missing.add(Manifest.permission.BLUETOOTH_SCAN);
+        } else if (rise && checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) missing.add(Manifest.permission.ACCESS_FINE_LOCATION);
+        return missing;
+    }
+    private void startSession(String text) { if (text != null) stopRepeat(); newSession(); sessionUsesCapture = text == null; if (text == null) {
         session.configure(listenMode == 2 ? settings().optInt("listen_seconds", 30) : 60, listenMode != 0 && !"work".equals(mode()), settings().optDouble("vad_threshold", .025)); session.start();
     } else { lastUser = text; session.startText(text); } }
     private void newSession() {
+        final long generation = ++sessionGeneration;
+        sessionUsesCapture = false; sessionIsReplay = false;
         turnSucceeded = false; recording = false; lastNotice = "正在连接…"; getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        session = new HostedSession(this, api, new HostedSession.Listener() {
-            @Override public void status(String text) { if (isDestroyed()) return; lastNotice = text; if (text.contains("正在识别") || text.contains("正在思考")) { recording = false; if (voiceButton != null) voiceButton.setText("正在处理…"); } if (status != null) status.setText("●  " + text); }
-            @Override public void failure(String text) { stopRepeat(); if (!isDestroyed()) { lastNotice = text; updateStatus(); } }
+        diagnosticInput = "本轮尚未录音"; diagnosticOutput = "本轮尚未播放"; diagnosticError = "无"; diagnosticRms = 0; diagnosticBytes = 0;
+        HostedSession.Listener listener = new HostedSession.Listener() {
+            @Override public void status(String text) { if (!currentSession(generation)) return; lastNotice = text; diagnosticStage = text; renderDiagnostics(); if (text.contains("正在识别") || text.contains("正在思考") || text.contains("正在结束")) { recording = false; if (voiceButton != null) voiceButton.setText("正在处理…"); } if (status != null) status.setText("●  " + text); }
+            @Override public void failure(String text) { if (!currentSession(generation)) return; turnSucceeded = false; stopRepeat(); lastNotice = text; diagnosticError = text; renderDiagnostics(); updateStatus(); }
+            @Override public void input(String text) { if (!currentSession(generation)) return; diagnosticInput = text; renderDiagnostics(); }
+            @Override public void output(String text) { if (!currentSession(generation)) return; diagnosticOutput = text; renderDiagnostics(); }
+            @Override public void diagnostic(String text) { if (!currentSession(generation)) return; diagnosticSession = text; renderDiagnostics(); }
             @Override public void result(JSONObject value) {
+                if (!currentSession(generation)) return;
                 turnSucceeded = true;
                 lastUser = value.optString("text"); lastAnswer = value.optString("response");
                 if (!isDestroyed() && content != null) { chatBubble(content, false, lastUser, "刚刚"); if (!lastAnswer.isEmpty()) chatBubble(content, true, lastAnswer, "刚刚"); scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN)); }
             }
-            @Override public void recording() { recording = true; if (!isDestroyed() && voiceButton != null) voiceButton.setText("■  结束并回复"); }
-            @Override public void meter(long bytes, double rms) { if (!isDestroyed()) { if (status != null) status.setText(String.format(Locale.CHINA, "●  正在聆听  %.1f / %d 秒", bytes / 32000.0, listenMode == 2 ? settings().optInt("listen_seconds", 30) : 60)); if (orb != null) orb.level = (float) Math.min(1, rms * 9); } }
+            @Override public void recording() { if (!currentSession(generation)) return; recording = true; if (voiceButton != null) voiceButton.setText("■  结束并发送"); }
+            @Override public void meter(long bytes, double rms) { if (currentSession(generation)) { diagnosticBytes = bytes; diagnosticRms = rms; renderDiagnostics(); if (status != null) status.setText(String.format(Locale.CHINA, "●  正在聆听  %.1f / %d 秒", bytes / 32000.0, listenMode == 2 ? settings().optInt("listen_seconds", 30) : 60)); if (orb != null) orb.level = (float) Math.min(1, rms * 9); } }
             @Override public void done() {
+                if (!currentSession(generation)) return;
+                ++sessionGeneration;
                 session = null; recording = false;
                 if (!isDestroyed()) {
                     if (!turnSucceeded || !visible || (listenMode == 2 && !"life".equals(mode()))) stopRepeat();
@@ -610,26 +773,231 @@ public final class MainActivity extends Activity {
                     if (api.vault.token().isEmpty()) { showAuth(0); authError.setText("登录已失效，请重新登录"); } else { updateStatus(); if (visible) refresh(); }
                 }
             }
-        });
+        };
+        AudioMode input = development.audioMode();
+        if (input == AudioMode.RISE_SDK) session = new HostedSession(this, api, input, new VendorCaptureSource(headset), headset::matchesOutput, listener);
+        else session = new HostedSession(this, api, input, listener);
         if (voiceButton != null) voiceButton.setText("正在准备…"); if (cancelButton != null) cancelButton.setVisibility(View.VISIBLE); updateStatus();
+    }
+    private boolean currentSession(long generation) { return !isDestroyed() && generation == sessionGeneration; }
+    private boolean hasHeadsetBoundSession() { return session != null && (sessionUsesCapture || sessionIsReplay); }
+    private void cancelSession(String reason) {
+        stopRepeat(); clearHeadsetGesture(); ++sessionGeneration;
+        HostedSession old = session; session = null; recording = false; turnSucceeded = false;
+        if (old != null) old.cancel();
+        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        if (voiceButton != null) voiceButton.setText("◉  开始说话");
+        if (cancelButton != null) cancelButton.setVisibility(View.GONE);
+        if (orb != null) orb.level = 0;
+        lastNotice = reason; diagnosticStage = "已取消"; renderDiagnostics(); updateStatus();
     }
     @Override public void onRequestPermissionsResult(int code, String[] permissions, int[] grants) {
         super.onRequestPermissionsResult(code, permissions, grants);
         if (code == 2) { if (grants.length > 0 && (checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED || checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED)) locate(); else toast("定位未授权，可继续使用目的地搜索与天气查询"); return; }
-        if (code != 1) return; permissionPending = false;
+        if (code != 1 && code != 3) return; permissionPending = false;
         for (int grant : grants) if (grant != PackageManager.PERMISSION_GRANTED) {
-            new AlertDialog.Builder(this).setTitle("需要麦克风与附近设备权限").setMessage("用于蓝牙耳机采音与播放。你仍然可以使用文字对话；也可在系统设置中开启权限。")
+            new AlertDialog.Builder(this).setTitle(development.audioMode().requiresBluetooth() ? "需要麦克风与附近设备权限" : "需要麦克风权限").setMessage("用于所选音频模式的采音与播放。你仍然可以使用文字对话；也可在系统设置中开启权限。")
                 .setNegativeButton("使用文字", null).setPositiveButton("打开设置", (d, w) -> startActivity(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getPackageName())))).show(); return;
         }
-        if (grants.length > 0 && visible) startVoice();
+        if (grants.length > 0 && visible) { if (code == 3) connectHeadset(); else startVoice(); }
     }
-    @Override protected void onResume() { super.onResume(); visible = true; if (orb != null) orb.invalidate(); }
+    @Override protected void onResume() {
+        super.onResume(); visible = true; syncHeadsetControls();
+        if (!pendingHeadsetNotice.isEmpty()) { String notice = pendingHeadsetNotice; pendingHeadsetNotice = ""; headsetNotice(notice); }
+        if (orb != null) orb.invalidate();
+    }
     private void stopRepeat() { repeatArmed = false; listenMode = 0; handler.removeCallbacks(repeatTick); if (session == null) getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON); }
-    @Override protected void onPause() { visible = false; stopRepeat(); if (session != null) session.cancel(); stopLocation(); super.onPause(); }
-    @Override protected void onDestroy() { if (session != null) session.cancel(); worker.shutdownNow(); super.onDestroy(); }
-    @Override public void onBackPressed() { if (session != null) { stopRepeat(); session.cancel(); return; } if (!api.vault.token().isEmpty() && tab != 0) { switchTab(0); return; } if (api.vault.token().isEmpty() && authMode != 0) { showAuth(0); return; } super.onBackPressed(); }
+    @Override protected void onPause() { visible = false; pauseModeChange(); clearHeadsetGesture(); syncHeadsetControls(); if (session != null) cancelSession("离开前台，本轮已取消；返回后请手动开始"); else stopRepeat(); stopLocation(); super.onPause(); }
+    @Override protected void onDestroy() { cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); super.onDestroy(); }
+    @Override public void onBackPressed() { if (session != null) { cancelSession("本轮已取消"); return; } if (!api.vault.token().isEmpty() && tab != 0) { switchTab(0); return; } if (api.vault.token().isEmpty() && authMode != 0) { showAuth(0); return; } super.onBackPressed(); }
+
+    private void syncHeadsetControls() {
+        if (headset == null || development == null || api == null) return;
+        boolean wanted = visible && headsetControlsOptIn && development.audioMode() == AudioMode.RISE_SDK && !api.vault.token().isEmpty();
+        if (controlsRequested == wanted) return;
+        controlsRequested = wanted;
+        if (!wanted) clearHeadsetGesture();
+        headset.setControlsEnabled(wanted);
+    }
+    private HeadsetInteractionPolicy.Context headsetInteractionContext() {
+        HeadsetController.Snapshot snapshot = headset.snapshot();
+        return new HeadsetInteractionPolicy.Context(visible, headsetControlsOptIn && development.audioMode() == AudioMode.RISE_SDK
+            && snapshot.controlsState == HeadsetController.ControlsState.ENABLED, !api.vault.token().isEmpty(), snapshot.ready(),
+            snapshot.inCall, busy || permissionPending || locationListener != null, session != null || repeatArmed, recording,
+            Boolean.FALSE.equals(snapshot.leftWorn) && Boolean.FALSE.equals(snapshot.rightWorn), mode(), sessionGeneration);
+    }
+    private void handleHeadsetControl(HeadsetController.ControlEvent event) {
+        HeadsetInteractionPolicy.Gesture gesture;
+        switch (event.kind) {
+            case TAP: case PRESS_SINGLE: gesture = HeadsetInteractionPolicy.Gesture.TOGGLE; break;
+            case DOUBLE_TAP: case PRESS_DOUBLE: gesture = HeadsetInteractionPolicy.Gesture.NEXT_MODE; break;
+            case TRIPLE_TAP: case PRESS_TRIPLE: gesture = HeadsetInteractionPolicy.Gesture.DISCARD_COMBINATION; break;
+            case LONG_PRESS: case PRESS_LONG: gesture = HeadsetInteractionPolicy.Gesture.CANCEL; break;
+            default: gesture = HeadsetInteractionPolicy.Gesture.IGNORE; break;
+        }
+        long now = android.os.SystemClock.elapsedRealtime();
+        applyHeadsetDecision(headsetPolicy.event(gesture, event.sequence, event.receivedAtMillis, now, headsetInteractionContext()));
+        handler.removeCallbacks(settleHeadsetGesture);
+        if (headsetPolicy.hasPending()) handler.postDelayed(settleHeadsetGesture, headsetPolicy.pendingDelay(now));
+    }
+    private void applyHeadsetDecision(HeadsetInteractionPolicy.Decision decision) {
+        if (!decision.message.isEmpty()) headsetNotice(decision.message);
+        for (HeadsetInteractionPolicy.Action action : decision.actions) {
+            switch (action) {
+                case CANCEL:
+                    cancelSession(decision.mode == null ? decision.message : "触控切换模式，本轮已取消；已提交内容请查看历史");
+                    break;
+                case CHANGE_MODE: changeMode(decision.mode); break;
+                case START:
+                    stopRepeat();
+                    if (tab != 0) { tab = 0; showApp(); }
+                    startVoice();
+                    break;
+                case STOP_AND_SEND:
+                    stopRepeat();
+                    if (session != null && recording) {
+                        recording = false; if (voiceButton != null) voiceButton.setText("正在处理…"); session.stopRecording();
+                    }
+                    break;
+            }
+        }
+    }
+    private void clearHeadsetGesture() { headsetPolicy.clearPending(); handler.removeCallbacks(settleHeadsetGesture); }
+    private void headsetNotice(String message) {
+        if (!visible) { pendingHeadsetNotice = message; return; }
+        lastNotice = message; updateStatus(); toast(message);
+    }
+    private static String modeName(String value) { return "work".equals(value) ? "工作模式" : "commute".equals(value) ? "通勤模式" : "生活模式"; }
 
     private void updateStatus() { if (status != null) { status.setText("●  " + (busy ? "正在同步…" : !lastNotice.isEmpty() ? lastNotice : "已连接  ·  " + api.vault.username())); status.setTextColor(busy ? MUTED : TEAL); } }
+    private void connectBackend() {
+        ApiClient next = new ApiClient(this, development.serverUrl());
+        api = next;
+        next.setDiagnostics(message -> runOnUiThread(() -> {
+            if (isDestroyed() || api != next) return;
+            if (message.contains("request_id=") && (session == null || !message.contains("request_id=" + session.requestId()))) return;
+            diagnosticRequest = message; renderDiagnostics();
+        }));
+    }
+    private String audioModeLabel() { return development.audioMode().label(); }
+    private String voiceHintText() { return (development.audioMode() == AudioMode.RISE_SDK ? "在设备详情连接 Rise，耳机就绪后开始\n触控联动就绪后：按一下开始/结束，按两下切模式，长按取消" : "连接蓝牙耳机后，轻触下方开始") + "\n每次最长 60 秒（含结束收尾）· 离开页面自动停止"; }
+    private String weatherPreferenceKey() { return "weather." + ServerEndpoint.sessionNamespace(api.serverUrl) + "." + api.vault.username(); }
+    private void developmentEntry(LinearLayout parent) {
+        if (!BuildConfig.DEBUG) return;
+        developmentSummary = label(parent, "开发版 · " + audioModeLabel() + "\n" + api.serverUrl, 11, TEAL);
+        button(parent, "开发测试设置", false, this::showDevelopmentSettings);
+        button(parent, "检查后端连接", false, () -> { if (canAct()) request(() -> api.json("GET", "/healthz", null), r -> {
+            new AlertDialog.Builder(this).setTitle("后端可达").setMessage(api.serverUrl + "\n服务配置：" + (r.optBoolean("ready") ? "齐备（供应商调用仍需验证）" : "未齐备，请检查电脑后端配置")).setPositiveButton("完成", null).show();
+        }); });
+    }
+    private RadioGroup choices(LinearLayout parent, String[] options, int selected) {
+        RadioGroup group = new RadioGroup(this); parent.addView(group);
+        for (int i = 0; i < options.length; i++) {
+            RadioButton option = new RadioButton(this); option.setId(View.generateViewId()); option.setText(options[i]);
+            option.setTextColor(INK); option.setTextSize(13); option.setButtonTintList(android.content.res.ColorStateList.valueOf(TEAL));
+            group.addView(option); if (i == selected) group.check(option.getId());
+        }
+        return group;
+    }
+    private void showDevelopmentSettings() {
+        if (!BuildConfig.DEBUG || permissionPending || !canAct()) return;
+        stopRepeat(); clearHeadsetGesture();
+        LinearLayout body = dialogBody();
+        label(body, "音频模式", 15, TEAL);
+        AudioMode[] audioOptions = {AudioMode.RISE_SDK, AudioMode.BLUETOOTH};
+        String[] audioNames = new String[audioOptions.length]; for (int i = 0; i < audioOptions.length; i++) audioNames[i] = audioOptions[i].label();
+        RadioGroup audio = choices(body, audioNames, development.audioMode() == AudioMode.RISE_SDK ? 0 : 1);
+        label(body, "Rise 使用耳机专用收音；系统蓝牙是独立兼容来源。来源失败不会自动切换。", 11, MUTED);
+        label(body, "后端", 15, TEAL);
+        RadioGroup backend = choices(body, new String[]{backendChoiceLabel("本地电脑服务（USB）", ServerEndpoint.USB_LOCAL), backendChoiceLabel("远端服务器", BuildConfig.SERVER_URL)}, development.localBackend() ? 0 : 1);
+        label(body, "本地和远端账号独立，各登录一次后自动记住。切换回来会恢复该服务的登录；凭证失效时才需重登。只切音频不会退出账号或清空页面。", 11, MUTED);
+        ScrollView container = new ScrollView(this); container.addView(body);
+        new AlertDialog.Builder(this).setTitle("开发测试设置").setView(container).setNegativeButton("取消", null)
+            .setPositiveButton("应用", (dialog, which) -> {
+                if (permissionPending || !canAct()) return;
+                AudioMode selected = audioOptions[audio.indexOfChild(audio.findViewById(audio.getCheckedRadioButtonId()))];
+                boolean localBackend = backend.getCheckedRadioButtonId() == backend.getChildAt(0).getId();
+                if (selected == development.audioMode() && localBackend == development.localBackend()) return;
+                cancelSession(""); if (development.audioMode() == AudioMode.RISE_SDK && selected != AudioMode.RISE_SDK) headset.disconnect();
+                development.save(selected, localBackend);
+                syncHeadsetControls();
+                if (api.serverUrl.equals(development.serverUrl())) {
+                    // Audio selection does not change the account, view tree, drafts or results.
+                    if (voiceHint != null) voiceHint.setText(voiceHintText());
+                    if (developmentSummary != null) developmentSummary.setText("开发版 · " + audioModeLabel() + "\n" + api.serverUrl);
+                    renderHeadset();
+                    toast("音频已切换，登录和当前页面已保留");
+                    return;
+                }
+                connectBackend(); state = new JSONObject(); tab = 0; lastAnswer = ""; lastUser = ""; lastNotice = ""; exportData = null;
+                diagnosticInput = "尚未录音"; diagnosticOutput = "尚未播放"; diagnosticRequest = "尚未请求"; diagnosticSession = "尚未开始"; diagnosticStage = "空闲"; diagnosticError = "无"; diagnosticRms = 0; diagnosticBytes = 0;
+                if (api.vault.token().isEmpty()) showAuth(0); else { showApp(); refresh(); }
+            }).show();
+    }
+    private String backendChoiceLabel(String title, String serverUrl) {
+        String endpoint = ServerEndpoint.validate(serverUrl, true);
+        boolean saved = endpoint.equals(api.serverUrl) && !api.vault.token().isEmpty()
+            || AuthVault.hasSavedSession(this, ServerEndpoint.sessionNamespace(endpoint));
+        return title + "\n" + (saved ? "已保存登录 · 切回自动恢复" : "未登录 · 登录后自动记住");
+    }
+    private void renderDiagnostics() {
+        if (!BuildConfig.DEBUG || diagnosticsView == null || isDestroyed()) return;
+        diagnosticsView.setText("音频：" + audioModeLabel() + "\n后端：" + api.serverUrl
+            + "\n输入：" + diagnosticInput + "\n输出：" + diagnosticOutput
+            + String.format(Locale.CHINA, "\n录音 RMS：%.4f · %.1f 秒 · %d 字节", diagnosticRms, diagnosticBytes / 32000.0, diagnosticBytes)
+            + "\n请求：" + diagnosticRequest + "\n会话：" + diagnosticSession
+            + "\n设备：" + headset.snapshot().diagnostics + "\n流程：" + diagnosticStage + "\n最近错误：" + diagnosticError);
+    }
+    private void renderHeadset() {
+        if (headset == null) return;
+        HeadsetController.Snapshot snapshot = headset.snapshot();
+        if (headsetStatus != null) headsetStatus.setText(development.audioMode() == AudioMode.RISE_SDK ? snapshot.summary() + " · 设备详情" : audioModeLabel() + " · 设备详情");
+        if (deviceDetails != null) deviceDetails.setText(snapshot.summary() + "\n输入来源：" + audioModeLabel()
+            + "\n型号：" + snapshot.model + "\n左耳电量：" + knownBattery(snapshot.leftBattery) + " · 右耳电量：" + knownBattery(snapshot.rightBattery)
+            + "\n左耳佩戴：" + knownWorn(snapshot.leftWorn) + " · 右耳佩戴：" + knownWorn(snapshot.rightWorn)
+            + "\n触控联动：" + snapshot.controlsSummary
+            + "\n实际触控事件：" + snapshot.controlEventCount + " 次 · " + snapshot.lastControlEvent
+            + "\n通话状态：" + (snapshot.inCall ? "检测到通话，已暂停 AI" : "未检测到通话")
+            + "\n实际输入：" + diagnosticInput + "\n实际输出：" + diagnosticOutput
+            + (BuildConfig.DEBUG ? "\n\n开发诊断\n" + snapshot.diagnostics : ""));
+        renderDiagnostics();
+    }
+    private static String knownBattery(Integer value) { return value == null ? "未知" : value + "%"; }
+    private static String knownWorn(Boolean value) { return value == null ? "未知" : value ? "已佩戴" : "未佩戴"; }
+    private void showDeviceDetails() {
+        LinearLayout body = dialogBody();
+        deviceDetails = label(body, "", 13, INK); renderHeadset();
+        label(body, "先在手机系统配对耳机。耳机就绪后仍需点击开始录音；连接成功不代表已核验声音来源和播放。", 12, MUTED);
+        if (BuildConfig.DEBUG && development.audioMode() == AudioMode.RISE_SDK) {
+            button(body, "连接 / 重新连接 Rise", true, () -> { if (canAct()) connectHeadset(); });
+            button(body, "断开耳机", false, () -> { cancelSession("耳机已断开"); headset.disconnect(); });
+            CheckBox controls = new CheckBox(this); controls.setText("开启耳机触控联动（仅 App 前台）");
+            controls.setTextColor(INK); controls.setChecked(headsetControlsOptIn); body.addView(controls);
+            controls.setOnCheckedChangeListener((button, checked) -> {
+                headsetControlsOptIn = checked;
+                getSharedPreferences("headset_controls", MODE_PRIVATE).edit().putBoolean("touch_enabled", checked).apply();
+                clearHeadsetGesture(); syncHeadsetControls();
+                toast(checked ? "已申请触控联动；请看设备状态并实际测试手势" : "触控联动已关闭");
+            });
+            label(body, "按一下（单击 / 单捏）：开始或结束发送单轮对话\n按两下（双击 / 双捏）：生活 → 工作 → 通勤\n长按 / 长捏：取消本轮\n单击、双击会等待组合手势判定。三击不绑定动作，并撤销尚未执行的组合手势；短按、释放及滑动不映射动作。\n\n以上只响应 SDK 实际上报的事件，不修改耳机系统手势或固件。显示已开启不等于每种手势已实测。", 11, MUTED);
+            label(body, "之前确认佩戴后，双耳都明确未佩戴时暂停；单耳及未知状态不推断摘下。戴回、重连只恢复就绪，不自动开麦。电量 ≤20% 和 ≤10% 分级提醒，回升超过25%后才重新提醒。工作模式提示仅显示文字，保持安静。", 11, MUTED);
+        } else label(body, "当前使用 " + audioModeLabel() + "。Rise 接入在开发设置中选择，实物验收后再调整发布策略。", 12, MUTED);
+        button(body, "打开系统蓝牙设置", false, () -> startActivity(new Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS)));
+        ScrollView container = new ScrollView(this); container.addView(body);
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("耳机与音频").setView(container).setPositiveButton("完成", null).create();
+        dialog.setOnDismissListener(d -> deviceDetails = null); dialog.show();
+    }
+    private void connectHeadset() {
+        if (!BuildConfig.DEBUG || development.audioMode() != AudioMode.RISE_SDK || permissionPending || !canAct()) return;
+        ArrayList<String> missing = audioPermissions(true);
+        if (!missing.isEmpty()) { permissionPending = true; requestPermissions(missing.toArray(new String[0]), 3); return; }
+        try {
+            java.util.List<HeadsetController.DeviceChoice> devices = headset.pairedDevices();
+            if (devices.size() <= 1) { headset.connect(); return; }
+            String[] labels = new String[devices.size()]; for (int i = 0; i < labels.length; i++) labels[i] = devices.get(i).label;
+            new AlertDialog.Builder(this).setTitle("选择本次使用的 Rise").setItems(labels, (d, index) -> headset.connect(devices.get(index).address)).setNegativeButton("取消", null).show();
+        } catch (SecurityException e) { showError("附近设备权限不可用，请在系统设置授权后重试"); }
+    }
     private void showError(String message) {
         if (authError != null) { authError.setText(message); return; }
         if (message.contains("登录已失效")) { new AlertDialog.Builder(this).setTitle("请重新登录").setMessage(message).setCancelable(false).setPositiveButton("去登录", (d, w) -> signOut()).show(); return; }

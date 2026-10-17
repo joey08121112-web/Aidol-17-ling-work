@@ -38,11 +38,24 @@ def agent(config, store, bus):
 
 
 @pytest.fixture
-def client(config, monkeypatch):
-    # main has a module-level app; ensure its default database is temporary too.
-    monkeypatch.setenv("DATABASE_PATH", config.database_path)
+def client(config, tmp_path, monkeypatch):
+    """Authenticated Android API client backed by a temporary account store."""
+    monkeypatch.setenv("AIDOL_REGISTRATION_OPEN", "true")
+    monkeypatch.setenv("AIDOL_MAX_USERS", "500")
+    monkeypatch.setenv("AIDOL_DAILY_REQUESTS", "300")
     from fastapi.testclient import TestClient
-    from app.main import create_app
+    from app.main import create_hosted_app
 
-    with TestClient(create_app(config)) as value:
+    with TestClient(create_hosted_app(config, tmp_path / "hosted")) as value:
+        registered = value.post("/auth/register", json={
+            "username": "testuser", "password": "test-password-123"})
+        assert registered.status_code == 201, registered.text
+        value.headers["Authorization"] = "Bearer " + registered.json()["token"]
         yield value
+
+
+@pytest.fixture
+def runtime(client):
+    state = client.get("/v1/state")
+    assert state.status_code == 200, state.text
+    return client.app.state.runtimes.items[state.json()["user"]["id"]]

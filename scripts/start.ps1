@@ -38,6 +38,6 @@ if ($InstallOnly) {
     Write-Host 'Aidol dependencies installed. Your existing .env was preserved.'
     exit 0
 }
-Write-Host 'Starting Aidol. Open the local URL printed below. Press Ctrl+C to stop.'
-& ./.venv/Scripts/python.exe run.py
+Write-Host 'Starting the local Android account API. Use the Android app to connect. Press Ctrl+C to stop.'
+& ./.venv/Scripts/python.exe -m scripts.android_backend
 exit $LASTEXITCODE

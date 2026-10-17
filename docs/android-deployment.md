@@ -1,6 +1,6 @@
 # Aidol 安卓共享测试部署
 
-这版是「安装 APK → 注册账号 → 使用」的共享服务。API Key 只保存在服务器，用户不需要填 Key、邮箱、短信验证码或电脑后端。原 `android-demo/aidol-android-direct-debug.apk` 是直连供应商的开发 Demo，不是本次多人服务版。
+这版是「安装 APK → 注册账号 → 使用」的共享服务。API Key 只保存在服务器，用户不需要填 Key、邮箱、短信验证码或电脑后端。当前只发布 `android-app/` 客户端与 `app/` 多账号后端，官网按独立静态流程发布。
 
 ## 固定地址与账号
 
@@ -41,6 +41,8 @@ IP 可以直接使用，不需要域名。测试 APK 内置仅用于该服务器
 
 `aidol` 是不可登录的系统账号。服务代码由 root 持有，运行进程仅可写自己的数据目录。单进程单 worker 是当前 SQLite 和内存会话实现的部署要求，不要直接增加 uvicorn worker 数。已有 `lvming.xqjun.top`、`photo.xqjun.top` 等服务的配置不需要修改。
 
+systemd 只信任来自 `127.0.0.1` 的 nginx 转发头。直接使用 `run.py` 或 Docker 时，`FORWARDED_ALLOW_IPS` 默认为空，关闭转发头信任；只有明确放在代理后面时才填写代理的准确 IP 或网段，避免所有用户被归入同一个代理 IP 的鉴权限流。不要信任任意客户端传入的地址头。USB 本地启动器始终关闭代理头处理。
+
 ## 首次部署
 
 SSH 使用 `root@123.207.219.174`、端口 22。SSH 密码和供应商 Key 不写入文档或 Git。用 SSH 客户端确认服务器指纹；本次实测的 Ed25519 公钥为：
@@ -51,7 +53,7 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMZfCmgpP9tVLJFPqnbY5WwR4C9C1ULT1Sr2SCURtziw
 
 1. 云安全组放行 TCP **7776**（App API）和 **80**（可选 APK 下载），管理端保留 SSH 22。不需要开放 8108。
    如果主机 UFW 已启用，还需 `ufw allow 7776/tcp comment 'Aidol Android API'`；不要关闭防火墙或修改默认策略。当前服务器已经执行此规则。
-2. 上传当前仓库的 `app/`、`web/`、`requirements.txt`、`deploy/` 到一个临时发布目录，例如 `/root/aidol-upload/`。不要上传 `.venv`、数据库、录音、Git 历史、Android 构建缓存。
+2. 上传当前仓库的 `app/`、`requirements.txt`、`deploy/` 到一个临时发布目录，例如 `/root/aidol-upload/`。不要上传 `.venv`、数据库、录音、Git 历史、Android 构建缓存。
 3. 在服务器执行：
 
 ```bash
@@ -72,7 +74,7 @@ bash deploy/prepare-server.sh
 | `AIDOL_MAX_USERS=500` | 体验注册上限 |
 | `AIDOL_DAILY_REQUESTS=300` | 单用户计费操作窗口配额；不是资金预算上限 |
 
-`.env` 中无需新增域名、Viaim Key、邮件或短信参数。不要把 TTS 凭据擅自视为已开通 ASR；识别失败需检查 ASR 权限与 resource id。systemd 固定持久化目录，不会使用开发机数据库路径。云端 `DATABASE_PATH` 和 `AIDOL_DATA_DIR` 由 service 文件覆盖。
+`.env` 中无需新增域名、Viaim Key、邮件或短信参数。不要把 TTS 凭据擅自视为已开通 ASR；识别失败需检查 ASR 权限与 resource id。systemd 固定持久化目录，不会使用开发机数据库路径。云端 `AIDOL_DATA_DIR` 由 service 命令固定为托管数据目录；旧 `DATABASE_PATH` 不用于账号选库。
 
 5. 执行发布脚本：
 

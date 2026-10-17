@@ -23,15 +23,12 @@ class Agent:
         self.last_motion = 0.0
         self.last_route = 0.0
         self.last_notice = 0.0
-        self.last_poll = time.monotonic()
-        self.last_schedule_check = time.monotonic()
         self.intent_until = 0.0
-        self.audio_clients = 0
         self.ingest_lock = asyncio.Lock()
 
     def snapshot(self):
         return {"mode": self.mode, "reason": self.reason, "location": self.location,
-                "route": self.route, "audio_clients": self.audio_clients}
+                "route": self.route}
 
     async def decide(self, text=""):
         settings = self.store.settings()
@@ -159,20 +156,6 @@ class Agent:
                 await self.propose_arrival("导航估算即将抵达", origin="location")
         await self.bus.emit("location.updated", {"location": self.location, "route": self.route}, persist=False)
         return self.snapshot()
-
-    async def scheduler(self):
-        """Request capture from a consenting active browser; never record on the server."""
-        while True:
-            await asyncio.sleep(1)
-            settings = self.store.settings()
-            if time.monotonic() - self.last_schedule_check >= 60:
-                self.last_schedule_check = time.monotonic()
-                if not self.audio_clients:
-                    await self.decide()
-            if (self.mode == Mode.life and settings.life_poll_enabled and self.audio_clients == 0
-                    and time.monotonic() - self.last_poll >= settings.life_poll_seconds):
-                self.last_poll = time.monotonic()
-                await self.bus.emit("life.listen_requested", {"seconds": settings.listen_seconds}, persist=False)
 
     def instructions(self):
         settings = self.store.settings()

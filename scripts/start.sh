@@ -49,5 +49,5 @@ if [ "$aidol_install_only" -eq 1 ]; then
     printf '%s\n' 'Aidol dependencies installed. Your existing .env was preserved.'
     exit 0
 fi
-printf '%s\n' 'Starting Aidol. Open the local URL printed below. Press Ctrl+C to stop.'
-exec .venv/bin/python run.py
+printf '%s\n' 'Starting the local Android account API. Use the Android app to connect. Press Ctrl+C to stop.'
+exec .venv/bin/python -m scripts.android_backend

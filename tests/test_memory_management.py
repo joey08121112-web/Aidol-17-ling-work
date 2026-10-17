@@ -1,4 +1,4 @@
-"""Memory corrections and favorites must remain compatible with local old databases."""
+"""Memory corrections and favorites survive SQLite schema upgrades."""
 import sqlite3
 
 import pytest

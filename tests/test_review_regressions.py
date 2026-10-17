@@ -12,12 +12,12 @@ async def test_meeting_intent_clears_stale_commute_evidence(agent):
     assert await agent.decide("我负责完成接口") == Mode.work
 
 
-def test_new_destination_cannot_reuse_old_eta(client):
-    agent = client.app.state.agent
+def test_new_destination_cannot_reuse_old_eta(client, runtime):
+    agent = runtime.agent
     agent.route = {"available": True, "eta_seconds": 120, "destination": "旧目的地"}
     agent.last_route, agent.last_notice = 12345, 12345
-    settings = client.get('/api/state').json()['settings']
-    response = client.put('/api/settings', json={**settings, 'destination_name': '新目的地'})
+    settings = client.get('/v1/state').json()['settings']
+    response = client.put('/v1/settings', json={**settings, 'destination_name': '新目的地'})
     assert response.status_code == 200
     assert agent.route is None and agent.last_route == 0 and agent.last_notice == 0
 

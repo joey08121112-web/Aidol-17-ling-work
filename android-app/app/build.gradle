@@ -23,9 +23,14 @@ android {
         }
     }
     buildTypes {
+        debug {
+            applicationIdSuffix '.debug'
+            versionNameSuffix '-dev'
+        }
         release {
             signingConfig signingConfigs.release
             minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
             debuggable false
         }
     }
@@ -35,6 +40,25 @@ android {
     }
 }
 dependencies {
+    implementation files('libs/headsetSdk-release-6.7.aar')
+    implementation 'com.polidea.rxandroidble2:rxandroidble:1.18.1'
+    implementation 'io.reactivex.rxjava2:rxandroid:2.1.1'
+    implementation 'io.reactivex.rxjava2:rxjava:2.2.17'
+    implementation 'net.java.dev.jna:jna:5.6.0@aar'
+    implementation 'com.google.code.gson:gson:2.10.1'
     implementation 'com.squareup.okhttp3:okhttp:4.12.0'
     testImplementation 'junit:junit:4.13.2'
+    testImplementation 'com.squareup.okhttp3:mockwebserver:4.12.0'
 }
+
+// A fixed external vendor artifact is required on every developer machine; never substitute a newer AAR silently.
+tasks.register('verifyRiseSdk') {
+    doLast {
+        def sdk = file('libs/headsetSdk-release-6.7.aar')
+        if (!sdk.isFile()) throw new GradleException('Missing Rise SDK 6.7. Run scripts/import-rise-sdk.ps1 or scripts/import-rise-sdk.sh with demo_6_7.zip.')
+        def hash = java.security.MessageDigest.getInstance('SHA-256').digest(sdk.bytes).encodeHex().toString()
+        if (hash != 'e074506fd3a46346272fdd2ab632a59b4cef2597f4cb37fd160737eb536e2b2c')
+            throw new GradleException('Rise SDK checksum mismatch. Obtain the pinned official demo_6_7.zip.')
+    }
+}
+tasks.named('preBuild').configure { dependsOn 'verifyRiseSdk' }

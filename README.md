@@ -1,188 +1,74 @@
 # 聆 · Aidol
 
-耳机里的随身助手：语音陪伴、工作记录、会议纪要、个人记忆和通勤提醒。当前面向同事体验的入口是 **Android 多账号服务版**：安装 APK → 注册唯一账号 → 连接蓝牙耳机 → 开始使用。
+耳机里的随身助手：语音陪伴、工作记录、会议纪要、个人记忆和通勤提醒。项目只维护三个产品模块，放在同一个仓库，通过 `main` 共享源码。
 
-用户不需要电脑后端、API Key、邮箱或短信验证码。APK 内置服务器 `https://123.207.219.174:7776`，直接使用 IP，不要求域名；服务器保存供应商密钥，各账号独立保存数据。测试者看 [Android 使用与交接](docs/android-handoff.md)，运维看 [服务器部署与回滚](docs/android-deployment.md)，开发者看 [API 契约](docs/api.md) 与 [验收记录](docs/acceptance.md)。
-
-服务器版交付文件为 `android-app/aidol-android.apk`（`com.aidol.app`，0.2.0，release 签名）。发布后的分发地址为 [下载 APK](http://123.207.219.174/downloads/aidol-android.apk)；上线可用性以验收记录为准。HTTP 链接仅分发安装文件，账号密码与业务 API 始终使用 HTTPS。
-
-| 入口 | 用途 |
+| 模块 | 职责 |
 | --- | --- |
-| `android-app/` + `app.main:create_hosted_app` | 当前 Android 多账号服务版；原生 Android + FastAPI + 每账号 SQLite |
-| `android-demo/aidol-android-direct-debug.apk` | 旧直连供应商 Demo，需自己填 Key；不用于多人服务器体验 |
-| `run.py` + `web/` + `create_app` | 保留的本地单用户 Web 开发入口；原生实时供应商、持续流式语音的参考与调试 |
-| `web_duplex_demo/`、`qwen_omni_demo/` | 保留的原始供应商协议参考，不是生产入口 |
+| `android-app/` | 唯一用户客户端：账号、耳机连接、录音播放、对话、记忆、工作和通勤 |
+| `app/` | Python / FastAPI 后端：鉴权、按账号隔离的 SQLite、业务编排、ASR、文本模型、TTS 和地图 |
+| `website/` | 静态官网：产品介绍、使用说明和 APK 下载入口 |
 
-Android 当前支持手动录音，以及用户主动开启的前台连续轮次/生活定时录音；每次最多 60 秒，结束后识别、回复和播放，工作模式只记录。连续模式按有界轮次接续，不是实时双工；离开前台或停止后不再自动录音。会议、记忆、地图和草稿功能的迁移范围见 [功能对照](docs/android-handoff.md#功能迁移对照)。ANC、硬件按键和电量不冒充已接入。服务器部署与实物耳机验收分别记录，不能用自动测试代替实际听音。
+`deploy/`、`scripts/`、`tests/`、`docs/` 是这三个模块的部署、开发与验收支撑。旧浏览器应用、直连供应商 Android Demo 和两套供应商参考 Demo 已从当前源码移除；官网与旧浏览器应用是不同模块。
 
-## 保留的本地 Web 开发入口
+## 手机体验
 
-以下启动、配置和能力说明仅针对原本的本地 Web 模式。每位开发者仍可运行自己的 Python 服务、`.env` 和 SQLite，通过 Git `main` 共享源代码；模型和高德请求访问外部 API。手机测试者无需按下面步骤搭建环境或索取 `.env`。
+安装 [aidol-android.apk](http://123.207.219.174/downloads/aidol-android.apk)，注册自己的账号，保存恢复码，连接蓝牙耳机。手机用户不需要电脑后端、API Key、邮箱或短信验证码。业务请求使用 APK 内置的 `https://123.207.219.174:7776`，供应商凭证只保存在后端，各账号的数据独立。
 
-三种系统首次运行都需要已安装 **Python 3.11+ 并加入 PATH**，以及联网安装 Python 依赖。队友拉取 `main` 后，将项目负责人私下提供的 `.env` 放在仓库根目录，即可复用其中已配置的服务；无需每人重新注册或配置一套新 API。已有自己的 `.env` 时先备份，再由本人决定是否替换；启动脚本不会覆盖现有文件。`.env` 永不提交 Git，也不要发到公开群或写进文档。
+现有发布包为 `com.aidol.app` 0.2.0，使用系统蓝牙和远端 HTTPS。当前源码已加入 debug 可选的 Rise SDK 6.7 接入，源码更新不代表公网 APK 已更新。安装、账号恢复和功能范围见 [Android 使用说明](docs/android-handoff.md)；公网可用性及硬件实测结果以 [验收记录](docs/acceptance.md) 为准。
 
-| 系统 | 根目录启动入口 | 终端命令 |
-| --- | --- | --- |
-| Windows | 双击 `start.bat`，或使用 `start.ps1` | `powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1` |
-| Linux | `start.sh` | `sh ./start.sh` |
-| macOS | 双击 `start.command`，或使用 `start.sh` | `sh ./start.sh` |
+当前语音是前台短录音：每轮最多 60 秒，结束后识别、回复和播放；工作模式只记录。连续轮次和生活定时录音需要用户主动开启并保持前台，停止或离开前台后不再接续。实时双工、锁屏持续采音、ANC、按键、闪录和盒子能力属于后续范围。
 
-所有入口均自动进入项目目录，无需激活虚拟环境。Windows 使用 `.venv/Scripts/python.exe`，Linux/macOS 使用 `.venv/bin/python`；只共享代码和获授权的 `.env`，不要复制其他系统的 `.venv`。Git 中已设置 Unix 脚本可执行权限和 LF 换行。若 ZIP 解压丢失权限，macOS 可运行 `chmod +x start.command`，或直接使用表中的 `sh` 命令。
+## 本地开发：安卓真机 + 电脑后端
 
-Windows 也可以直接双击仓库根目录的 **`start.bat`**。它调用同一个启动脚本，首次自动安装依赖；保持窗口打开。或者在仓库根目录执行：
+要求 Python 3.11+、JDK 17、Android SDK 35，以及允许 USB 调试的安卓真机。耳机配对手机，Windows/macOS 电脑运行同一套多账号后端。
 
-```powershell
-# 已收到 .env 则直接运行下一行；仅未收到时才使用 .env.example 建立模板
-powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1
-```
+| 系统 | 在仓库根目录启动后端 |
+| --- | --- |
+| Windows PowerShell | `powershell -NoProfile -ExecutionPolicy Bypass -File .\start-android-backend.ps1` |
+| macOS / Linux Shell | `sh ./start-android-backend.sh` |
 
-这里的执行策略仅作用于这次启动的 PowerShell 进程，不修改电脑的永久策略。脚本创建虚拟环境、安装依赖并启动。依赖已安装后的日常启动可直接执行：
+后端监听 `127.0.0.1:8108`，数据独立保存在 `data/android-local/`。根目录 `start.ps1`、`start.sh`、`start.bat`、`start.command` 也指向此账号后端。`python run.py` 也运行账号 API，但读取 `HOST`、`PORT`、`AIDOL_DATA_DIR`，默认数据目录为 `data/hosted/`；USB 开发优先使用上述专用启动器。健康检查为 `http://127.0.0.1:8108/healthz`。
 
-```powershell
-.\.venv\Scripts\python.exe run.py
-```
+USB 授权后建立 `adb -s <serial> reverse tcp:8108 tcp:8108`，Android Studio 打开 `android-app/` 并在手机 Run。debug 的“开发测试设置”分别选择音频来源和后端：系统蓝牙兼容 / Rise SDK 麦克风，本地电脑服务 / 远端服务器。本地固定 `http://127.0.0.1:8108`，不提供模拟器入口；本地与远端账号、会话和数据互不复制。
 
-Linux / macOS：
+完整步骤和无 Key 测试范围见 [USB 真机与本地后端测试](docs/android-local-testing.md)。Rise 开发还需按 [M0/M1 交接](docs/android-m0-m1-handoff.md) 提供官方 Word、`demo_6_7.zip` 和固定版本 AAR；这些厂商资料并不是已移除的项目 Demo。换电脑时需包含当前未提交源码，不能只发送旧 HEAD。
+
+本机已观察到 Rise VI-A10 的 SDK READY、电量和佩戴上报；手机 USB 业务请求、短语音、真实输入来源及人耳听音仍待完整验收，macOS 组合单独待验。测试结果不能由编译成功或供应商返回音频替代。
+
+## 后端配置与部署
+
+本地供应商配置写入根目录 `.env`，字段模板见 `.env.example`，已有配置不覆盖。账号、记忆管理等可用 mock / 无 Key 环境验证；完整语音和地图需要后端对应服务已开通。
+
+| 配置 | 用途 |
+| --- | --- |
+| `TEXT_API_KEY` / `TEXT_BASE_URL` / `TEXT_MODEL` | 文字对话、记忆提取、纪要及证据筛选 |
+| `SPEECH_VOLC_*` | 账号语音接口使用 ASR 2.0 stream；flash 仅供独立探测脚本诊断 |
+| `TTS_VOLC_*` | 独立语音合成；资源和音色必须匹配 |
+| `AMAP_API_KEY` | 地点、路线、周边和天气 |
+| `UPSTREAM_PROXY` / `PROVIDER_PROXY` | 后端上游代理，可选 |
+| `AIDOL_REGISTRATION_OPEN` / `AIDOL_MAX_USERS` / `AIDOL_DAILY_REQUESTS` | 注册开关、账号容量及业务操作配额 |
+
+“配置齐备”不代表供应商权限已经实测。凭证、录音、数据库、签名私钥和构建产物不提交 Git。开发者各自建立本地环境和数据库，只共享源码与脱敏验收材料。
+
+后端只提供 `/healthz`、`/auth/*`、`/v1/*`，使用 `app.main:create_hosted_app`。部署保持单进程单 worker，HTTPS 代理后的服务只监听回环地址。部署、备份和回滚见 [后端部署](docs/android-deployment.md)。本地 Docker Compose 同样运行账号后端，端口只映射 `127.0.0.1:8108`；容器数据卷与直接启动的本地目录分别保存。
+
+官网 `website/` 独立静态发布，当前地址为 [Aidol 官网](http://123.207.219.174:6655/)，只展示公开内容并分发 APK，不处理账号密码。发布与回滚见 [官网部署](docs/website-deployment.md)。
+
+## 验证与交接
 
 ```sh
-[ -f .env ] || cp .env.example .env # 已收到配置时保留它
-sh ./start.sh
+python -m pytest tests -q
+python -m compileall -q app
+# 在 android-app/，JDK 17 + Android SDK 35：
+./gradlew testDebugUnitTest lintDebug assembleDebug
 ```
 
-可选参数：Windows 的 `-Check` / Unix 的 `--check` 只检查环境，不安装依赖、不修改文件；`-InstallOnly` / `--install-only` 仅创建环境与安装依赖；`-Dev` / `--dev` 同时安装测试依赖。Linux 如果提示无法创建虚拟环境，请安装与 Python 版本匹配的 `python3-venv`；macOS 可从 python.org 安装 Python。发现已有但不兼容的 `.venv` 时脚本会停止并提示，不自动删除任何目录。
+Windows Android 构建使用 `gradlew.bat`。真实 `scripts/probe_*.py` 调用可能消耗 API 配额，按需使用合成语音和公共地标，仅由开发者按需手动执行。官网修改另做桌面/手机视觉、交互、资源和下载检查。
 
-启动脚本创建 `.venv` 并安装依赖。打开 [http://localhost:8000](http://localhost:8000)，交互 API 文档在 [http://localhost:8000/docs](http://localhost:8000/docs)。没有模型 Key 也可点击「演示完整一天」，跑通模式切换、文字提取、记忆、消息草稿；演示发言均标记为模拟场景。
-
-新建 SQLite 的默认语音通道是 `cascade`，与已验证的豆包 ASR 2.0 → Turbo → TTS 配置对应。已有数据库保留原设置：若之前选了 `auto`，请在「偏好与设备」选择「豆包完整链路」并保存。`auto` 只尝试原生实时供应商，不会自动转到 `cascade`。
-
-可选本地 Docker（不要求使用，也不部署公共服务器）：先在 `.env` 设置非空 `APP_TOKEN`，启动后在页面「偏好与设备」填写同一口令。容器内部监听所有接口，启动保护要求口令；宿主仍只映射本机端口。
-
-```sh
-[ -f .env ] || cp .env.example .env # 随后编辑 APP_TOKEN
-docker compose up --build -d
-docker compose logs -f aidol
-```
-
-本地 Compose 只绑定 `127.0.0.1:8000`，数据库存在本机 `aidol-data` 卷。Android 共享服务使用独立的托管入口和 HTTPS 部署，不对外开放这个单用户 Compose 入口。
-
-## 本地 Web 保留能力
-
-| 能力 | 实现与边界 |
-| --- | --- |
-| 耳机音频 | 浏览器选择 Viaim 麦克风/输出，PCM 流经后端到实时模型；蓝牙先在系统配对 |
-| 豆包 / Qwen | 独立实时协议适配，自动策略先尝试豆包，建连失败尝试 Qwen；Qwen 凭证已实测建立会话并返回音频，豆包实时需对应服务凭证 |
-| 豆包语音流水线 | `cascade` 默认持续 PCM → ASR 2.0 → Turbo/记忆 → TTS；真实 stream WebSocket 全链路通过，输出 357804 字节 PCM、ASR 持久化；Viaim 实物待验收 |
-| 工作记录 | 实时转写进入独立记忆队列；文本模型提取或规则降级；工作模式拦截助手播放 |
-| 独立 ASR / TTS | ASR 2.0 连续 WebSocket、flash ASR 与 TTS 均已真实验证；原有凭证可用，无需因旧资源配置失败另购权限 |
-| 多人发言 | 保留收到的转写；文本可指定发言人；实时输入未做声纹分离，远处拾音效果需真机测试 |
-| 自动模式 | 手动选择优先，再按场景文字、最近运动、工作时段、今日行程记忆判断，并显示理由 |
-| 通勤 | 浏览器 GPS → 高德坐标转换 → 驾车/步行/公交规划 → 提醒草稿；公交为计划数据，播报文本也可触发提醒 |
-| 地点与天气 | 高德坐标转换、驾车/步行/公交规划与地点搜索已真实联调；另有 3 km 周边 POI、城市天气 API，后两者待真实验收 |
-| 生活 | 默认间隔 300 秒监听 30 秒，需开关、当前页面授权和可见页面；VAD 用于已开启会话中的说话检测和打断 |
-| 会议纪要与待办 | 按所选时段整理工作转写，生成带原话来源的纪要与行动项；待办可勾选完成；相同输入快照复用报告；不是自动识别单场会议 |
-| 问记忆 | 在本地记忆、转写和行动项中查找相关证据，显示摘录与引用；依据不足明确提示，不自由编造答案 |
-| 全局记忆 | 记忆时间线、重要收藏、内容更正、手动「立即记住」、转写卡「记住这句」、搜索/删除/导出；`task` 类型是待办线索，不等于有完成状态的行动项 |
-| 联系人通知 | 生成草稿供复制或忽略；没有真实发送渠道 |
-| 硬件控制 | ANC、按键、电量、厂商唤醒事件等待 Viaim SDK；浏览器降噪不等于耳机 ANC |
-
-「已配置」只表示变量非空，不代表服务权限已验证。Qwen 文本触发返回音频的探测，也不等于 Viaim 真实麦克风端到端验收。
-
-## 本地开发配置矩阵
-
-供应商凭证由后端读取 `.env`，前端仅获得能力标记。`.env.example` 提供字段示例，不包含可用凭证；更改后重启后端。
-
-| 变量 | 用途 | 缺少时 |
-| --- | --- | --- |
-| `HOST` / `PORT` | 默认 `127.0.0.1` / `8000` | 使用默认值 |
-| `DATABASE_PATH` | 默认 `data/aidol.sqlite3` | 自动建库 |
-| `APP_TOKEN` | 可选共享访问口令；在界面「偏好与设备」填写 | 本机 Demo 无口令 |
-| `DOUBAO_API_KEY` | 豆包实时双工服务 Key | 自动策略尝试 Qwen |
-| `DOUBAO_REALTIME_URL` | 比赛示例 `openspeech` JSON 双工 WebSocket | 使用示例地址 |
-| `DOUBAO_MODEL` / `DOUBAO_VOICE` | 默认 `1.2.6.1` / `zh_female_vv_jupiter_bigtts` | 使用默认值 |
-| `QWEN_API_KEY` | 比赛 MaaS 实时服务 Key | 无实时备份 |
-| `QWEN_REALTIME_URL` | 默认 `wss://maas.qianwenaiapi.com/api-ws/v1/realtime` | 使用默认地址 |
-| `QWEN_MODEL` / `QWEN_VOICE` | 默认 `qwen3.8-omni-flash-realtime` / `Tina` | 使用默认值 |
-| `TEXT_API_KEY` / `TEXT_BASE_URL` / `TEXT_MODEL` | OpenAI 兼容文本服务，用于文字交互和记忆清洗；配置示例为 `doubao-seed-2-1-turbo-260628`，关闭思考模式 | 规则提取和模板建议 |
-| `AMAP_API_KEY` | 高德 Web 服务 Key，坐标转换与驾车路线 | 明确显示无 ETA，播报提醒仍可演示 |
-| `UPSTREAM_PROXY` | 可选上游代理 | 直接连接 |
-| `SPEECH_VOLC_APP_KEY` / `SPEECH_VOLC_ACCESS_KEY` | 独立火山流式 ASR 凭证 | 录音文件识别不可用，实时模型自带 ASR 仍独立工作 |
-| `SPEECH_VOLC_RESOURCE_ID` | 默认 `volc.seedasr.sauc.duration`，ASR 2.0 资源 | 使用默认资源 |
-| `SPEECH_VOLC_WS_URL` | 默认 `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async` | 使用 ASR 2.0 连续识别地址 |
-| `SPEECH_ASR_MODE` | `stream`（默认连续识别）或 `flash`（分段 HTTP 备用） | 默认 stream |
-| `TTS_VOLC_APP_KEY` / `TTS_VOLC_ACCESS_KEY` | 独立火山 TTS 凭证 | 文字合成 API 不可用，实时模型语音仍独立工作 |
-| `TTS_VOLC_RESOURCE_ID` / `TTS_VOLC_VOICE_TYPE` | 当前可用组合 `seed-tts-1.0` / `zh_female_jitangmeimei_mars_bigtts` | 使用默认值，资源与音色必须匹配 |
-| `TTS_VOLC_WS_URL` | 默认火山 v3 bidirection TTS WebSocket | 使用默认地址 |
-| `PROVIDER_PROXY` | 独立 ASR/TTS 适配器的可选代理 | 直接连接；与 `UPSTREAM_PROXY` 分开配置 |
-
-火山方舟文本 Key、语音 ASR/TTS 凭证、豆包实时双工 Key 属于不同服务，不能仅凭名称相同替换。Qwen 默认端点属于比赛 MaaS，不应默认把 DashScope Key 用于该地址。
-
-## 项目地图
-
-```text
-app/
-  main.py                 REST、SSE、WebSocket 与应用生命周期
-  config.py               后端配置与能力状态
-  domain.py               请求模型、设置校验、模式枚举
-  storage.py              SQLite 持久化
-  events.py               有界事件总线
-  providers/realtime.py   豆包 / Qwen 协议归一化
-  providers/volc_speech.py 独立火山 ASR / TTS 二进制协议
-  services/audio.py       音频会话与异步转写队列
-  services/cascade.py     PCM VAD 切句 → 独立 ASR → 文本 Agent → TTS
-  services/streaming_cascade.py 持续 PCM/ASR、独立记忆队列和可打断 TTS
-  services/agent.py       模式决策与三种场景业务
-  services/memory.py      文本 LLM 提取与规则降级
-  services/insights.py    工作转写纪要、决策和行动项的生成与校验
-  services/recall.py      有界本地检索与原文证据筛选
-  services/conversation.py 文字交互模型，关闭思考并限制回复长度
-  services/maps.py        高德坐标转换与驾车路线
-web/
-  app.js                  管理界面与 REST/SSE
-  memory.js               纪要、待办、引用问答与记忆时间线
-  audio/hardware.js       浏览器耳机适配和 Viaim SDK 边界
-  audio/session.js        采集、传输、播放、打断、资源释放
-  audio/pcm-worklet.js    PCM16 重采样与音量检测
-scripts/                  启动与实时服务探测
-docs/                     架构、接口、硬件、交接、演示手册
-```
-
-- [整体架构与模式决策](docs/architecture.md)
-- [Viaim 接入与厂商资料清单](docs/hardware-integration.md)
-- [REST / SSE / 音频协议](docs/api.md)
-- [24 小时分工与交接验收](docs/handoff.md)
-- [演示步骤与故障排查](docs/demo-runbook.md)
-- [需求实现与验收证据](docs/acceptance.md)
-- [会议纪要、问记忆与时间线用法](docs/memory-features.md)
-- [硅基记忆官网调研与设计依据](docs/memory-product-research.md)
-
-## 验证
-
-```powershell
-./.venv/Scripts/python.exe -m pip install -r requirements-dev.txt
-./.venv/Scripts/python.exe -m pytest tests -q
-node --test tests/audio-worklet.test.mjs tests/audio-session.test.mjs
-./.venv/Scripts/python.exe -m compileall -q app
-# 以下建立真实服务会话，需要相应 .env 配置并可能产生费用
-./.venv/Scripts/python.exe -m scripts.probe_realtime --provider qwen --text-test
-./.venv/Scripts/python.exe -m scripts.probe_realtime --provider doubao --text-test
-# 文本提取和高德真实集成探测（按配置调用服务）
-./.venv/Scripts/python.exe -m scripts.probe_services
-# 独立 TTS → 重采样 → ASR 联调，不采集用户麦克风
-./.venv/Scripts/python.exe -m scripts.probe_speech
-# 主应用已在本机8000端口启动时，验证真实WebSocket级联，写入本地测试记忆
-./.venv/Scripts/python.exe -m scripts.probe_e2e
-```
-
-Linux / macOS 使用 `.venv/bin/python`。实时探测输出连接结果、音频字节数、文本事件数和错误类型，不打印凭证；`session=true` 且 `audio_bytes>0` 说明文本触发到语音输出成功。
-
-当前是单用户、单进程 Demo：共享设置和记忆，一次只应连接一个语音会话。不要启用多个 Uvicorn worker。关闭浏览器后不提供全天后台唤醒，后续需要厂商 SDK 或原生宿主。
-
-## 运行通道与依赖
-
-| 通道 | 配置 | 能力与选择理由 |
-| --- | --- | --- |
-| 文字演示 `demo` | 无 Key 可运行；配置 TEXT 后可文字模型交互 | 先联调模式、记忆、草稿与 UI |
-| 豆包语音流水线 `cascade` | 独立 ASR；完整语音回复另需 TEXT + 独立 TTS | 默认 stream 持续传入音频，按供应商最终句子进入记忆和回复；flash 为可选分段备用 |
-| 原生实时 `qwen` / `doubao` / `auto` | 对应实时服务 Key；TEXT 为可选记忆提取增强 | 适合低延迟语音，Qwen 已验证；auto 仅在原生实时供应商之间切换 |
-
-各通道共用工作/通勤/生活、设置和记忆。`cascade` 是连续 ASR、文本模型与 TTS 组合，不是豆包原生实时模型，不承诺相同延迟。每位队友按自己的凭证选择通道；SQLite 不通过 Git 同步。ASR 2.0 配置参考[官方流式识别文档](https://docs.volcengine.com/docs/DoubaoVoice/LargemodelstreamingautomaticspeechrecognitionAPI?lang=zh)。
+- [架构与模块边界](docs/architecture.md)
+- [多账号 API 契约](docs/api.md)
+- [团队交接](docs/handoff.md)
+- [Rise SDK 与音频边界](docs/hardware-integration.md)
+- [记忆、纪要和行动项](docs/memory-features.md)
+- [后续 Android 产品规划](docs/android-rise-product-plan.md)
+- [验收证据与待验项](docs/acceptance.md)

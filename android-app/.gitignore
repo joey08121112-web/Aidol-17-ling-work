@@ -2,6 +2,7 @@
 **/build/
 local.properties
 libs/*.aar
+app/libs/*.aar
 *.apk
 *.jks
 *.keystore

@@ -1,121 +1,42 @@
-# 队友交接
+# 团队交接
 
-当前给同事体验的产品是 Android 多账号服务版：安装 APK、注册唯一用户名和密码即可，不填写供应商 Key、不搭建电脑后端。测试流程、功能迁移和反馈格式见 [Android 使用与交接](android-handoff.md)；服务器部署、证书、更新与回滚见 [Android 部署](android-deployment.md)。
+项目只维护 `android-app/`、`app/` 和 `website/` 三个产品模块。Android 是唯一业务客户端，Python 后端负责账号、模型与数据，官网负责介绍和下载。旧浏览器客户端与独立供应商 Demo 已移除；测试、脚本、部署和文档继续随对应模块维护。
 
-开发职责沿用模块边界：Android 原生 UI/蓝牙在 `android-app/`；供应商协议在 `app/providers/`；账号密码派生和每账号业务上下文在 `app/services/accounts.py`、`mobile.py`；HTTP 验证/鉴权/生命周期在 `app/main.py`；事务持久化在 `app/storage.py`。部署只启动 `create_hosted_app` 工厂，不对外发布旧 `/api/*` 或 WebSocket Demo。
+## 开发入口
 
-每次交付需区分离线测试、服务器真实供应商链路、Android 界面、实物耳机四类结果。开发时可以多智能体分工，产品仍复用一套场景编排逻辑；每账号的隔离上下文不代表多个自主决策 Agent 协商运行。
+1. 拉取 `main` 后先检查 `git status`，保留已有未提交和未跟踪工作。按模块认领文件；功能分支可用 `codex/` 前缀，审查后集成回 `main`。
+2. 每位开发者独立创建 Python 环境和 `.env`，运行根目录 `start-android-backend.ps1`（Windows）或 `sh ./start-android-backend.sh`（macOS）。后端固定 `127.0.0.1:8108`，本地账号库在 `data/android-local/`。
+3. 耳机配对安卓真机，USB 授权后建立 `adb -s <serial> reverse tcp:8108 tcp:8108`。Android Studio 打开 `android-app/` 并 Run；debug 选择“本地电脑服务”或“远端服务器”，再独立选择“系统蓝牙兼容”或“Rise SDK 麦克风”。
+4. 先核对健康、登录和文字，再检查 SDK 就绪、采集和输出。完整 Windows/macOS 步骤见 [本地测试](android-local-testing.md)，本轮实施契约见 [M0/M1 交接](android-m0-m1-handoff.md)。
 
-## 保留的本地 Web 开发与历史黑客马拉松安排
+本地服务和远端服务的账号、历史、记忆与 Token 独立；切换后端不复制登录凭据。旧模拟器偏好迁移为 USB / 系统蓝牙，`10.0.2.2:8108` 已拒绝。release 仍使用系统蓝牙与远端 HTTPS，debug SDK 功能不表示已发布到公网 APK。
 
-以下内容用于本地 Web 参考入口，不能当作 Android 测试者的安装要求。可先用无 Key 的文字演示跑通本地流程，再接真实服务；从仓库根目录 `run.py` 启动，原始两个 Demo 留作协议参考。
+## 模块分工
 
-## 本地协作约定
-
-每位队友在自己的电脑克隆仓库，自己的 Viaim 连接自己的本地服务，浏览器访问 `localhost:8000`。每人独立建立 `.venv`、`.env` 与 `data/aidol.sqlite3`，默认 `HOST=127.0.0.1`，无需服务器和部署平台。Git `main` 只共享代码与文档，密钥、个人转写、记忆、SQLite 不入库、不跨队友同步。
-
-本地开发代码修改后按需重启自己的 Python 服务，前端静态文件刷新浏览器即可。队友以小提交合并到 `main`，拉取后更新依赖并重启。Android 共享环境的发布由集成负责人按部署文档进行。需要重现相同场景时，分享标记过的演示输入或脱敏样例，不复制个人数据库。
-
-新队友首次拉取（GitHub 的 main 分支已推送后）：
-
-```powershell
-git clone --branch main https://github.com/joey08121112-web/Aidol-17-ling-work.git
-Set-Location Aidol-17-ling-work
-# 先把负责人私下提供的 .env 放在此目录；没有时脚本会创建模板，已有文件不覆盖
-powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1
-```
-
-首次运行先安装 Python 3.11+ 并加入 PATH，依赖安装需要网络。若项目负责人已私下发来完整 `.env`，将其放到仓库根目录即可，不需要再注册新的模型、高德或记忆服务。没有配置文件时脚本才从 `.env.example` 创建模板。已有个人 `.env` 时先备份，再自行决定是否换成负责人提供的配置。脚本不覆盖现有 `.env`，该文件永不提交 Git，也不在公开文档或群里贴 Key。
-
-Windows 可直接双击根目录 `start.bat`；Linux 在项目目录运行 `sh ./start.sh`；macOS 可双击 `start.command`，也可运行 `sh ./start.sh`。三者都自动创建本机虚拟环境和安装依赖。不要复制其他系统的 `.venv`；已有但不兼容时脚本会报错，请先手动移走后重建。macOS 从 ZIP 解压后若没有执行权限，运行 `chmod +x start.command` 或改用 `sh`。不启动服务的检查方式：Windows `start.ps1 -Check`，Linux/macOS `sh ./start.sh --check`。
-
-`-ExecutionPolicy Bypass` 只影响本次启动进程，不修改永久策略。依赖装好后可直接运行 `.\.venv\Scripts\python.exe run.py`。新数据库默认 `provider=cascade`；旧数据库保留原设置，需在设备页选择「豆包完整链路」并保存。认领功能后创建个人功能分支，完成测试再合并回 main。已有未提交修改时先保存，避免直接拉取造成混杂。
-
-## 交接十分钟
-
-1. 阅读根目录 README，用启动脚本打开主界面。
-2. 点击「演示完整一天」，确认工作记录、通勤草稿、生活偏好出现。
-3. 查看 `/docs` 和 `docs/api.md`，确认前后端契约。
-4. 将负责人私下提供的 `.env` 放到根目录，或填自己的授权凭证；不要在公开聊天贴 Key。
-5. 先运行对应实时探测，再接耳机麦克风。
-6. 认领下面模块，避免多人直接修改 `app/main.py`、`domain.py`、`web/app.js`。
-
-## 模块所有权建议
-
-| 角色 | 主目录 | 本轮交付 | 合并前对接 |
-| --- | --- | --- | --- |
-| 音频 / 硬件 | `web/audio/`、`app/services/audio.py` | Viaim 实测、音频格式、打断、断连清理 | 与模型同学确认采样率与事件 |
-| 模型服务 | `app/providers/`、配置字段 | 豆包实时验证、Qwen 备用、ASR/TTS 接入 | 与音频同学固定标准化事件 |
-| Agent / 数据 | `app/services/agent.py`、`memory.py`、`storage.py` | 三模式、记忆提取、幂等与数据管理 | 与 UI 固定模式/记忆/草稿字段 |
-| 前端 / 演示 | `web/app.js`、`index.html`、`styles.css` | 设备管理、展示、授权、演示脚本 | 与后端同步 `/api/state` 和 SSE |
-| 通勤集成 | `app/services/maps.py` | 高德 Key 实测、坐标转换、ETA | 与 Agent 固定 route 结构 |
-| 集成负责人 | `app/main.py`、`domain.py`、README、测试 | 接口变更审核、联调、main 合并 | 每次合并提供验证记录 |
-
-人数少时合并相邻角色。开发多智能体协同可分别负责独立模块与测试，避免多个 Agent 同时写同一个文件；跨模块只通过契约和集成负责人合并。业务运行时当前仍是单编排 Agent，不要把开发方式描述成已经部署多自治 Agent。
-
-## 24 小时建议节奏
-
-| 时间 | 主目标 | 必须可演示的结果 |
+| 范围 | 主要文件 | 交付要求 |
 | --- | --- | --- |
-| 0–2 h | 环境、凭证、设备清单 | 无 Key 演示 + 至少一个真实模型连接 |
-| 2–6 h | 真音频主链路 | 耳机输入 → 转写 → 模型音频 → 耳机输出 |
-| 6–10 h | 工作记录与记忆 | 多段发言、过滤废话、保存、重启可读 |
-| 10–14 h | 通勤与生活 | 模式理由、播报草稿、定时监听，Key 就绪则真高德 ETA |
-| 14–18 h | SDK / 体验增强 | SDK 到位接按键/ANC；不到位做真机稳定性和 UI |
-| 18–21 h | 联调回归 | 断网、错误 Key、停止、清空、权限拒绝均可解释 |
-| 21–24 h | 冻结与彩排 | 固定演示数据、备用文字流程、技术说明和分支推送 |
+| Android UI / 会话 | `android-app/` 的 MainActivity、HostedSession、CaptureTurn、ReplyPlayer | 用户操作、停止/取消、前台生命周期与真实输出路由 |
+| Rise / 系统蓝牙 | Android `hardware/`、CaptureSource、BluetoothCapture | 单一 SDK 所有者、明确来源、尾帧排空和有界缓冲 |
+| 后端账号 / 路由 | `app/main.py`、`app/services/accounts.py`、`mobile.py` | 鉴权、每账号隔离、幂等、限流、诊断脱敏 |
+| 后端业务 / 数据 | `app/services/`、`app/storage.py`、`app/domain.py` | 场景、记忆、纪要、引用与事务一致性 |
+| 供应商 | `app/providers/` | ASR/TTS 协议、超时与失败语义，不含 UI |
+| 官网 | `website/`、`deploy/website-*` | 公开说明、下载和独立静态发布 |
+| 发布与验收 | `deploy/`、`scripts/`、`tests/`、`docs/` | 可回滚发布、临时库测试、分层验收证据 |
 
-## 接入信息缺口
+多人共享源码、契约、脱敏用例和验收记录，各自持有本地数据库与获授权的配置。密钥、Token、恢复码、私密录音、数据库、构建缓存和签名私钥不进 Git。产品运行时使用一套按账号隔离的编排服务，开发代理数量不改变产品架构。
 
-| 缺口 | 需要提供 | 没有时的可运行路径 |
-| --- | --- | --- |
-| 豆包实时双工 | 对应产品 Key、接口、模型、音色和权限 | 已验证的 Qwen 实时 |
-| 连续 ASR 配置 | 使用 ASR 2.0 `volc.seedasr.sauc.duration` + `bigmodel_async`，原凭证已验证 | flash 分段备用；不因旧资源名错误要求购买新权限 |
-| 文本提取 | OpenAI 兼容根 URL、模型 ID、Key | 规则提取 |
-| 高德 | Web 服务 Key，坐标转换/路线权限；目的地 GCJ-02 坐标 | 播报文本提醒，无实时 ETA |
-| Viaim SDK | SDK、支持平台、设备/固件、音频/ANC/按键协议 | 标准蓝牙音频 |
-| 公交/地铁实时 | 城市、线路、交通方式、实时数据 API 与权限 | 明示仅驾车 ETA 或播报提醒 |
-| 消息渠道 | 目标渠道 API、账号授权、联系人 ID、确认流程 | 用户复制草稿到聊天软件 |
+## 换机与硬件资料
 
-不需要为了运行主 Demo 同时拿齐全部服务。优先确认一个实时模型、耳机音频和文本提取；高德、SDK 分别独立接入。
+当前 Rise 交接必须包含官方 `耳机SDK Android 文档.docx`、`demo_6_7.zip` 和当前源码快照。官方 ZIP 是导入 SDK 的来源，不能与已移除的项目 Demo 混淆。固定 AAR 校验与导入步骤见 [M0/M1 交接](android-m0-m1-handoff.md)。只发旧 HEAD 无法复现当前未提交实现。
 
-当前已验证独立 TTS（`seed-tts-1.0` + mars 音色）、ASR 2.0 连续 WebSocket 和 flash ASR。`cascade` 默认 `SPEECH_ASR_MODE=stream`，持续上传音频，独立队列处理记忆和语音回复；flash 仅备用。Qwen 原生实时继续保留。已有 `.env` 的队友应同步 ASR 2.0 resource/URL，不能只更新代码保留旧资源值；无需另购权限，各自账号仍需探测确认。
+`python scripts/package_android_handoff.py --official-doc <官方.docx路径> --demo-zip <demo_6_7.zip路径>` 可重新生成源码交接包。以前生成的 ZIP 和 APK 是当时快照，收窄目录后需要重新打包才能反映当前源码；不把本机数据或凭证装入交接包。
 
-## 变更约定
+## 验收与发布
 
-- REST 请求字段先在 `domain.py` 定义，随后同步 API 文档与前端；设置 PUT 为完整模型替换。
-- 新供应商只在 adapter 中处理私有事件，对业务层保持 `audio/transcript/interrupt/assistant.delta` 等标准事件。
-- 添加第三方 API 要有明确超时、降级和来源标记。缺数据不返回看似真实的结果。
-- 记忆提取把输入当作资料，保留来源；草稿状态不是发送回执。
-- 修改 schema 时同时设计兼容升级，不能只改建表语句后假定旧库自动变化。
-- 提交前记录分支、影响接口、验证命令、是否真实服务测试、已知限制；不要把「已有 Key」当作「已联调」。
+本地回归运行 `python -m pytest tests -q`、`python -m compileall -q app`；Android 使用 JDK 17 / SDK 35 运行 `testDebugUnitTest lintDebug assembleDebug`。官网单独检查桌面、窄屏、交互、资源和 APK 下载。真实供应商脚本可能消耗配额，仅由开发者按需手动执行。
 
-## 验收清单
+按项目清理要求，仓库不启用 GitHub CI workflow。每位开发者在本地执行后端离线测试、编译、启动器配置检查及官网 `node --check website/app.js`。官方 SDK AAR 不进 Git，取得官方 Word 与 `demo_6_7.zip` 并导入后完成 Android 检查；软件检查不能代替硬件验收。
 
-| 流程 | 验证点 |
-| --- | --- |
-| 首次启动 | 自动建库、静态页、health、无 Key 可文字演示 |
-| 设置 | 手动覆盖、时区/范围校验、保存后刷新可读 |
-| 工作 | 记录有效信息、废话过滤、工作不播放、重复事件不重复处理 |
-| 记忆 | 分类、搜索、删除、导出，重启保留 |
-| 通勤 | 正确坐标系、无 Key 不造 ETA、草稿复制/忽略、无自动发送 |
-| 生活 | 默认不开轮询、本次页面授权、隐藏页不启动、新会话有截止 |
-| 音频 | 16 kHz 输入/24 kHz 输出；停止立即释放麦克风/播放，最多 25 秒等最终识别与记忆，快速重启等待旧连接；断网/关页不保证尾句 |
-| 服务失败 | 豆包连接失败可尝试 Qwen，文本失败规则降级 |
-| 清空 | 录音期间拒绝、停止后成功、设置保留 |
-| 凭证 | 不在 `/api/state`、浏览器 JS、事件和异常输出中出现 |
+Windows 已观察到真实手机连接和 Rise READY、电量/佩戴上报；手机断网健康检查及移除/恢复 USB reverse 的对照通过。Windows USB 本地服务与 SDK 6.7 的一次真机短语音收到 `mic_bytes=107520`，ASR、业务、TTS 和目标 Rise 输出核验成功，用户确认转写正确并从耳机听到回复。记忆来源、手机断网注册/文字请求、远端 SDK 组合、macOS、麦克风来源对照、尾句和异常场景仍待验。追加的触控、佩戴与重连联动见 [Rise 联动](rise-controls.md)。当前会话前台结束后停止，没有实时双工、锁屏服务、ANC 或盒子接入。结果分别记入 [验收记录](acceptance.md)，不得把单轮通过扩展为全部硬件场景通过。
 
-具体自动测试覆盖以 `tests/` 实际文件和运行结果为准；真实耳机、浏览器权限、上游费用/配额不能靠 mock 测试证明。
-
-## 目前不应对评委宣称的能力
-
-没有真机 SDK 联调时不宣称自动 ANC/按键/电量。没有交通实时数据时不宣称列车实时预测。没有 diarization 时不宣称自动认出发言人。没有消息渠道时不宣称自动通知老板。没有唤醒词和原生后台时不宣称全天待机。界面中的模型配置标记不是服务成功证明。
-
-## 新增记忆工作空间的交接
-
-- `app/services/insights.py`：工作转写汇总与结构化结果校验；`app/services/recall.py`：本地证据检索与摘录；`web/memory.js`：记忆页交互。API、持久化与输入模型仍由原模块负责。
-- 纪要按最近 1/24/168 小时筛选，最多 80 条工作转写，不是按会议 ID 切分。报告与行动项一起入库，相同输入快照不重复创建任务。
-- `action_tasks` 才有用户确认的 `open/done`。`memories.kind=task` 是待办线索，不应批量当作未完成任务。
-- 记忆新增收藏与修改时间，旧库自动迁移；不要为了升级删除队友数据库。手动更正不修改原话，精确原文来源使用 `transcript:{id}`，模拟数据使用 `demo_transcript:{id}`。
-- 导出版本为 2，包含 `meeting_reports/action_tasks`；清空一并删除。只需已有文本模型配置，不要求新增模型、记忆平台或 Key。
-- 按 [memory-features.md](memory-features.md) 操作；先用合成文字和临时数据库核对来源、缓存、状态、旧库与清空，再按需调用真实服务。调研建议见 [memory-product-research.md](memory-product-research.md)，不把建议或第三方宣称当作本项目验收。
+接口修改同步 [API](api.md)；账号与共享服务发布按 [后端部署](android-deployment.md)，官网发布按 [官网部署](website-deployment.md)。故障记录包含源码/APK版本、主机和手机系统、耳机/固件、后端源、输入来源、步骤和脱敏 session/request ID；输入字节、SDK 就绪和人耳听见分别陈述。
