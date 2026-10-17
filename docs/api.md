@@ -7,15 +7,20 @@
 | 请求 | 契约 |
 | --- | --- |
 | `POST /v1/work-meetings` | `{"meeting_id":"客户端生成16–64位唯一编号"}`；工作模式下幂等建场，已结束编号不能复用。成功后才开启采音。 |
-| `POST /v1/voice?request_id=…&meeting_id=…&segment_index=0` | PCM16/16kHz；`meeting_id` 与从0递增的 `segment_index` 必须同时提供，来源为 `ambient_capture`。每段独立 request_id；原文与场次关联在一个事务内提交。静音段保留无原文回执，不假装记录了文字。同一编号重试不重复 ASR 或原文，不同请求占用同一片段编号返回409。 |
+| `POST /v1/voice?request_id=…&meeting_id=…&segment_index=0&offset_ms=0` | PCM16/16kHz；`meeting_id` 与从0递增的 `segment_index` 必须同时提供，来源为 `ambient_capture`。`offset_ms` 为该段在本场录音时间轴上的起点（只计已录 PCM，32 字节/毫秒，不含暂停）；旧客户端省略时按 `segment_index×20000`。只能与会议参数一起使用。每段独立 request_id；原文与场次关联在一个事务内提交。静音段保留无原文回执，不假装记录了文字。同一编号重试不重复 ASR 或原文，不同请求占用同一片段编号返回409。 |
 | `POST /v1/work-meetings/{id}/finish` | `{"segment_count":N,"complete":true}`；客户端排空后告知本场总片段数。核对0到N−1回执，完整且有文字才为 `saved`；无讲话为 `empty`，缺段／非正常结束为 `partial`。返回原文和后台整理状态；结束请求幂等，不再接受追加。异常中断可用 `complete:false` 收尾已保存部分。 |
 | `GET /v1/work-meetings` | `{"meetings":[…]}`；最近100场，含开始／结束时间、原文段数、标题、摘要和处理状态。只读 SQLite 快照不等待 ASR 账号锁。 |
-| `GET /v1/work-meetings/{id}` | 本场完整有序 `sources` 和 `report`；原文不按最近100条聊天裁剪。未知／其他账号编号返回404。 |
+| `GET /v1/work-meetings/{id}` | 本场完整有序 `sources`（含 `offset_ms/duration_ms`）、`utterances`、`events`、`audio` 和 `report`；原文不按最近100条聊天裁剪。未知／其他账号编号返回404。列表另含 `duration_ms`。 |
+| `POST /v1/work-meetings/{id}/events` | `{"event_id":"16–64位","kind":"pause|resume|mark","offset_ms":N,"origin":"app|headset"}`；仅录音中可写。同一 event_id 重试返回原记录，内容不同返回409；已暂停再暂停、未暂停时继续返回409。读 SQLite 快照写入，不等待片段 ASR 持有的账号锁。 |
+| `GET /v1/work-meetings/{id}/audio?start_ms=0&duration_ms=600000` | 返回本场录音时间轴 `[start_ms, start_ms+duration_ms)` 的 16 kHz 单声道 WAV，单次最多 10 分钟，裁到最后一段已存音频；缺失片段补静音。无录音、已过期或已删除返回404。 |
+| `DELETE /v1/work-meetings/{id}/audio` | 只删除本场录音文件，保留原文、句子与纪要；录音中返回409。返回会议详情。 |
 | `POST /v1/work-meetings/{id}/retry-summary` | 只重新处理已保存的文字，不重新 ASR 或上传音频；并发轮询不重复启动后台任务。替换同场旧纪要和待办，保留相同待办的完成状态。 |
 
 `status` 是原文保存状态：`recording/saved/partial/empty`；`summary_status` 为 `waiting/pending/ready/fallback/failed/unavailable`。`summary_stage` 为 `waiting/queued/analyzing/synthesizing/done`，`processed_sections/total_sections` 是实际完成的分析组数，不伪造百分比。Android 在本机停止至上传排空间显示“正在转写并保存”。网络失败保留上次确认状态并提示同步重试；后端重启后，读取列表／详情／state 会恢复持久化的 pending 任务。
 
-`report` 含 `title/summary/topics/decisions/tasks/open_questions/source_ids/extraction/notice/capture_status`。原文不经 AI 改写；长会议先按有界片段分析，再分层汇总，覆盖所有已保存文字。每条要点、决策、待办、待确认项引用本场原文 id；负责人和截止日期必须能在来源中核对，身份不明时留空。模型不可用、结构不合法或额度不足返回明确的原文摘录 fallback，不宣称 AI 整理成功。原文保存不受聊天保留开关影响；新协议的录音不逐段进入个人记忆提取。原始音频不保存，不提供音频回放。ASR 和每次实际文字模型调用分别计入账号额度。
+`report` 含 `title/summary/topics/decisions/tasks/open_questions/source_ids/extraction/notice/capture_status`。原文不经 AI 改写；长会议先按有界片段分析，再分层汇总，覆盖所有已保存文字。每条要点、决策、待办、待确认项引用本场句子 id（`<原文 id>.<序号>`，旧会议仍为原文 id）；负责人和截止日期必须能在来源中核对，身份不明时留空。模型不可用、结构不合法或额度不足返回明确的原文摘录 fallback，不宣称 AI 整理成功。原文保存不受聊天保留开关影响；新协议的录音不逐段进入个人记忆提取。ASR 和每次实际文字模型调用分别计入账号额度。
+
+2026-10-17 时间轴与录音保存：`utterances` 每项 `{id, transcript_id, segment_index, start_ms, end_ms, text}`，时间为本场录音时间轴毫秒（段起点 + ASR 句内 `start_time/end_time`，裁到段长）；供应商未给时间时整段作为一句。`events` 为暂停、继续与重点标记（`offset_ms` 同一时间轴，`created_at` 为服务器时间）。`audio` 为 `{status: saved|partial|none|expired|deleted, bytes, segments_with_audio, retention_days, expires_at}`。设置 `work_audio_retention_days`（0–365，默认30，0 表示不保存）控制保存：每段 PCM 写入 `users/<UUID>/work-audio/<会议>/`，路径只由服务端生成；会议结束超过期限后，在读取列表/详情/音频或保存设置时删除录音并标为 `expired`，异常未结束的会议多宽限1天。缩短期限立即作用于已有录音。录音不进入导出；清除数据和删除账号删除整个录音目录。服务端不加密录音文件，依赖主机磁盘与访问控制；部署备份是否包含该目录需按 `deploy/` 另行配置。
 
 `/v1/state` 增加 `work_meetings`；`/v1/export` 版本4增加全部会议详情。清除数据／删除账号包含新表；遗忘原文会撤回关联纪要和待办，后台结果不会重新发布已撤回的原文。旧 `/v1/meetings` 按时间范围整理入口保留兼容，不能据此倒推旧片段属于哪一场会议。
 

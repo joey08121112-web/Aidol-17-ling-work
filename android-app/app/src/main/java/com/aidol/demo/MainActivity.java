@@ -165,10 +165,17 @@ public final class MainActivity extends Activity {
     private LinearLayout turnDetails;
     private AlertDialog sourceDialog;
     private LinearLayout workMeetingList, workMeetingDetail;
-    private String openWorkMeetingId = "", workMeetingDetailSnapshot = "";
+    private String openWorkMeetingId = "", workMeetingDetailSnapshot = "", workMeetingJumpId = "";
     private boolean workMeetingShowOriginal, workMeetingSyncError;
-    private TextView workMeetingDetailStatus;
+    private TextView workMeetingDetailStatus, workClock;
     private boolean workMeetingPollInFlight;
+    private MeetingPlayback meetingPlayback;
+    private MeetingTimeline workMeetingTimeline;
+    private final java.util.HashMap<String, TextView> workMeetingLines = new java.util.HashMap<>();
+    private String workMeetingPlayingId = "";
+    private LinearLayout workMeetingPlayer;
+    private TextView workMeetingPlayerStatus;
+    private final Runnable workMeetingPlaybackTick = this::tickMeetingPlayback;
     private long workMeetingReadGeneration;
     private final Runnable workMeetingPoll = this::pollWorkMeetings;
     private String lastBusinessRequestId = "", uncertainTurnId = "";
@@ -216,6 +223,7 @@ public final class MainActivity extends Activity {
         headsetControlsOptIn = getSharedPreferences("headset_controls", MODE_PRIVATE).getBoolean("touch_enabled", true);
         headset = new HeadsetController(getApplicationContext());
         quickFeedback = new QuickFeedback(this, headset::matchesOutput, this::canSpeakFeedback);
+        meetingPlayback = new MeetingPlayback(this, headset::matchesOutput, this::meetingPlaybackChanged);
         headset.addListener(headsetListener);
         headset.addControlListener(headsetControlListener);
         connectBackend();
@@ -742,7 +750,8 @@ public final class MainActivity extends Activity {
             LinearLayout item = card(workMeetingList);
             String title = meeting.isNull("title") ? "会议记录" : fallback(meeting.optString("title"), "会议记录");
             label(item, title, 17, INK);
-            label(item, date(meeting.optString("started_at")) + " · 已保存 " + meeting.optInt("transcript_count") + " 段原文", 11, MUTED);
+            label(item, date(meeting.optString("started_at")) + " · 时长 " + TimeFormat.clock(meeting.optLong("duration_ms"))
+                + " · 已保存 " + meeting.optInt("transcript_count") + " 段原文", 11, MUTED);
             label(item, workMeetingProgress(meeting), 13, WORK);
             String summary = meeting.isNull("summary") ? "" : meeting.optString("summary");
             if (!summary.isEmpty()) label(item, summary.length() > 120 ? summary.substring(0, 120) + "…" : summary, 13, MUTED);
@@ -782,7 +791,11 @@ public final class MainActivity extends Activity {
         openWorkMeetingId = meetingId; workMeetingDetailSnapshot = ""; workMeetingShowOriginal = true;
         workMeetingDetail = dialogBody(); label(workMeetingDetail, "正在加载会议原文…", 14, MUTED);
         scrollDialog("会议记录", workMeetingDetail);
-        sourceDialog.setOnDismissListener(d -> { openWorkMeetingId = ""; workMeetingDetail = null; workMeetingDetailStatus = null; });
+        sourceDialog.setOnDismissListener(d -> {
+            openWorkMeetingId = ""; workMeetingDetail = null; workMeetingDetailStatus = null;
+            workMeetingPlayer = null; workMeetingPlayerStatus = null; workMeetingTimeline = null; workMeetingLines.clear(); workMeetingPlayingId = "";
+            meetingPlayback.stop();
+        });
         handler.removeCallbacks(workMeetingPoll); handler.post(workMeetingPoll);
     }
     private void renderWorkMeetingDetail(JSONObject meeting) {
@@ -790,10 +803,15 @@ public final class MainActivity extends Activity {
         if (workMeetingDetailStatus != null) workMeetingDetailStatus.setText(workMeetingProgress(meeting));
         JSONObject report = meeting.optJSONObject("report");
         JSONArray sources = array(meeting, "sources");
+        MeetingTimeline timeline = new MeetingTimeline(meeting);
         String snapshot = json("sources", sources, "report", report, "summary_status", meeting.optString("summary_status"),
-            "error", meeting.optString("error"), "original", workMeetingShowOriginal).toString();
+            "error", meeting.optString("error"), "original", workMeetingShowOriginal, "utterances", array(meeting, "utterances"),
+            "events", array(meeting, "events"), "audio", meeting.optJSONObject("audio")).toString();
         if (snapshot.equals(workMeetingDetailSnapshot)) return;
         workMeetingDetailSnapshot = snapshot; workMeetingDetail.removeAllViews();
+        workMeetingTimeline = timeline; workMeetingLines.clear(); workMeetingPlayingId = ""; workMeetingPlayer = null; workMeetingPlayerStatus = null;
+        boolean playable = MeetingTimeline.audioPlayable(meeting);
+        if (!playable && meeting.optString("id").equals(meetingPlayback.meetingId())) meetingPlayback.stop();
         label(workMeetingDetail, report == null ? "本次会议" : report.optString("title", "本次会议"), 19, INK);
         label(workMeetingDetail, date(meeting.optString("started_at")), 11, MUTED);
         workMeetingDetailStatus = label(workMeetingDetail, workMeetingProgress(meeting), 13, WORK);
@@ -801,26 +819,44 @@ public final class MainActivity extends Activity {
         LinearLayout tabs = row(); workMeetingDetail.addView(tabs);
         segment(tabs, "原始文稿", workMeetingShowOriginal, () -> { workMeetingShowOriginal = true; renderWorkMeetingDetail(meeting); });
         segment(tabs, "AI 纪要", !workMeetingShowOriginal, () -> { workMeetingShowOriginal = false; renderWorkMeetingDetail(meeting); });
+        workMeetingAudio(meeting);
         if (workMeetingShowOriginal) {
-            label(workMeetingDetail, "按录音片段顺序显示语音识别原文，未经 AI 改写；未区分说话人身份。", 12, MUTED);
-            if (sources.length() == 0) label(workMeetingDetail, "暂无已保存原文；录音转写后会陆续显示。", 14, MUTED);
+            label(workMeetingDetail, "按录音时间显示语音识别原文，未经 AI 改写；时间为录音内时长（不含暂停）；未区分说话人身份。", 12, MUTED);
+            if (timeline.sentences().isEmpty()) label(workMeetingDetail, "暂无已保存原文；录音转写后会陆续显示。", 14, MUTED);
             StringBuilder raw = new StringBuilder();
-            for (int i = 0; i < sources.length(); i++) {
-                JSONObject source = sources.optJSONObject(i); if (source == null) continue;
-                String time = date(source.optString("created_at"));
-                label(workMeetingDetail, "片段 " + (source.optInt("segment_index") + 1) + " · " + time, 11, WORK);
-                label(workMeetingDetail, source.optString("text"), 15, INK).setTextIsSelectable(true);
-                if (raw.length() > 0) raw.append("\n\n"); raw.append("[").append(time).append("] ").append(source.optString("text"));
+            TextView jumpTarget = null;
+            for (MeetingTimeline.Entry entry : timeline.entries) {
+                switch (entry.kind) {
+                    case PAUSE: label(workMeetingDetail, "‖ 暂停 " + TimeFormat.clock(entry.startMs) + " · " + date(entry.wallTime), 12, MUTED); break;
+                    case RESUME: label(workMeetingDetail, "▶ 继续 · " + date(entry.wallTime), 12, MUTED); break;
+                    case MARK: label(workMeetingDetail, "★ 重点标记 " + TimeFormat.clock(entry.startMs), 12, WORK); break;
+                    default:
+                        LinearLayout sentence = row(); workMeetingDetail.addView(sentence);
+                        TextView line = label(sentence, "[" + TimeFormat.clock(entry.startMs) + "] " + entry.text, 15, INK);
+                        line.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
+                        line.setTextIsSelectable(true); workMeetingLines.put(entry.id, line);
+                        if (playable) playFromHere(sentence, meeting, entry.startMs, timeline, null);
+                        if (entry.id.equals(workMeetingJumpId)) { line.setBackground(shape(0xffeef3fc, 8, 0xffeef3fc)); jumpTarget = line; }
+                        if (raw.length() > 0) raw.append("\n");
+                        raw.append("[").append(TimeFormat.clock(entry.startMs)).append("] ").append(entry.text);
+                }
             }
             if (raw.length() > 0) button(workMeetingDetail, "复制本次会议原文", false, () -> copy("会议原文", raw.toString()));
+            updateMeetingHighlight();
+            if (jumpTarget != null) {
+                TextView target = jumpTarget; workMeetingJumpId = "";
+                target.post(() -> { if (target.getParent() == workMeetingDetail && workMeetingDetail.getParent() instanceof ScrollView)
+                    ((ScrollView) workMeetingDetail.getParent()).smoothScrollTo(0, Math.max(0, target.getTop() - dp(12))); });
+            }
         } else if (report != null) {
             label(workMeetingDetail, report.optString("notice", "AI 整理稿，请结合原文核对。"), 12, MUTED);
             label(workMeetingDetail, "会议摘要", 16, INK);
             label(workMeetingDetail, report.optString("summary"), 15, INK).setTextIsSelectable(true);
-            meetingItems(workMeetingDetail, "讨论要点", array(report, "topics"), sources, false);
-            meetingItems(workMeetingDetail, "已确认决策", array(report, "decisions"), sources, false);
-            meetingItems(workMeetingDetail, "行动待办", array(report, "tasks"), sources, true);
-            meetingItems(workMeetingDetail, "待确认事项", array(report, "open_questions"), sources, false);
+            meetingItems(workMeetingDetail, "讨论要点", array(report, "topics"), meeting, timeline, false);
+            meetingItems(workMeetingDetail, "已确认决策", array(report, "decisions"), meeting, timeline, false);
+            meetingItems(workMeetingDetail, "行动待办", array(report, "tasks"), meeting, timeline, true);
+            meetingItems(workMeetingDetail, "待确认事项", array(report, "open_questions"), meeting, timeline, false);
+            meetingMarks(meeting, timeline);
         } else label(workMeetingDetail, "原文可以先看，AI 整理完成后这里会自动更新。", 14, MUTED);
         String summaryStatus = meeting.optString("summary_status");
         if ("recording".equals(meeting.optString("status")) && (session == null || !openWorkMeetingId.equals(session.workMeetingId()))) {
@@ -843,21 +879,150 @@ public final class MainActivity extends Activity {
                 });
             });
     }
-    private void meetingItems(LinearLayout parent, String title, JSONArray items, JSONArray sources, boolean tasks) {
+    private void meetingItems(LinearLayout parent, String title, JSONArray items, JSONObject meeting, MeetingTimeline timeline, boolean tasks) {
         label(parent, title, 16, INK);
         if (items.length() == 0) label(parent, "暂无明确记录", 13, MUTED);
         for (int i = 0; i < items.length(); i++) {
             JSONObject item = items.optJSONObject(i); if (item == null) continue;
             label(parent, "• " + item.optString(tasks ? "content" : "text"), 14, INK).setTextIsSelectable(true);
-            if (tasks) label(parent, "负责人：" + fallback(item.optString("owner"), "待确认") + " · 截止：" + fallback(item.optString("due"), "待确认"), 12, MUTED);
+            if (tasks) label(parent, "负责人：" + fallback(item.optString("owner"), "未明确") + " · 截止：" + fallback(item.optString("due"), "未提及"), 12, MUTED);
             JSONArray ids = array(item, "source_ids");
-            LinearLayout evidence = disclosure(parent, "查看原文依据", "", false);
-            for (int j = 0; j < sources.length(); j++) {
-                JSONObject source = sources.optJSONObject(j); if (source == null) continue;
-                for (int k = 0; k < ids.length(); k++) if (source.optString("id").equals(ids.optString(k)))
-                    label(evidence, source.optString("text"), 13, MUTED).setTextIsSelectable(true);
+            LinearLayout evidence = disclosure(parent, "查看原文依据", ids.length() + " 处 · 点击跳到原文", false);
+            for (int k = 0; k < ids.length(); k++) {
+                MeetingTimeline.Entry cited = timeline.sentence(ids.optString(k));
+                if (cited == null) continue;
+                LinearLayout citation = row(); evidence.addView(citation);
+                TextView line = label(citation, "[" + TimeFormat.clock(cited.startMs) + "] " + cited.text + "  →", 13, ACCENT);
+                line.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
+                line.setMinHeight(dp(44)); line.setFocusable(true); line.setContentDescription("跳到原文 " + TimeFormat.clock(cited.startMs) + "，" + cited.text);
+                line.setOnClickListener(v -> jumpToSentence(meeting, cited.id));
+                if (MeetingTimeline.audioPlayable(meeting)) playFromHere(citation, meeting, cited.startMs, timeline, cited.id);
             }
         }
+    }
+    private void meetingMarks(JSONObject meeting, MeetingTimeline timeline) {
+        label(workMeetingDetail, "我的标记", 16, INK);
+        if (timeline.marks().isEmpty()) { label(workMeetingDetail, "录音时点“标记重点”，这里会列出标记时刻的原文", 13, MUTED); return; }
+        for (MeetingTimeline.Entry mark : timeline.marks()) {
+            MeetingTimeline.Entry at = timeline.sentenceAt(mark.startMs);
+            LinearLayout markRow = row(); workMeetingDetail.addView(markRow);
+            TextView line = label(markRow, "★ " + TimeFormat.clock(mark.startMs) + (at == null ? " · 该时刻没有识别到讲话" : " · " + at.text + "  →"), 14, at == null ? MUTED : ACCENT);
+            line.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
+            if (at != null) { line.setMinHeight(dp(44)); line.setFocusable(true); line.setOnClickListener(v -> jumpToSentence(meeting, at.id)); }
+            // Start at the sentence being spoken when marked, so the moment is heard in context.
+            if (MeetingTimeline.audioPlayable(meeting))
+                playFromHere(markRow, meeting, at == null ? mark.startMs : Math.min(mark.startMs, at.startMs), timeline, at == null ? null : at.id);
+        }
+    }
+    /** Citations open the original-text tab scrolled to, and highlighting, the cited sentence. */
+    private void jumpToSentence(JSONObject meeting, String sentenceId) {
+        workMeetingJumpId = sentenceId; workMeetingShowOriginal = true; workMeetingDetailSnapshot = "";
+        renderWorkMeetingDetail(meeting);
+    }
+    private void workMeetingAudio(JSONObject meeting) {
+        JSONObject audio = meeting.optJSONObject("audio"); if (audio == null) return;
+        String status = audio.optString("status");
+        String text = "saved".equals(status) || "partial".equals(status)
+            ? ("partial".equals(status) ? "录音部分已保存" : "录音已保存") + " · " + String.format(java.util.Locale.ROOT, "%.1f MB", audio.optLong("bytes") / 1048576.0)
+                + (audio.isNull("expires_at") ? " · 结束后开始计算保存期限" : " · 保存至 " + date(audio.optString("expires_at")))
+            : "expired".equals(status) ? "录音已过保存期限并删除；文字原文保留" : "deleted".equals(status) ? "录音已删除；文字原文保留"
+            : "未保存录音（保存期限设为不保存，或录音保存失败）";
+        label(workMeetingDetail, text, 12, MUTED);
+        if (MeetingTimeline.audioPlayable(meeting)) {
+            workMeetingPlayer = column(); workMeetingDetail.addView(workMeetingPlayer);
+            renderMeetingPlayer(meeting.optString("id"));
+        }
+        if (("saved".equals(status) || "partial".equals(status)) && !"recording".equals(meeting.optString("status")))
+            small(workMeetingDetail, "删除本场录音（保留文字）", () -> confirm("删除本场录音", "录音删除后无法恢复，文字原文与纪要会保留。", () -> {
+                if (meeting.optString("id").equals(meetingPlayback.meetingId())) meetingPlayback.stop();
+                request(() -> api.json("DELETE", "/v1/work-meetings/" + Uri.encode(meeting.optString("id")) + "/audio", null), r -> {
+                    workMeetingDetailSnapshot = ""; renderWorkMeetingDetail(r);
+                });
+            }));
+    }
+    /** Meeting audio plays only on the verified headset and never alongside a capture or call. */
+    private boolean canPlayMeetingAudio() {
+        if (session != null || repeatArmed || callStartPending) {
+            feedback("录音或通话进行中，结束后再播放会议录音", null); return false;
+        }
+        HeadsetController.Snapshot snapshot = headset.snapshot();
+        if (!snapshot.ready()) { feedback("请先连接耳机；会议录音只在已核验的耳机中播放", null); return false; }
+        if (snapshot.inCall || getSystemService(android.media.AudioManager.class).getMode() != android.media.AudioManager.MODE_NORMAL) {
+            feedback("手机通话结束后再播放会议录音", null); return false;
+        }
+        return true;
+    }
+    private void playMeetingAudio(String meetingId, long startMs, MeetingTimeline timeline) {
+        if (!canAct() || !canPlayMeetingAudio()) return;
+        if (quickFeedback != null) quickFeedback.stop();
+        meetingPlayback.play(api, meetingId, startMs, timeline.audioEndMs());
+    }
+    /** "Play from here" beside a sentence; citations and marks also open the original text at it. */
+    private void playFromHere(LinearLayout parent, JSONObject meeting, long startMs, MeetingTimeline timeline, String jumpId) {
+        TextView v = label(parent, "从这里播放", 12, ACCENT);
+        v.setGravity(Gravity.CENTER); v.setMinHeight(dp(48)); v.setPadding(dp(8), dp(4), dp(2), dp(4));
+        v.setBackground(ripple(Color.TRANSPARENT, 12, Color.TRANSPARENT)); v.setFocusable(true);
+        v.setContentDescription("从 " + TimeFormat.clock(startMs) + " 播放会议录音");
+        v.setOnClickListener(w -> {
+            playMeetingAudio(meeting.optString("id"), startMs, timeline);
+            if (jumpId != null && meetingPlayback.active()) jumpToSentence(meeting, jumpId);
+        });
+    }
+    private void renderMeetingPlayer(String meetingId) {
+        LinearLayout bar = workMeetingPlayer; if (bar == null) return;
+        bar.removeAllViews(); workMeetingPlayerStatus = null;
+        boolean ours = meetingId.equals(meetingPlayback.meetingId());
+        MeetingPlayback.State playback = ours ? meetingPlayback.state() : MeetingPlayback.State.IDLE;
+        if (playback == MeetingPlayback.State.IDLE) {
+            String error = ours ? meetingPlayback.error() : "";
+            label(bar, error.isEmpty() ? "点句子旁的“从这里播放”收听录音；只在已连接的耳机中播放。" : "录音播放已停止：" + error, 12, error.isEmpty() ? MUTED : RED);
+            MeetingTimeline timeline = workMeetingTimeline;
+            if (timeline != null) small(bar, "▶ 从头播放录音", () -> playMeetingAudio(meetingId, 0, timeline));
+            return;
+        }
+        workMeetingPlayerStatus = label(bar, meetingPlayerText(), 13, WORK);
+        LinearLayout controls = row(); bar.addView(controls);
+        button(controls, playback == MeetingPlayback.State.PAUSED ? "继续播放" : "暂停", false, () -> {
+            if (meetingPlayback.state() == MeetingPlayback.State.PAUSED) { if (canAct() && canPlayMeetingAudio()) meetingPlayback.resume(api); }
+            else meetingPlayback.pause();
+        });
+        button(controls, "停止", false, meetingPlayback::stop);
+    }
+    private String meetingPlayerText() {
+        String at = TimeFormat.clock(meetingPlayback.positionMs());
+        String notice = meetingPlayback.notice().isEmpty() ? "" : " · " + meetingPlayback.notice();
+        switch (meetingPlayback.state()) {
+            case LOADING: return "正在连接耳机并加载录音 · " + at + notice;
+            case PLAYING: return "正在播放 " + at + notice;
+            case PAUSED: return "已暂停于 " + at;
+            default: return "";
+        }
+    }
+    private void meetingPlaybackChanged() {
+        handler.removeCallbacks(workMeetingPlaybackTick);
+        // Rebuild only the control bar; the transcript keeps its scroll position.
+        renderMeetingPlayer(openWorkMeetingId);
+        updateMeetingHighlight();
+        if (meetingPlayback.active()) handler.postDelayed(workMeetingPlaybackTick, 250);
+    }
+    private void tickMeetingPlayback() {
+        if (workMeetingPlayerStatus != null) workMeetingPlayerStatus.setText(meetingPlayerText());
+        updateMeetingHighlight();
+        if (meetingPlayback.active()) handler.postDelayed(workMeetingPlaybackTick, 250);
+    }
+    private void updateMeetingHighlight() {
+        MeetingTimeline timeline = workMeetingTimeline;
+        String id = "";
+        if (timeline != null && meetingPlayback.state() != MeetingPlayback.State.IDLE && meetingPlayback.meetingId().equals(openWorkMeetingId)) {
+            MeetingTimeline.Entry playing = timeline.sentencePlaying(meetingPlayback.positionMs());
+            if (playing != null) id = playing.id;
+        }
+        if (id.equals(workMeetingPlayingId)) return;
+        TextView previous = workMeetingLines.get(workMeetingPlayingId);
+        if (previous != null) previous.setBackground(null);
+        workMeetingPlayingId = id;
+        TextView current = workMeetingLines.get(id);
+        if (current != null) current.setBackground(shape(0xffdde8fb, 8, WORK));
     }
     private void work() {
         pageHeading("工作");
@@ -878,8 +1043,32 @@ public final class MainActivity extends Activity {
             if (session != null && sessionUsesCapture && "work".equals(mode())) endVoice();
             else if (canAct()) { if ("work".equals(mode())) startVoice(); else changeMode("work"); }
         });
+        if (recordingMeeting && !session.workMeetingId().isEmpty() && !session.workSaving()) {
+            HostedSession active = session;
+            workClock = label(intro, active.workPaused() ? "已暂停于 " + TimeFormat.clock(active.workOffsetMs()) + " · 暂停期间不记录、不上传"
+                : "已记录 " + TimeFormat.clock(active.workOffsetMs()) + (active.workMarks() > 0 ? " · 已标记 " + active.workMarks() + " 处" : ""), 12, WORK);
+            workClock.setGravity(Gravity.CENTER);
+            LinearLayout controls = row(); intro.addView(controls);
+            button(controls, active.workPaused() ? "继续记录" : "暂停", false, () -> {
+                if (session != active) return;
+                if (active.workPaused() ? active.resumeWork() : active.pauseWork()) showApp();
+            });
+            button(controls, "标记重点", false, () -> {
+                if (session != active) return;
+                if (active.markWork("app")) { feedback("已标记 " + TimeFormat.clock(active.workOffsetMs()), null); showApp(); }
+            });
+        }
         label(intro, "结束后自动保存原文，再由 AI 整理摘要、决策与待办", 11, MUTED).setGravity(Gravity.CENTER);
-        sectionHeader(page, "会议记录", "每次录音独立保存 · 处理进度自动更新", "", null);
+        int retention = settings().optInt("work_audio_retention_days", 30);
+        sectionHeader(page, "会议记录", "每次录音独立保存 · 处理进度自动更新",
+            retention == 0 ? "录音：不保存" : "录音保存 " + retention + " 天", () -> {
+            if (!canAct()) return;
+            String[] options = {"不保存录音（只保留文字）", "保存 7 天", "保存 30 天", "保存 90 天", "保存 365 天"}; int[] days = {0, 7, 30, 90, 365};
+            new AlertDialog.Builder(this).setTitle("会议录音保存期限")
+                .setItems(options, (d, w) -> { JSONObject payload = cloneJson(settings()); put(payload, "work_audio_retention_days", days[w]); mutate("PUT", "/v1/settings", payload); })
+                .setNegativeButton("取消", null).show();
+        });
+        label(page, "录音按账号保存在服务器，到期自动删除；缩短期限会立即删除超期录音。文字原文与纪要不受影响。", 11, MUTED);
         workMeetingList = column(); page.addView(workMeetingList); renderWorkMeetings();
         sectionHeader(page, "历史记录整理", "按时间范围整理较早的工作记录", "选择范围", () -> {
             if (!canAct()) return;
@@ -1395,7 +1584,7 @@ public final class MainActivity extends Activity {
     private void endVoice() {
         if ("work".equals(mode()) && session != null && sessionUsesCapture) {
             stopRepeat(); session.stopRecording(); lastNotice = "正在结束并保存工作记录…"; updateStatus();
-            if (visible && tab != 2) { tab = 2; showApp(); }
+            if (visible) { tab = 2; showApp(); }  // Also hides pause/mark controls while saving.
             renderWorkMeetings();
         } else cancelSession("会话已结束，单击可重新开始");
     }
@@ -1483,6 +1672,8 @@ public final class MainActivity extends Activity {
     private void newSession() { newSession(null); }
     private void newSession(String operationNotice) {
         if (quickFeedback != null) quickFeedback.stop();
+        // A recording or call owns the headset: release meeting playback before capture starts.
+        if (meetingPlayback != null) meetingPlayback.stop();
         final boolean operationCue = operationNotice != null;
         final long generation = ++sessionGeneration;
         final int submittedInteraction = listenMode;
@@ -1536,8 +1727,11 @@ public final class MainActivity extends Activity {
             @Override public void reply(String text) { if (!currentSession(generation)) return; liveReplyText = text; recording = false; if (liveWords != null) liveWords.setText(text); if (!operationCue && conversationFeed.reply(text)) renderLiveTurn(); if (voiceButton != null) voiceButton.setText("结束会话"); if (callCaption != null) callCaption.setText("正在回答 · 说“小万”可打断 · 单击结束通话"); }
             @Override public void processing() { if (!currentSession(generation)) return; recording = false; if (voiceButton != null) voiceButton.setText(submittedInteraction == VoiceInteraction.NOTES ? "正在保存…" : "结束会话"); if (callCaption != null) callCaption.setText(submittedInteraction == VoiceInteraction.NOTES ? "正在保存工作记录" : "正在思考 · 单击结束会话"); }
             @Override public void idle() { if (!currentSession(generation)) return; turnSucceeded = listenMode == VoiceInteraction.CALL; if (!turnSucceeded) stopRepeat(); uncertainTurnId = ""; }
-            @Override public void recording() { if (!currentSession(generation)) return; recording = true; if (voiceButton != null) voiceButton.setText(listenMode == VoiceInteraction.NOTES ? "结束并保存记录" : "结束会话"); if (callCaption != null) callCaption.setText(InteractionCopy.recording(listenMode, settings().optBoolean("vad_enabled", true))); setStatusText("正在听你说…"); }
-            @Override public void meter(long bytes, double rms) { if (currentSession(generation)) { diagnosticBytes = bytes; diagnosticRms = rms; renderDiagnostics(); if (orb != null) orb.level = (float) Math.min(1, rms * 9); } }
+            @Override public void recording() { if (!currentSession(generation)) return; recording = true; if (voiceButton != null) voiceButton.setText(listenMode == VoiceInteraction.NOTES ? "结束并保存记录" : "结束会话"); if (callCaption != null) callCaption.setText(InteractionCopy.recording(listenMode, settings().optBoolean("vad_enabled", true))); setStatusText("正在听你说…");
+                if (listenMode == VoiceInteraction.NOTES && visible && tab == 2) showApp(); }  // Show pause/mark controls.
+            @Override public void meter(long bytes, double rms) { if (currentSession(generation)) { diagnosticBytes = bytes; diagnosticRms = rms; renderDiagnostics(); if (orb != null) orb.level = (float) Math.min(1, rms * 9);
+                if (workClock != null && workClock.isAttachedToWindow() && session != null && !session.workPaused())
+                    workClock.setText("已记录 " + TimeFormat.clock(session.workOffsetMs()) + (session.workMarks() > 0 ? " · 已标记 " + session.workMarks() + " 处" : "")); } }
             @Override public void done() {
                 if (!currentSession(generation)) return;
                 if (session != null && session.isDuplexCall()) stopRepeat();
@@ -1653,12 +1847,12 @@ public final class MainActivity extends Activity {
         handler.removeCallbacks(startupLocationTick);
         handler.removeCallbacks(workMeetingPoll);
         clearVoicePreparation();
-        visible = false; if (quickFeedback != null) quickFeedback.stop(); if (!lockScreenEnabled()) pauseModeChange(); clearHeadsetGesture(); syncHeadsetControls();
+        visible = false; if (quickFeedback != null) quickFeedback.stop(); if (meetingPlayback != null) meetingPlayback.stop(); if (!lockScreenEnabled()) pauseModeChange(); clearHeadsetGesture(); syncHeadsetControls();
         if ((session != null || repeatArmed) && !lockScreenEnabled()) endVoice();
         else if (listenMode != VoiceInteraction.CALL && session != null && sessionUsesCapture) endVoice();
         stopLocation(); super.onPause();
     }
-    @Override protected void onDestroy() { if (quickFeedback != null) quickFeedback.close(); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); super.onDestroy(); }
+    @Override protected void onDestroy() { if (quickFeedback != null) quickFeedback.close(); if (meetingPlayback != null) meetingPlayback.close(); handler.removeCallbacks(workMeetingPlaybackTick); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); super.onDestroy(); }
     @Override public void onBackPressed() { if (session != null) { endVoice(); return; } if (!api.vault.token().isEmpty() && tab != 0) { switchTab(0); return; } if (api.vault.token().isEmpty() && authMode != 0) { showAuth(0); return; } super.onBackPressed(); }
 
     private void syncHeadsetControls() {
@@ -1675,7 +1869,8 @@ public final class MainActivity extends Activity {
             && snapshot.controlsState == HeadsetController.ControlsState.ENABLED, !api.vault.token().isEmpty(), snapshot.ready(),
             snapshot.inCall, busy || permissionPending || locationListener != null, session != null || repeatArmed || callStartPending || modeChange != null || audioPermissionGeneration >= 0, recording,
             WearState.from(snapshot.leftWorn, snapshot.rightWorn) == WearState.REMOVED, deferredMode == null ? mode() : deferredMode, sessionGeneration,
-            session != null && sessionOperationNotice != null, session != null && sessionUsesCapture && session.isReplyPlaying());
+            session != null && sessionOperationNotice != null, session != null && sessionUsesCapture && session.isReplyPlaying(),
+            session != null && sessionUsesCapture && session.workCapturing());
     }
     private void handleHeadsetControl(HeadsetController.ControlEvent event) {
         HeadsetInteractionPolicy.Gesture gesture;
@@ -1710,6 +1905,13 @@ public final class MainActivity extends Activity {
                     break;
                 case STOP_AND_SEND:
                     endVoice();
+                    break;
+                case MARK:
+                    // No earbud cue: the capture owns the headset audio path while recording.
+                    if (session != null && session.markWork("headset")) {
+                        feedback("耳机已标记 " + TimeFormat.clock(session.workOffsetMs()), null);
+                        if (visible && tab == 2) showApp();
+                    }
                     break;
                 case INTERRUPT:
                     if (session != null && sessionUsesCapture) session.interruptReply();
@@ -1928,7 +2130,8 @@ public final class MainActivity extends Activity {
         if (cue != null && quickFeedback != null) quickFeedback.say(cue);
     }
     private boolean canSpeakFeedback() {
-        if (!visible || isDestroyed() || session != null || repeatArmed || callStartPending || headset == null) return false;
+        if (!visible || isDestroyed() || session != null || repeatArmed || callStartPending || headset == null
+            || meetingPlayback != null && meetingPlayback.active()) return false;
         HeadsetController.Snapshot snapshot = headset.snapshot();
         android.media.AudioManager audio = (android.media.AudioManager) getSystemService(AUDIO_SERVICE);
         return snapshot.ready() && !snapshot.inCall

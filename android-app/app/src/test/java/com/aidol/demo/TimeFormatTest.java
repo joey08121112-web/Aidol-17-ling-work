@@ -20,4 +20,10 @@ public class TimeFormatTest {
         assertEquals("", TimeFormat.format("", SHANGHAI));
         assertNull(TimeFormat.format(null, SHANGHAI));
     }
+    @Test public void recordingClockShowsMinutesThenHours() {
+        assertEquals("0:00", TimeFormat.clock(-5));
+        assertEquals("1:05", TimeFormat.clock(65_999));
+        assertEquals("59:59", TimeFormat.clock(3_599_000));
+        assertEquals("1:00:01", TimeFormat.clock(3_601_000));
+    }
 }

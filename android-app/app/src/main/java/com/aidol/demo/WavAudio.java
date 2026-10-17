@@ -1,6 +1,8 @@
 package com.aidol.demo;
 
+import java.io.EOFException;
 import java.io.IOException;
+import java.io.InputStream;
 import java.util.Arrays;
 
 /** Strict RIFF parser: never assumes a fixed WAV header size. */
@@ -30,5 +32,41 @@ public final class WavAudio {
         if(!valid || pcm==null || pcm.length==0 || pcm.length%2!=0 || pcm.length>6*1024*1024)
             throw new IOException("回复音频为空或过长");
         return pcm;
+    }
+
+    /**
+     * Streaming variant for long recordings: consumes the header chunks and leaves the stream at
+     * the first PCM byte. Returns the data chunk length in bytes.
+     */
+    public static long openPcm(InputStream in, int sampleRate) throws IOException {
+        byte[] head = new byte[12];
+        readFully(in, head);
+        if(!tag(head,0,"RIFF") || !tag(head,8,"WAVE")) throw new IOException("会议录音格式不正确");
+        boolean valid=false;
+        byte[] chunk = new byte[8];
+        while(true) {
+            readFully(in, chunk);
+            long n=u32(chunk,4);
+            if(tag(chunk,0,"data")) {
+                if(!valid) throw new IOException("会议录音缺少格式信息");
+                if(n%2!=0) throw new IOException("会议录音不完整");
+                return n;
+            }
+            if(n>65536) throw new IOException("会议录音格式不正确");
+            byte[] body = new byte[(int)(n+(n&1))];
+            readFully(in, body);
+            if(tag(chunk,0,"fmt ")) {
+                if(n<16 || u16(body,0)!=1 || u16(body,2)!=1 || u32(body,4)!=sampleRate || u16(body,14)!=16)
+                    throw new IOException("会议录音采样格式不支持");
+                valid=true;
+            }
+        }
+    }
+    private static void readFully(InputStream in, byte[] buffer) throws IOException {
+        for(int offset=0; offset<buffer.length;) {
+            int count=in.read(buffer,offset,buffer.length-offset);
+            if(count<0) throw new EOFException("会议录音不完整");
+            offset+=count;
+        }
     }
 }

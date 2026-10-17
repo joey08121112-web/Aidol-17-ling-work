@@ -33,4 +33,12 @@ public class WavAudioTest {
         assertThrows(IOException.class,()->WavAudio.pcm(bad));
         assertThrows(IOException.class,()->WavAudio.pcm(new byte[64]));
     }
+    @Test public void streamingHeaderStopsAtTheFirstPcmByte() throws Exception {
+        java.io.InputStream in=new java.io.ByteArrayInputStream(wav(16000,1,true));
+        assertEquals(8,WavAudio.openPcm(in,16000));
+        assertEquals(1,in.read()); // Padded metadata was skipped; the reader continues with PCM.
+        assertThrows(IOException.class,()->WavAudio.openPcm(new java.io.ByteArrayInputStream(wav(24000,1,false)),16000));
+        assertThrows(IOException.class,()->WavAudio.openPcm(new java.io.ByteArrayInputStream(wav(16000,2,false)),16000));
+        assertThrows(IOException.class,()->WavAudio.openPcm(new java.io.ByteArrayInputStream(java.util.Arrays.copyOf(wav(16000,1,false),30)),16000));
+    }
 }

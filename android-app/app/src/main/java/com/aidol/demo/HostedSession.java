@@ -12,6 +12,8 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Predicate;
@@ -127,8 +129,66 @@ public final class HostedSession {
     private WorkAudioBuffer workBuffer;
     private volatile boolean workMeetingStarted;
     private int workSegmentCount;
+    private volatile int workMarks;
+    // Pause/resume/mark receipts are posted in order, off the segment-upload worker.
+    private final ExecutorService workEvents = Executors.newSingleThreadExecutor(r -> new Thread(r, "aidol-work-events"));
     public String workMeetingId() { return workRecording && workMeetingStarted ? sessionId : ""; }
     public boolean workSaving() { return workRecording && workStopping.get(); }
+    public boolean workPaused() { WorkAudioBuffer buffer = workBuffer; return buffer != null && buffer.paused(); }
+    public int workMarks() { return workMarks; }
+    /** Recorded time on the meeting timeline, excluding pauses. */
+    public long workOffsetMs() { WorkAudioBuffer buffer = workBuffer; return buffer == null ? 0 : buffer.offsetMs(); }
+    /** Stop keeping audio; the headset stream stays connected but paused PCM is discarded. */
+    public boolean pauseWork() {
+        WorkAudioBuffer buffer = workBuffer;
+        if (!activeWorkCapture() || buffer == null) return false;
+        try {
+            long offset = buffer.pause();
+            if (offset < 0) return false;
+            postWorkEvent("pause", offset, "app");
+            status("已暂停 · 不记录、不上传；点“继续”恢复");
+            return true;
+        } catch (IOException error) { workFailure(error.getMessage()); return false; }
+    }
+    public boolean resumeWork() {
+        WorkAudioBuffer buffer = workBuffer;
+        if (!activeWorkCapture() || buffer == null) return false;
+        long offset = buffer.resume();
+        if (offset < 0) return false;
+        postWorkEvent("resume", offset, "app");
+        status("已继续记录");
+        return true;
+    }
+    /** @param origin "app" or "headset", stored with the mark. */
+    public boolean markWork(String origin) {
+        WorkAudioBuffer buffer = workBuffer;
+        if (!activeWorkCapture() || buffer == null) return false;
+        workMarks++;
+        postWorkEvent("mark", buffer.offsetMs(), origin);
+        return true;
+    }
+    /** True while double tap should mean "mark": capturing a work meeting, not yet saving. */
+    public boolean workCapturing() { return activeWorkCapture(); }
+    private boolean activeWorkCapture() {
+        return workRecording && workMeetingStarted && captureActive && !workStopping.get() && !cancelled.get();
+    }
+    private void postWorkEvent(String kind, long offsetMs, String origin) {
+        String eventId = UUID.randomUUID().toString();
+        workEvents.execute(() -> {
+            // Same event id on retry: the server stores each pause/resume/mark exactly once.
+            for (int attempt = 0; attempt < 3; attempt++) {
+                try {
+                    api.json("POST", "/v1/work-meetings/" + sessionId + "/events", new JSONObject()
+                        .put("event_id", eventId).put("kind", kind).put("offset_ms", offsetMs).put("origin", origin));
+                    return;
+                } catch (ApiClient.ApiException error) {
+                    if (error.status < 500) break;  // Conflict or ended meeting: retrying cannot help.
+                } catch (Exception ignored) { /* Network: retry below. */ }
+                try { Thread.sleep(1000L * (attempt + 1)); } catch (InterruptedException interrupted) { return; }
+            }
+            status("mark".equals(kind) ? "重点标记未能保存，请检查网络" : "暂停状态未能同步，录音时间轴可能不准确");
+        });
+    }
     public HostedSession workRecording(boolean enabled) {
         if (launched.get()) throw new IllegalStateException("会话已开始");
         workRecording = enabled; return this;
@@ -373,6 +433,9 @@ public final class HostedSession {
             complete = true;
         } finally {
             captureActive = false; capture.close(); releaseCaptureFocus();
+            // Let queued marks/pauses land before finish; the server rejects them afterwards.
+            workEvents.shutdown();
+            try { workEvents.awaitTermination(8, TimeUnit.SECONDS); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
             try {
                 // Closing a deterministic session is idempotent; this never replays PCM.
                 finished = api.json("POST", "/v1/work-meetings/" + sessionId + "/finish",
@@ -417,15 +480,15 @@ public final class HostedSession {
         while (true) {
             check();
             if (failure != null) throw new IOException(failure);
-            byte[] segment = workBuffer.poll();
+            WorkAudioBuffer.Segment segment = workBuffer.poll();
             if (segment != null) {
                 requestId = UUID.randomUUID().toString();
                 String segmentId = requestId; post(() -> listener.submitted(segmentId));
                 int segmentIndex = workSegmentCount++;
                 try {
                     JSONObject result = new JSONObject(new String(request("/v1/voice?request_id=" + segmentId
-                        + "&interaction_source=ambient_capture&meeting_id=" + sessionId + "&segment_index=" + segmentIndex,
-                        segment, "audio/pcm"), StandardCharsets.UTF_8));
+                        + "&interaction_source=ambient_capture&meeting_id=" + sessionId + "&segment_index=" + segmentIndex
+                        + "&offset_ms=" + segment.offsetMs, segment.pcm, "audio/pcm"), StandardCharsets.UTF_8));
                     check();
                     post(() -> { listener.transcript(result.optString("text")); listener.result(result); });
                 } catch (Exception error) {

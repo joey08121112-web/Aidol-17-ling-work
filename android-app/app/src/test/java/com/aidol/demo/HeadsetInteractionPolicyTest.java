@@ -346,4 +346,38 @@ public class HeadsetInteractionPolicyTest {
         assertTrue(policy.device(device(true, false, null, null, 26), false).notices.isEmpty());
         assertEquals(1, policy.device(device(true, false, null, null, 20), false).notices.size());
     }
+
+    private static HeadsetInteractionPolicy.Context workMeeting(boolean capturing, long generation) {
+        return new HeadsetInteractionPolicy.Context(true, true, true, true, false, false, true, true, false, "work",
+            generation, false, false, capturing);
+    }
+
+    @Test public void doubleTapWhileWorkMeetingRecordsMarksInsteadOfSwitchingMode() {
+        HeadsetInteractionPolicy policy = new HeadsetInteractionPolicy();
+        policy.event(TOGGLE, 1, 1000, 1000, workMeeting(true, 3));      // Would stop if left alone.
+        assertTrue(policy.event(NEXT_MODE, 2, 1200, 1200, workMeeting(true, 3)).actions.isEmpty());
+        assertTrue(policy.flush(1599, workMeeting(true, 3)).actions.isEmpty());
+        HeadsetInteractionPolicy.Decision decision = policy.flush(1600, workMeeting(true, 3));
+        assertEquals(Arrays.asList(MARK), decision.actions);
+        assertNull(decision.mode);
+        assertFalse(policy.hasPending());
+        // A second mark is allowed once the debounce window has passed.
+        policy.event(NEXT_MODE, 3, 2500, 2500, workMeeting(true, 3));
+        assertEquals(Arrays.asList(MARK), policy.flush(2900, workMeeting(true, 3)).actions);
+    }
+
+    @Test public void pendingMarkIsDroppedOnceSavingBeginsOrByTripleTapAndIdleWorkStillSwitchesMode() {
+        HeadsetInteractionPolicy policy = new HeadsetInteractionPolicy();
+        policy.event(NEXT_MODE, 1, 1000, 1000, workMeeting(true, 3));
+        assertTrue(policy.flush(1400, workMeeting(false, 3)).actions.isEmpty());   // Saving: neither mark nor switch.
+        policy.event(NEXT_MODE, 2, 2000, 2000, workMeeting(true, 3));
+        policy.event(HeadsetInteractionPolicy.Gesture.DISCARD_COMBINATION, 3, 2100, 2100, workMeeting(true, 3));
+        assertTrue(policy.flush(2400, workMeeting(true, 3)).actions.isEmpty());
+        HeadsetInteractionPolicy.Context idleWork = new HeadsetInteractionPolicy.Context(
+            true, true, true, true, false, false, false, false, false, "work", 3, false, false, false);
+        policy.event(NEXT_MODE, 4, 3000, 3000, idleWork);
+        HeadsetInteractionPolicy.Decision decision = policy.flush(3400, idleWork);
+        assertEquals(Arrays.asList(CHANGE_MODE), decision.actions);
+        assertEquals("commute", decision.mode);
+    }
 }

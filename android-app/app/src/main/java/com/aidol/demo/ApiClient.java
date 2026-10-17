@@ -33,6 +33,8 @@ public final class ApiClient {
         private final OkHttpClient safeReads = mutations.newBuilder().retryOnConnectionFailure(true).build();
         private final OkHttpClient liveSockets = mutations.newBuilder().readTimeout(0, TimeUnit.SECONDS)
             .callTimeout(0, TimeUnit.SECONDS).pingInterval(20, TimeUnit.SECONDS).build();
+        // Media bodies are read at playback speed, so only the per-read timeout applies.
+        private final OkHttpClient mediaReads = safeReads.newBuilder().callTimeout(0, TimeUnit.SECONDS).build();
         HttpTransport() { this(false); }
         HttpTransport(boolean freshConnections) { this.freshConnections = freshConnections; }
         Call call(Request request) {
@@ -41,6 +43,10 @@ public final class ApiClient {
             if (freshConnections) request = request.newBuilder().header("Connection", "close").build();
             boolean readOnly = request.method().equals("GET") || request.method().equals("HEAD");
             return (readOnly ? safeReads : mutations).newCall(request);
+        }
+        Call media(Request request) {
+            if (freshConnections) request = request.newBuilder().header("Connection", "close").build();
+            return mediaReads.newCall(request);
         }
         WebSocket socket(Request request, WebSocketListener listener) {
             return liveSockets.newWebSocket(request, listener);
@@ -80,6 +86,31 @@ public final class ApiClient {
         if (!token.isEmpty()) builder.header("Authorization", "Bearer " + token);
         return transport.call(builder.build());
     }
+    /** An authenticated GET whose body may stream for minutes (meeting audio). */
+    public Call mediaCall(String path) {
+        Request.Builder builder = new Request.Builder().url(serverUrl + path).get();
+        String token = vault.token();
+        if (!token.isEmpty()) builder.header("Authorization", "Bearer " + token);
+        return transport.media(builder.build());
+    }
+    /** Like execute, but hands the open body to the caller, who must close the response. */
+    public Response open(Call call) throws IOException {
+        String operation = operation(call);
+        diagnostics.accept(operation + " · 请求中");
+        Response response;
+        try { response = call.execute(); }
+        catch (IOException e) {
+            diagnostics.accept(operation + " · " + (call.isCanceled() ? "已取消" : "网络失败：" + e.getClass().getSimpleName()));
+            throw transportFailure(call, e);
+        }
+        diagnostics.accept(operation + " · HTTP " + response.code());
+        if (response.isSuccessful() && response.body() != null) return response;
+        try (Response failed = response) {
+            String detail = "服务暂不可用（" + failed.code() + "）";
+            try { detail = new JSONObject(failed.body().string()).optString("detail", detail); } catch (Exception ignored) {}
+            throw new ApiException(failed.code(), detail);
+        }
+    }
     public byte[] bytes(String method, String path, byte[] body, String contentType) throws Exception {
         return execute(call(method, path, body, contentType));
     }
@@ -88,10 +119,7 @@ public final class ApiClient {
             .header("Authorization", "Bearer " + vault.token()).build(), listener);
     }
     public byte[] execute(Call call) throws Exception {
-        // Only method/path/status: never log credentials, query strings or bodies.
-        String correlation = call.request().header("X-Aidol-Request-ID");
-        String operation = call.request().method() + " " + call.request().url().encodedPath()
-            + (correlation == null ? "" : " · request_id=" + correlation);
+        String operation = operation(call);
         diagnostics.accept(operation + " · 请求中");
         try (Response response = call.execute()) {
             diagnostics.accept(operation + " · HTTP " + response.code());
@@ -107,6 +135,12 @@ public final class ApiClient {
             if (!(e instanceof ApiException)) diagnostics.accept(operation + " · " + (call.isCanceled() ? "已取消" : "网络失败：" + e.getClass().getSimpleName()));
             throw transportFailure(call, e);
         }
+    }
+    private static String operation(Call call) {
+        // Only method/path/status: never log credentials, query strings or bodies.
+        String correlation = call.request().header("X-Aidol-Request-ID");
+        return call.request().method() + " " + call.request().url().encodedPath()
+            + (correlation == null ? "" : " · request_id=" + correlation);
     }
     static IOException transportFailure(Call call, IOException cause) {
         if (cause instanceof ApiException) return cause;

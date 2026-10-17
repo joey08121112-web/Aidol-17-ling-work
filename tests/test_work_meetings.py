@@ -242,3 +242,147 @@ async def test_minutes_model_payload_and_unsupported_citations_fall_back_to_visi
     output['tasks'][0]['owner'] = '小林'
     output['open_questions'][0]['source_ids'] = ['other-meeting']
     assert (await WorkMeetingMinutes(config).generate(rows))['extraction'] == 'rules_fallback'
+
+
+@pytest.fixture
+def timed(work, monkeypatch):
+    """ASR that reports two timed sentences per segment, like Volc show_utterances."""
+    client, runtime, words, calls = work
+
+    async def transcribe(chunks):
+        async for _ in chunks:
+            pass
+        yield AsrResult('先说预算。再定排期。', final=True, utterances=(
+            {'text': '先说预算。', 'start_time': 200, 'end_time': 900},
+            {'text': '再定排期。', 'start_time': 1100, 'end_time': 99999},  # Clamped to the segment.
+            {'text': '', 'start_time': 0, 'end_time': 10}))
+
+    monkeypatch.setattr(client.app.state.speech, 'stream_asr', transcribe)
+    return client, runtime, calls
+
+
+def pcm_upload(client, meeting_id, index, pcm, offset_ms=None, request_id=None):
+    params = {'request_id': request_id or uuid4().hex, 'meeting_id': meeting_id, 'segment_index': index}
+    if offset_ms is not None:
+        params['offset_ms'] = offset_ms
+    return client.post('/v1/voice', params=params, content=pcm, headers={'Content-Type': 'audio/pcm'})
+
+
+def test_sentences_carry_meeting_timeline_times_and_minutes_cite_them(timed):
+    client, runtime, calls = timed
+    meeting_id = start(client)
+    # A pause flushed a 2 s segment, so the next segment starts at 2000 ms, not 20000 ms.
+    assert pcm_upload(client, meeting_id, 0, b'\1\0' * 32000, offset_ms=0).status_code == 200
+    assert pcm_upload(client, meeting_id, 1, b'\2\0' * 32000, offset_ms=2000).status_code == 200
+    detail = finish(client, meeting_id, 2)
+    assert [(u['start_ms'], u['end_ms'], u['text']) for u in detail['utterances']] == [
+        (200, 900, '先说预算。'), (1100, 2000, '再定排期。'), (2200, 2900, '先说预算。'), (3100, 4000, '再定排期。')]
+    first = detail['sources'][0]
+    assert detail['utterances'][0]['id'] == first['id'] + '.0'
+    assert [s['offset_ms'] for s in detail['sources']] == [0, 2000]
+    # The model receives one row per sentence; its citations are sentence ids.
+    assert [row['id'] for row in calls[0]] == [u['id'] for u in detail['utterances']]
+    report = client.get('/v1/work-meetings/' + meeting_id).json()['report']
+    assert report['decisions'][0]['source_ids'][0] == first['id'] + '.0'
+    assert client.get('/v1/work-meetings').json()['meetings'][0]['duration_ms'] == 4000
+
+
+def test_old_clients_without_offsets_and_untimed_asr_still_get_times(work):
+    client, runtime, words, calls = work
+    meeting_id = start(client)
+    upload(client, meeting_id, 0)
+    upload(client, meeting_id, 1)
+    detail = finish(client, meeting_id, 2)
+    assert [(u['start_ms'], u['end_ms'], u['text']) for u in detail['utterances']] == [
+        (0, 100, words[0]), (20000, 20100, words[0])]
+    assert client.post('/v1/voice', params={'request_id': uuid4().hex, 'offset_ms': 0},
+                       content=b'\0' * 3200, headers={'Content-Type': 'audio/pcm'}).status_code == 422
+
+
+def test_audio_is_kept_per_account_assembled_by_offset_and_deletable(timed):
+    client, runtime, calls = timed
+    meeting_id = start(client)
+    pcm_upload(client, meeting_id, 0, b'\1\0' * 16000, offset_ms=0)       # 1000 ms
+    pcm_upload(client, meeting_id, 1, b'\2\0' * 16000, offset_ms=1000)    # 1000 ms
+    detail = finish(client, meeting_id, 2)
+    assert detail['audio']['status'] == 'saved' and detail['audio']['bytes'] == 64000
+    assert detail['audio']['retention_days'] == 30 and detail['audio']['expires_at']
+    folder = runtime.store.audio_root / meeting_id
+    assert sorted(p.name for p in folder.iterdir()) == ['000000.pcm', '000001.pcm']
+    clip = client.get('/v1/work-meetings/' + meeting_id + '/audio', params={'start_ms': 900, 'duration_ms': 200})
+    assert clip.status_code == 200 and clip.headers['content-type'] == 'audio/wav'
+    body = clip.content[44:]
+    assert body == b'\1\0' * 1600 + b'\2\0' * 1600  # 100 ms from each segment.
+    whole = client.get('/v1/work-meetings/' + meeting_id + '/audio').content[44:]
+    assert len(whole) == 64000  # Clipped to the saved audio, not the 10-minute window.
+
+    other = client.post('/auth/register', json={'username': 'other2', 'password': 'test'}).json()
+    headers = {'Authorization': 'Bearer ' + other['token']}
+    assert client.get('/v1/work-meetings/' + meeting_id + '/audio', headers=headers).status_code == 404
+    assert client.delete('/v1/work-meetings/' + meeting_id + '/audio', headers=headers).status_code == 404
+
+    deleted = client.delete('/v1/work-meetings/' + meeting_id + '/audio')
+    assert deleted.status_code == 200 and deleted.json()['audio']['status'] == 'deleted'
+    assert not folder.exists()
+    assert deleted.json()['utterances'], 'text survives audio deletion'
+    assert client.get('/v1/work-meetings/' + meeting_id + '/audio').status_code == 404
+
+
+def test_retention_zero_stores_nothing_and_expiry_purges_files(timed):
+    client, runtime, calls = timed
+    settings = client.get('/v1/state').json()['settings']
+    kept = start(client)
+    pcm_upload(client, kept, 0, b'\1\0' * 16000, offset_ms=0)
+    finish(client, kept, 1)
+    with runtime.store.connect() as db:  # Ended long ago.
+        db.execute("UPDATE work_meetings SET ended_at='2026-01-01T00:00:00+00:00' WHERE id=?", (kept,))
+    assert client.get('/v1/work-meetings/' + kept).json()['audio']['status'] == 'expired'
+    assert not (runtime.store.audio_root / kept).exists()
+
+    settings['work_audio_retention_days'] = 0
+    assert client.put('/v1/settings', json=settings).status_code == 200
+    none = start(client)
+    pcm_upload(client, none, 0, b'\1\0' * 16000, offset_ms=0)
+    assert finish(client, none, 1)['audio']['status'] == 'none'
+    assert not (runtime.store.audio_root / none).exists()
+    settings['work_audio_retention_days'] = 366
+    assert client.put('/v1/settings', json=settings).status_code == 422
+
+
+def test_clearing_data_removes_meeting_audio(timed):
+    client, runtime, calls = timed
+    meeting_id = start(client)
+    pcm_upload(client, meeting_id, 0, b'\1\0' * 16000, offset_ms=0)
+    assert (runtime.store.audio_root / meeting_id).exists()
+    assert client.request('DELETE', '/v1/data', json={'password': 'test-password-123'}).status_code == 200
+    assert not runtime.store.audio_root.exists()
+
+
+def test_pause_resume_and_marks_are_idempotent_and_only_while_recording(work):
+    client, runtime, words, calls = work
+    meeting_id = start(client)
+    url = '/v1/work-meetings/' + meeting_id + '/events'
+    pause = {'event_id': uuid4().hex, 'kind': 'pause', 'offset_ms': 5000}
+    assert client.post(url, json=pause).status_code == 200
+    assert client.post(url, json=pause).json()['kind'] == 'pause'  # Retry of the same event.
+    assert client.post(url, json={**pause, 'event_id': uuid4().hex}).status_code == 409  # Already paused.
+    assert client.post(url, json={**pause, 'offset_ms': 1}).status_code == 409  # Reused id, other content.
+    mark = {'event_id': uuid4().hex, 'kind': 'mark', 'offset_ms': 5000, 'origin': 'headset'}
+    assert client.post(url, json=mark).status_code == 200
+    assert client.post(url, json={'event_id': uuid4().hex, 'kind': 'resume', 'offset_ms': 5000}).status_code == 200
+    assert client.post(url, json={'event_id': uuid4().hex, 'kind': 'resume', 'offset_ms': 5000}).status_code == 409
+    assert client.post(url, json={'event_id': uuid4().hex, 'kind': 'note', 'offset_ms': 1}).status_code == 422
+    upload(client, meeting_id)
+    detail = finish(client, meeting_id)
+    assert [e['kind'] for e in detail['events']] == ['pause', 'mark', 'resume']
+    assert detail['events'][1]['origin'] == 'headset'
+    assert client.post(url, json={**mark, 'event_id': uuid4().hex}).status_code == 409
+    assert client.post('/v1/work-meetings/' + uuid4().hex + '/events', json=mark).status_code == 404
+    # Marks do not wait for the account lock held by an in-flight segment ASR.
+    second = start(client)
+    client.portal.call(runtime.lock.acquire)
+    try:
+        assert client.post('/v1/work-meetings/' + second + '/events',
+                           json={**mark, 'event_id': uuid4().hex}).status_code == 200
+    finally:
+        client.portal.call(runtime.lock.release)

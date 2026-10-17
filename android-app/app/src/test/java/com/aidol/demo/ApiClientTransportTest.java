@@ -161,4 +161,19 @@ public class ApiClientTransportTest {
             } finally { transport.closeForTest(); }
         }
     }
+
+    @Test public void meetingAudioStreamsWithoutAWholeCallDeadline() throws Exception {
+        ApiClient.HttpTransport transport = new ApiClient.HttpTransport(true);
+        try (MockWebServer server = new MockWebServer()) {
+            server.start();
+            // A 10-minute window is read at playback speed, far beyond the 120 s call timeout.
+            Call media = transport.media(request(server, "GET", "/v1/work-meetings/m/audio?start_ms=0&duration_ms=600000"));
+            assertEquals(0, media.timeout().timeoutNanos());
+            assertTrue(transport.call(request(server, "GET", "/v1/state")).timeout().timeoutNanos() > 0);
+            server.enqueue(new MockResponse().setBody("wav"));
+            try (Response response = media.execute()) { assertEquals("wav", response.body().string()); }
+            RecordedRequest received = server.takeRequest(2, TimeUnit.SECONDS);
+            assertEquals("GET", received.getMethod()); assertEquals("close", received.getHeader("Connection"));
+        } finally { transport.closeForTest(); }
+    }
 }

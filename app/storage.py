@@ -1,8 +1,10 @@
 """SQLite persistence. One connection per transaction; no shared mutable cursor."""
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
+import os
 from pathlib import Path
+import shutil
 import sqlite3
 import time
 import re
@@ -17,9 +19,34 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
+WORK_SEGMENT_MS = 20000  # Older clients cut fixed 20 s segments and send no offset.
+PCM_BYTES_PER_MS = 32    # 16 kHz mono PCM16.
+
+
+def _utterance_rows(transcript_id, offset_ms, duration_ms, text, utterances):
+    """Normalise ASR sentences onto the meeting timeline; fall back to one segment-wide sentence."""
+    rows = []
+    for item in utterances or ():
+        if not isinstance(item, dict):
+            continue
+        body, start, end = str(item.get('text') or '').strip(), item.get('start_time'), item.get('end_time')
+        if not body or type(start) is not int or type(end) is not int or start < 0 or end < start:
+            continue
+        if duration_ms:
+            start, end = min(start, duration_ms), min(end, duration_ms)
+        rows.append((start, end, body))
+    if not rows:
+        rows = [(0, duration_ms, text.strip())]
+    rows.sort(key=lambda row: row[0])
+    return [(f'{transcript_id}.{ordinal}', ordinal, offset_ms + start, offset_ms + end, body)
+            for ordinal, (start, end, body) in enumerate(rows)]
+
+
 class Store:
     def __init__(self, path: str):
         self.path = path
+        # users/<uuid>.sqlite3 keeps its meeting audio in users/<uuid>/work-audio/<meeting>/.
+        self.audio_root = Path(path).with_suffix('') / 'work-audio'
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
             db.executescript("""
@@ -83,6 +110,20 @@ class Store:
                     db.execute(f'ALTER TABLE work_meetings ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0')
             if 'summary_stage' not in meeting_columns:
                 db.execute("ALTER TABLE work_meetings ADD COLUMN summary_stage TEXT NOT NULL DEFAULT 'waiting'")
+            if 'audio_status' not in meeting_columns:
+                db.execute("ALTER TABLE work_meetings ADD COLUMN audio_status TEXT NOT NULL DEFAULT 'none'")
+            segment_columns = {row['name'] for row in db.execute('PRAGMA table_info(work_meeting_segments)')}
+            for name, ddl in (('offset_ms', 'INTEGER'), ('duration_ms', 'INTEGER NOT NULL DEFAULT 0'),
+                              ('audio_bytes', 'INTEGER NOT NULL DEFAULT 0')):
+                if name not in segment_columns:
+                    db.execute(f'ALTER TABLE work_meeting_segments ADD COLUMN {name} {ddl}')
+            # Sentence times are milliseconds on the meeting's audio timeline (pauses excluded).
+            db.execute("CREATE TABLE IF NOT EXISTS work_utterances (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, "
+                       "transcript_id TEXT NOT NULL, segment_index INTEGER NOT NULL, ordinal INTEGER NOT NULL, "
+                       "start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, text TEXT NOT NULL)")
+            db.execute("CREATE INDEX IF NOT EXISTS work_utterance_order ON work_utterances(meeting_id, start_ms)")
+            db.execute("CREATE TABLE IF NOT EXISTS work_meeting_events (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, "
+                       "kind TEXT NOT NULL, offset_ms INTEGER NOT NULL, origin TEXT NOT NULL, created_at TEXT NOT NULL)")
             # One transactional migration indexes existing history, then triggers keep
             # updates/deletes in sync, including writes inside report transactions.
             indexed = db.execute("SELECT 1 FROM sqlite_master WHERE name='recall_index'").fetchone()
@@ -264,8 +305,9 @@ class Store:
 
     def clear(self):
         with self.connect() as db:
-            for table in ("work_meeting_segments", "work_meetings", "memories", "transcripts", "events", "drafts", "processed", "meeting_reports", "action_tasks", "mobile_turns", "recall_exclusions"):
+            for table in ("work_utterances", "work_meeting_events", "work_meeting_segments", "work_meetings", "memories", "transcripts", "events", "drafts", "processed", "meeting_reports", "action_tasks", "mobile_turns", "recall_exclusions"):
                 db.execute(f"DELETE FROM {table}")
+        shutil.rmtree(self.audio_root, ignore_errors=True)
 
     def mobile_turn(self, turn_id, fingerprint, reserve=True):
         with self.connect() as db:
@@ -367,21 +409,60 @@ class Store:
             return [dict(row) for row in db.execute(
                 "SELECT m.*,json_extract(r.payload,'$.title') AS title,json_extract(r.payload,'$.summary') AS summary, "
                 "(SELECT count(*) FROM work_meeting_segments s JOIN transcripts t ON t.id=s.transcript_id "
-                "WHERE s.meeting_id=m.id) AS transcript_count FROM work_meetings m LEFT JOIN meeting_reports r ON r.id=m.report_id "
-                "ORDER BY m.started_at DESC LIMIT ?", (limit,))]
+                "WHERE s.meeting_id=m.id) AS transcript_count, "
+                "(SELECT COALESCE(max(COALESCE(s.offset_ms,s.segment_index*?)+s.duration_ms),0) FROM work_meeting_segments s "
+                "WHERE s.meeting_id=m.id) AS duration_ms FROM work_meetings m LEFT JOIN meeting_reports r ON r.id=m.report_id "
+                "ORDER BY m.started_at DESC LIMIT ?", (WORK_SEGMENT_MS, limit))]
 
     def work_meeting(self, meeting_id):
+        retention = self.settings().work_audio_retention_days
         with self.connect() as db:
             row = db.execute("SELECT * FROM work_meetings WHERE id=?", (meeting_id,)).fetchone()
             if row is None:
                 return None
             sources = [dict(item) for item in db.execute(
-                "SELECT t.*,s.segment_index FROM work_meeting_segments s JOIN transcripts t ON t.id=s.transcript_id "
-                "WHERE s.meeting_id=? ORDER BY s.segment_index", (meeting_id,))]
+                "SELECT t.*,s.segment_index,COALESCE(s.offset_ms,s.segment_index*?) AS offset_ms,s.duration_ms "
+                "FROM work_meeting_segments s JOIN transcripts t ON t.id=s.transcript_id "
+                "WHERE s.meeting_id=? ORDER BY s.segment_index", (WORK_SEGMENT_MS, meeting_id))]
+            utterances = [dict(item) for item in db.execute(
+                "SELECT u.id,u.transcript_id,u.segment_index,u.start_ms,u.end_ms,u.text FROM work_utterances u "
+                "JOIN transcripts t ON t.id=u.transcript_id WHERE u.meeting_id=? ORDER BY u.segment_index,u.ordinal", (meeting_id,))]
+            events = [dict(item) for item in db.execute(
+                "SELECT id,kind,offset_ms,origin,created_at FROM work_meeting_events WHERE meeting_id=? "
+                "ORDER BY offset_ms,created_at", (meeting_id,))]
+            audio = db.execute("SELECT count(*) AS total,COALESCE(sum(audio_bytes>0),0) AS kept,COALESCE(sum(audio_bytes),0) AS bytes "
+                               "FROM work_meeting_segments WHERE meeting_id=?", (meeting_id,)).fetchone()
             report = db.execute("SELECT payload FROM meeting_reports WHERE id=?", (row['report_id'],)).fetchone()
-            received = db.execute('SELECT count(*) FROM work_meeting_segments WHERE meeting_id=?', (meeting_id,)).fetchone()[0]
+        status = row['audio_status'] if row['audio_status'] in ('expired', 'deleted') else (
+            'none' if not audio['bytes'] else 'saved' if audio['kept'] == audio['total'] else 'partial')
+        expires = None
+        if status in ('saved', 'partial') and row['ended_at']:
+            expires = (datetime.fromisoformat(row['ended_at']) + timedelta(days=retention)).isoformat()
         return {**dict(row), 'sources': sources, 'transcript_count': len(sources),
-                'received_segments': received, 'report': json.loads(report['payload']) if report else None}
+                'received_segments': audio['total'], 'utterances': utterances, 'events': events,
+                'audio': {'status': status, 'bytes': audio['bytes'], 'segments_with_audio': audio['kept'],
+                          'retention_days': retention, 'expires_at': expires},
+                'report': json.loads(report['payload']) if report else None}
+
+    @staticmethod
+    def work_meeting_evidence(meeting):
+        """Model input: one row per saved sentence, so citations point at timed transcript lines."""
+        by_transcript = {}
+        for item in meeting['utterances']:
+            by_transcript.setdefault(item['transcript_id'], []).append(item)
+        rows = []
+        for source in meeting['sources']:
+            parts = by_transcript.get(source['id'])
+            if not parts:
+                rows.append(source)  # Saved before sentence timing existed.
+                continue
+            rows.extend({**source, 'id': part['id'], 'text': part['text'], 'start_ms': part['start_ms']} for part in parts)
+        return rows
+
+    def _work_audio_dir(self, meeting_id):
+        if not re.fullmatch(r'[a-zA-Z0-9-]{16,64}', meeting_id):
+            raise ValueError('invalid meeting id')
+        return self.audio_root / meeting_id
 
     def check_work_segment(self, meeting_id, segment_index, request_id):
         with self.connect() as db:
@@ -395,11 +476,16 @@ class Store:
         if segment is not None and segment['request_id'] != request_id:
             raise ValueError('会议片段编号已被使用')
 
-    def save_work_segment(self, meeting_id, segment_index, request_id, text):
-        """Persist ASR evidence and session membership in the same transaction, including silence receipts."""
+    def save_work_segment(self, meeting_id, segment_index, request_id, text, *, offset_ms=None, duration_ms=0,
+                          utterances=(), audio=None):
+        """Persist ASR evidence and session membership in the same transaction, including silence receipts.
+
+        Audio is written after the rows commit; a failed write keeps the text and records no audio."""
+        keep_audio = bool(audio) and self.settings().work_audio_retention_days > 0
+        offset = segment_index * WORK_SEGMENT_MS if offset_ms is None else offset_ms
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            row = db.execute("SELECT status FROM work_meetings WHERE id=?", (meeting_id,)).fetchone()
+            row = db.execute("SELECT status,audio_status FROM work_meetings WHERE id=?", (meeting_id,)).fetchone()
             if row is None or row['status'] != 'recording':
                 raise ValueError('会议不存在或已结束')
             existing = db.execute("SELECT * FROM work_meeting_segments WHERE meeting_id=? AND segment_index=?",
@@ -408,13 +494,114 @@ class Store:
                 if existing['request_id'] != request_id:
                     raise ValueError('会议片段编号已被使用')
                 return existing['transcript_id']
+            keep_audio = keep_audio and row['audio_status'] not in ('expired', 'deleted')
             transcript_id = uuid4().hex if text.strip() else None
             if transcript_id:
                 db.execute("INSERT INTO transcripts(id,speaker,text,mode,source,created_at,interaction_source) VALUES(?,?,?,?,?,?,?)",
                            (transcript_id, '现场发言（未分离声纹）', text, 'work', 'asr', now(), 'ambient_capture'))
-            db.execute("INSERT INTO work_meeting_segments VALUES(?,?,?,?)",
-                       (meeting_id, segment_index, request_id, transcript_id))
+                db.executemany("INSERT INTO work_utterances VALUES(?,?,?,?,?,?,?,?)",
+                               [(uid, meeting_id, transcript_id, segment_index, ordinal, start, end, body)
+                                for uid, ordinal, start, end, body in
+                                _utterance_rows(transcript_id, offset, duration_ms, text, utterances)])
+            db.execute("INSERT INTO work_meeting_segments(meeting_id,segment_index,request_id,transcript_id,offset_ms,duration_ms,audio_bytes) "
+                       "VALUES(?,?,?,?,?,?,?)", (meeting_id, segment_index, request_id, transcript_id, offset, duration_ms,
+                                                 len(audio) if keep_audio else 0))
+        if keep_audio:
+            target = self._work_audio_dir(meeting_id) / f'{segment_index:06d}.pcm'
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                temporary = target.with_suffix('.tmp')
+                temporary.write_bytes(audio)
+                os.replace(temporary, target)
+            except OSError:
+                with self.connect() as db:
+                    db.execute("UPDATE work_meeting_segments SET audio_bytes=0 WHERE meeting_id=? AND segment_index=?",
+                               (meeting_id, segment_index))
         return transcript_id
+
+    def work_audio(self, meeting_id, start_ms, end_ms):
+        """PCM16 for [start_ms, end_ms) of the meeting timeline; gaps without audio are silence."""
+        with self.connect() as db:
+            segments = [dict(row) for row in db.execute(
+                "SELECT segment_index,COALESCE(offset_ms,segment_index*?) AS offset_ms,audio_bytes FROM work_meeting_segments "
+                "WHERE meeting_id=? AND audio_bytes>0 ORDER BY offset_ms", (WORK_SEGMENT_MS, meeting_id))]
+        if not segments:
+            return None
+        last = segments[-1]
+        end_ms = min(end_ms, last['offset_ms'] + last['audio_bytes'] // PCM_BYTES_PER_MS)
+        if end_ms <= start_ms:
+            return b''
+        out = bytearray((end_ms - start_ms) * PCM_BYTES_PER_MS)
+        folder = self._work_audio_dir(meeting_id)
+        for i, segment in enumerate(segments):
+            begin = segment['offset_ms']
+            # A short padded tail may overlap the next segment; the later segment wins.
+            finish = begin + segment['audio_bytes'] // PCM_BYTES_PER_MS
+            if i + 1 < len(segments):
+                finish = min(finish, segments[i + 1]['offset_ms'])
+            low, high = max(start_ms, begin), min(end_ms, finish)
+            if low >= high:
+                continue
+            try:
+                with open(folder / f"{segment['segment_index']:06d}.pcm", 'rb') as source:
+                    source.seek((low - begin) * PCM_BYTES_PER_MS)
+                    chunk = source.read((high - low) * PCM_BYTES_PER_MS)
+            except OSError:
+                continue
+            position = (low - start_ms) * PCM_BYTES_PER_MS
+            out[position:position + len(chunk)] = chunk
+        return bytes(out)
+
+    def delete_work_audio(self, meeting_id, status='deleted'):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute("SELECT status FROM work_meetings WHERE id=?", (meeting_id,)).fetchone()
+            if row is None:
+                return None
+            if row['status'] == 'recording' and status == 'deleted':
+                raise ValueError('请先结束会议，再删除录音')
+            db.execute("UPDATE work_meetings SET audio_status=? WHERE id=?", (status, meeting_id))
+            db.execute("UPDATE work_meeting_segments SET audio_bytes=0 WHERE meeting_id=?", (meeting_id,))
+        shutil.rmtree(self._work_audio_dir(meeting_id), ignore_errors=True)
+        return True
+
+    def purge_work_audio(self):
+        """Apply the account's current retention to finished (or long-abandoned) meetings."""
+        days = self.settings().work_audio_retention_days
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        with self.connect() as db:
+            expired = [row['id'] for row in db.execute(
+                "SELECT m.id FROM work_meetings m WHERE m.audio_status NOT IN ('expired','deleted') "
+                "AND ((m.status!='recording' AND m.ended_at<?) OR (m.status='recording' AND m.started_at<?)) "
+                "AND EXISTS (SELECT 1 FROM work_meeting_segments s WHERE s.meeting_id=m.id AND s.audio_bytes>0)",
+                (cutoff.isoformat(), (cutoff - timedelta(days=1)).isoformat()))]
+        for meeting_id in expired:
+            self.delete_work_audio(meeting_id, 'expired')
+        return len(expired)
+
+    def add_work_event(self, meeting_id, event_id, kind, offset_ms, origin):
+        """Idempotent pause/resume/mark on the audio timeline; only while the meeting is recording."""
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            meeting = db.execute("SELECT status FROM work_meetings WHERE id=?", (meeting_id,)).fetchone()
+            if meeting is None:
+                return None
+            existing = db.execute("SELECT * FROM work_meeting_events WHERE id=?", (event_id,)).fetchone()
+            if existing:
+                if existing['meeting_id'] != meeting_id or existing['kind'] != kind or existing['offset_ms'] != offset_ms:
+                    raise ValueError('事件编号已被使用')
+                return dict(existing)
+            if meeting['status'] != 'recording':
+                raise ValueError('会议已结束，不能再暂停或标记')
+            if kind in ('pause', 'resume'):
+                last = db.execute("SELECT kind FROM work_meeting_events WHERE meeting_id=? AND kind IN ('pause','resume') "
+                                  "ORDER BY rowid DESC LIMIT 1", (meeting_id,)).fetchone()
+                if (kind == 'pause') == bool(last and last['kind'] == 'pause'):
+                    raise ValueError('录音已经暂停' if kind == 'pause' else '录音没有暂停')
+            row = {'id': event_id, 'meeting_id': meeting_id, 'kind': kind, 'offset_ms': offset_ms,
+                   'origin': origin, 'created_at': now()}
+            db.execute("INSERT INTO work_meeting_events VALUES(?,?,?,?,?,?)", tuple(row.values()))
+            return row
 
     def finish_work_meeting(self, meeting_id, expected_segments, complete):
         with self.connect() as db:
@@ -516,13 +703,15 @@ class Store:
                 removed_memories += db.execute('DELETE FROM memories WHERE source=?', (row['source'],)).rowcount
                 removed_transcripts = db.execute('DELETE FROM transcripts WHERE id=?', (source_id,)).rowcount
                 db.execute('DELETE FROM recall_exclusions WHERE transcript_id=?', (source_id,))
+                # Work minutes cite sentences "<transcript id>.<n>"; they belong to the same source.
+                cites = lambda ids: any(item == source_id or item.startswith(source_id + '.') for item in ids)
                 for task in db.execute('SELECT id,source_ids FROM action_tasks').fetchall():
-                    if source_id in json.loads(task['source_ids']):
+                    if cites(json.loads(task['source_ids'])):
                         removed_tasks += db.execute('DELETE FROM action_tasks WHERE id=?', (task['id'],)).rowcount
                 for report in db.execute('SELECT id,payload FROM meeting_reports').fetchall():
                     payload = json.loads(report['payload'])
                     source_ids = set(payload.get('source_ids', [])) | {s['id'] for s in payload.get('sources', [])}
-                    if source_id in source_ids:
+                    if cites(source_ids):
                         db.execute("UPDATE work_meetings SET report_id=NULL,summary_status='failed',summary_stage='done' WHERE report_id=?", (report['id'],))
                         removed_reports += db.execute('DELETE FROM meeting_reports WHERE id=?', (report['id'],)).rowcount
             self._invalidate_recall(db)

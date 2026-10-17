@@ -3,12 +3,16 @@ import json
 
 import httpx
 
-from .insights import MAX_RECORDS, MAX_TEXT_CHARS, MAX_RECORD_CHARS, _validate, _rules, _string, _citations, _PROMPT
+from .insights import MAX_TEXT_CHARS, MAX_RECORD_CHARS, _validate, _rules, _string, _citations, _PROMPT
+
+# Rows are single timed sentences, so a batch holds more of them than whole segments.
+MAX_BATCH_RECORDS = 240
 
 
 MINUTES_PROMPT = _PROMPT.replace(
     '且只含以下字段：', '基础字段如下：') + """
-这是一次从开始到结束的独立会议。按会议秘书的标准组织内容，不按录音分段流水记账。
+这是一次从开始到结束的独立会议。transcripts 每条通常是一句带时间的原文，source_ids 引用这些句子 id。
+按会议秘书的标准组织内容，不按录音分段流水记账。
 summary 先概括会议目的和结果，再按议题整理主要讨论、分歧、依据及后续步骤。
 删去口头禅和机械重复，保留限定条件、否定和后续更正，不篡改原文的含义。
 区分讨论、建议、最终决策和未解决问题；后来的更正或撤销优先，不能把已撤销承诺列为待办。
@@ -28,7 +32,7 @@ def _batches(rows):
     for row in rows:
         for offset in range(0, len(row['text']), MAX_RECORD_CHARS):
             piece = {**row, 'text': row['text'][offset:offset + MAX_RECORD_CHARS]}
-            if batch and (len(batch) == MAX_RECORDS or size + len(piece['text']) > MAX_TEXT_CHARS):
+            if batch and (len(batch) == MAX_BATCH_RECORDS or size + len(piece['text']) > MAX_TEXT_CHARS):
                 yield batch
                 batch, size = [], 0
             batch.append(piece)

@@ -39,6 +39,8 @@ class Settings(BaseModel):
     contact: str = Field(default="同事", max_length=100)
     arrival_notice_minutes: int = Field(default=5, ge=1, le=60)
     retain_transcripts: bool = True
+    # Work-meeting audio is kept per account for playback; 0 means never store it.
+    work_audio_retention_days: int = Field(default=30, ge=0, le=365)
 
     @model_validator(mode="after")
     def valid_settings(self):
