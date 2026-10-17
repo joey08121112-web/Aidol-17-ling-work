@@ -55,6 +55,9 @@ public final class MainActivity extends Activity {
     private DevelopmentSettings development;
     private HeadsetController headset;
     private QuickFeedback quickFeedback;
+    private ActionTaskBoard taskBoard;
+    private LinearLayout lastRenderedMeetingList;
+    private String lastRenderedMeetingSnapshot = "";
     private ForegroundLocationMonitor locationMonitor;
     private TransientStatusPopup statusPopup;
     private TextView maintenanceStatus, meetingMaintenanceStatus;
@@ -255,7 +258,14 @@ public final class MainActivity extends Activity {
         meetingPlayback = new MeetingPlayback(this, headset::matchesOutput, this::meetingPlaybackChanged);
         headset.addListener(headsetListener);
         headset.addControlListener(headsetControlListener);
+        taskBoard = new ActionTaskBoard(this, () -> api, () -> !busy && session == null,
+            tasks -> { put(state, "tasks", tasks); }, message -> { lastNotice = message; updateStatus(); }, () -> {
+                if (Build.VERSION.SDK_INT >= 33 && !permissionPending && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                    permissionPending = true; requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 7);
+                }
+            });
         connectBackend();
+        if (getIntent().getBooleanExtra("open_work_tasks", false)) tab = 2;
         if (api.vault.token().isEmpty()) showAuth(0); else { showApp(); refresh(); }
     }
 
@@ -852,6 +862,11 @@ public final class MainActivity extends Activity {
     }
     private void renderWorkMeetings() {
         if (workMeetingList == null || tab != 2) return;
+        String snapshot = array(state, "work_meetings").toString() + workMeetingSyncError;
+        if (lastRenderedMeetingList == workMeetingList && lastRenderedMeetingSnapshot.equals(snapshot)) return;
+        lastRenderedMeetingList = workMeetingList; lastRenderedMeetingSnapshot = snapshot;
+        if (taskBoard != null) taskBoard.refreshReminders();
+        Runnable restoreTaskPosition = taskBoard == null ? () -> {} : taskBoard.preserveViewport();
         workMeetingList.removeAllViews();
         if (workMeetingSyncError) label(workMeetingList, "进度暂未同步，正在重试；下面显示上次确认的状态。", 12, MUTED);
         JSONArray meetings = array(state, "work_meetings");
@@ -873,6 +888,7 @@ public final class MainActivity extends Activity {
             if (!summary.isEmpty()) label(item, summary.length() > 120 ? summary.substring(0, 120) + "…" : summary, 13, MUTED);
             button(item, "查看原文与纪要", false, () -> openWorkMeeting(meeting.optString("id")));
         }
+        restoreTaskPosition.run();
     }
     private void pollWorkMeetings() {
         if (!visible || tab != 2 || isDestroyed() || api.vault.token().isEmpty()) return;
@@ -1006,7 +1022,7 @@ public final class MainActivity extends Activity {
         if (report != null) {
             meetingSection("章节", "智能章节");
             JSONArray chapters = array(report, "chapters");
-            if (!report.has("chapters")) label(workMeetingDetail, "这份纪要生成时还没有章节功能，点页面底部“重新生成 AI 纪要”即可补上。", 13, MUTED);
+            if (!report.has("chapters")) label(workMeetingDetail, "这份纪要生成时还没有章节功能，点页面底部“修正并重新生成纪要”即可补上。", 13, MUTED);
             else if (chapters.length() == 0) label(workMeetingDetail, "内容较短，未划分章节。", 13, MUTED);
             for (int i = 0; i < chapters.length(); i++) {
                 JSONObject chapter = chapters.optJSONObject(i); if (chapter == null) continue;
@@ -1014,12 +1030,13 @@ public final class MainActivity extends Activity {
                 long at = chapter.isNull("start_ms") || !chapter.has("start_ms") ? (first == null ? 0 : first.startMs) : chapter.optLong("start_ms");
                 LinearLayout card = card(workMeetingDetail); card.setPadding(dp(14), dp(10), dp(14), dp(10));
                 LinearLayout top = row(); top.setGravity(Gravity.CENTER_VERTICAL); card.addView(top);
-                badge(top, TimeFormat.clock(at), WORK, 0xffeef3fc);
+                boolean timedChapter = first != null || chapter.has("start_ms") && !chapter.isNull("start_ms");
+                badge(top, timedChapter ? TimeFormat.clock(at) : "用户补充", WORK, 0xffeef3fc);
                 TextView heading = label(top, chapter.optString("title"), 15, INK); heading.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
                 if (!chapter.optString("summary").isEmpty()) label(card, chapter.optString("summary"), 13, MUTED);
                 String target = first == null ? null : first.id;
-                card.setFocusable(true); card.setContentDescription("章节 " + TimeFormat.clock(at) + "，" + chapter.optString("title"));
-                card.setOnClickListener(v -> seekOrJump(meeting, timeline, at, target));
+                card.setFocusable(timedChapter); card.setContentDescription("章节 " + (timedChapter ? TimeFormat.clock(at) : "用户补充") + "，" + chapter.optString("title"));
+                if (timedChapter) card.setOnClickListener(v -> seekOrJump(meeting, timeline, at, target));
             }
             meetingSection("观点", "各人物观点");
             meetingItems(workMeetingDetail, meetingAnalysisItems(report, "viewpoints"), meeting, timeline, false);
@@ -1079,15 +1096,28 @@ public final class MainActivity extends Activity {
                 });
             });
         }
-        if (!"recording".equals(meeting.optString("status")) && (sources.length() > 0 || "pending".equals(meeting.optString("transcription_status"))) && !"pending".equals(summaryStatus))
-            button(workMeetingDetail, ("pending".equals(meeting.optString("transcription_status")) || "failed".equals(meeting.optString("transcription_status")))
-                ? "重试整场识别与总结" : "重新生成 AI 纪要", false, () -> {
+        JSONObject revision = meeting.optJSONObject("revision_request");
+        if (revision != null && "failed".equals(revision.optString("status")))
+            label(workMeetingDetail, "上次修正分析未完成，编辑稿和上一版纪要均已保留。请点下方按钮继续编辑并重试。", 13, 0xffbb5a54);
+        if (!"recording".equals(meeting.optString("status")) && !"pending".equals(summaryStatus)) {
+            if (report != null) button(workMeetingDetail, "修正并重新生成纪要", false, () -> {
                 if (!canAct()) return;
-                request(() -> api.json("POST", "/v1/work-meetings/" + Uri.encode(meeting.optString("id")) + "/retry-summary", json()), r -> {
-                    workMeetingDetailSnapshot = ""; renderWorkMeetingDetail(r);
-                    handler.removeCallbacks(workMeetingPoll); handler.post(workMeetingPoll);
-                });
+                String id = meeting.optString("id");
+                request(() -> api.json("GET", "/v1/work-meetings/" + Uri.encode(id) + "/revision", null), draft ->
+                    new MeetingRevisionEditor(this, api, id, draft, result -> {
+                        workMeetingDetailSnapshot = ""; renderWorkMeetingDetail(result);
+                        handler.removeCallbacks(workMeetingPoll); handler.post(workMeetingPoll);
+                        taskBoard.refreshReminders();
+                    }).show());
             });
+            else if (sources.length() > 0 || "pending".equals(meeting.optString("transcription_status")) || "failed".equals(meeting.optString("transcription_status")))
+                button(workMeetingDetail, "重试原文识别与整理", false, () -> {
+                    if (!canAct()) return;
+                    request(() -> api.json("POST", "/v1/work-meetings/" + Uri.encode(meeting.optString("id")) + "/retry-summary", json()), result -> {
+                        workMeetingDetailSnapshot = ""; renderWorkMeetingDetail(result); handler.post(workMeetingPoll);
+                    });
+                });
+        }
         JSONObject audio = meeting.optJSONObject("audio");
         String audioStatus = audio == null ? "" : audio.optString("status");
         if (("saved".equals(audioStatus) || "partial".equals(audioStatus)) && !"recording".equals(meeting.optString("status")))
@@ -1190,6 +1220,7 @@ public final class MainActivity extends Activity {
     /** Compact "依据" links: the cited sentence's time and opening words; tap to jump (and play when saved). */
     private void meetingEvidence(JSONObject meeting, MeetingTimeline timeline, JSONArray ids) {
         for (int k = 0; k < ids.length() && k < 3; k++) {
+            if (ids.optString(k).startsWith("user-edit:")) { label(workMeetingDetail, "↳ 依据：用户修正（未改动录音原文）", 12, ACCENT); continue; }
             MeetingTimeline.Entry cited = timeline.sentence(ids.optString(k));
             if (cited == null) continue;
             String excerpt = cited.text.length() > 28 ? cited.text.substring(0, 28) + "…" : cited.text;
@@ -1491,19 +1522,7 @@ public final class MainActivity extends Activity {
             small(actions, "复制纪要", () -> copy("Aidol 会议纪要", report.optString("summary")));
             small(actions, "查看原始记录", () -> showSources(array(report, "sources")));
         } else empty(page, "下一次讨论，从这里开始", "完成记录后，点击「生成纪要」。\n重点和决策会留在这里，方便回看。");
-        JSONArray tasks = array(state, "tasks"); int open = 0; for (int i = 0; i < tasks.length(); i++) if (tasks.optJSONObject(i) != null && !"done".equals(tasks.optJSONObject(i).optString("status"))) open++;
-        sectionHeader(page, "行动清单", open + " 项待完成", "", null);
-        if (tasks.length() == 0) { LinearLayout noTasks = card(page); label(noTasks, "还没有待办，先专注眼前。", 14, MUTED); }
-        for (int i = 0; i < tasks.length(); i++) {
-            JSONObject task = tasks.optJSONObject(i); if (task == null) continue;
-            boolean done = "done".equals(task.optString("status")); LinearLayout taskCard = card(page);
-            taskCard.setPadding(dp(16), dp(12), dp(16), dp(12));
-            CheckBox check = new CheckBox(this); check.setText(task.optString("content")); check.setTextColor(done ? MUTED : INK); check.setTextSize(15); check.setMinHeight(dp(48));
-            check.setButtonTintList(android.content.res.ColorStateList.valueOf(ACCENT)); check.setChecked(done); taskCard.addView(check);
-            if (done) check.setPaintFlags(check.getPaintFlags() | Paint.STRIKE_THRU_TEXT_FLAG);
-            check.setOnClickListener(v -> { if (canAct()) mutate("PATCH", "/v1/tasks/" + task.optString("id"), json("status", check.isChecked() ? "done" : "open")); else check.setChecked(done); });
-            label(taskCard, "负责人：" + fallback(task.optString("owner"), "待确认") + "    截止：" + fallback(task.optString("due"), "待确认"), 11, MUTED);
-        }
+        taskBoard.render(page, array(state, "tasks"), scroll);
     }
 
     private void commute() {
@@ -1837,7 +1856,7 @@ public final class MainActivity extends Activity {
         dialog.setOnShowListener(v -> { dialog.getButton(-1).setTextColor(RED); dialog.getButton(-1).setOnClickListener(w -> {
             if (!canAct()) return; if (password.length() == 0) { password.setError("请输入密码"); return; }
             request(() -> api.json("DELETE", account ? "/auth/account" : "/v1/data", json("password", password.getText().toString())), r -> {
-                dialog.dismiss(); clearPrivateSnapshots(); if (account) signOut(); else { showApp(); refresh(); }
+                dialog.dismiss(); TaskReminders.clear(this); getSharedPreferences("meeting_edit_drafts", MODE_PRIVATE).edit().clear().apply(); clearPrivateSnapshots(); if (account) signOut(); else { showApp(); refresh(); }
             });
         }); }); dialog.show();
     }
@@ -2003,6 +2022,7 @@ public final class MainActivity extends Activity {
         final String notice = lastNotice;
         request(() -> api.json("GET", "/v1/state", null), r -> {
             state = r; lastNotice = notice; showApp();
+            if (taskBoard != null) taskBoard.refreshReminders();
             handler.post(startupLocationTick);
         });
     }
@@ -2017,7 +2037,7 @@ public final class MainActivity extends Activity {
                 if (authError != null || !(e instanceof ApiClient.ApiException) || ((ApiClient.ApiException) e).status != 409) showError(lastNotice); } }); }
         });
     }
-    private void signOut() { clearVoicePreparation(); preparationAttemptAt = -60000; if (quickFeedback != null) quickFeedback.stop(); chatDraft = ""; stopLockScreenSession(); cancelSession(""); clearPrivateSnapshots(); api.vault.clear(); syncHeadsetControls(); state = new JSONObject(); lastNotice = ""; showAuth(0); }
+    private void signOut() { TaskReminders.clear(this); getSharedPreferences("meeting_edit_drafts", MODE_PRIVATE).edit().clear().apply(); clearVoicePreparation(); preparationAttemptAt = -60000; if (quickFeedback != null) quickFeedback.stop(); chatDraft = ""; stopLockScreenSession(); cancelSession(""); clearPrivateSnapshots(); api.vault.clear(); syncHeadsetControls(); state = new JSONObject(); lastNotice = ""; showAuth(0); }
     private boolean canAct() { if (busy || session != null || locationListener != null) { feedback("上一项操作正在进行，请稍候", LocalCue.BUSY); return false; } return true; }
 
     private boolean lockScreenEnabled() { return voiceService != null && voiceService.enabled(); }
@@ -2308,6 +2328,7 @@ public final class MainActivity extends Activity {
     }
     @Override public void onRequestPermissionsResult(int code, String[] permissions, int[] grants) {
         super.onRequestPermissionsResult(code, permissions, grants);
+        if (code == 7) { permissionPending = false; if (taskBoard != null) taskBoard.refreshReminders(); return; }
         if (code == 6) { permissionPending = false; renderMaintenanceStatus(); return; }
         if (code == 4) {
             permissionPending = false;
@@ -2342,6 +2363,7 @@ public final class MainActivity extends Activity {
         automaticHeadsetSuppressed = false;
         enterMaintenance("app_open");
         prepareVoice();
+        if (taskBoard != null) taskBoard.refreshReminders();
         if (!pendingHeadsetNotice.isEmpty()) { String notice = pendingHeadsetNotice; pendingHeadsetNotice = ""; headsetNotice(notice); }
         if (orb != null) orb.invalidate();
         if (tab == 2) { handler.removeCallbacks(workMeetingPoll); handler.post(workMeetingPoll); }
@@ -2359,7 +2381,11 @@ public final class MainActivity extends Activity {
         else if (listenMode != VoiceInteraction.CALL && session != null && sessionUsesCapture) endVoice();
         stopLocation(); super.onPause();
     }
-    @Override protected void onDestroy() { if (locationMonitor != null) locationMonitor.close(); if (statusPopup != null) statusPopup.dismiss(); handler.removeCallbacks(automaticHeadsetTick); if (quickFeedback != null) quickFeedback.close(); if (meetingPlayback != null) meetingPlayback.close(); handler.removeCallbacks(workMeetingPlaybackTick); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); super.onDestroy(); }
+    @Override protected void onDestroy() { if (taskBoard != null) taskBoard.close(); if (locationMonitor != null) locationMonitor.close(); if (statusPopup != null) statusPopup.dismiss(); handler.removeCallbacks(automaticHeadsetTick); if (quickFeedback != null) quickFeedback.close(); if (meetingPlayback != null) meetingPlayback.close(); handler.removeCallbacks(workMeetingPlaybackTick); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); super.onDestroy(); }
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent); setIntent(intent);
+        if (intent.getBooleanExtra("open_work_tasks", false) && api != null && !api.vault.token().isEmpty()) switchTab(2);
+    }
     @Override public void onBackPressed() { if (session != null) { endVoice(); return; } if (!api.vault.token().isEmpty() && tab != 0) { switchTab(0); return; } if (api.vault.token().isEmpty() && authMode != 0) { showAuth(0); return; } super.onBackPressed(); }
 
     private void syncHeadsetControls() {
@@ -2470,6 +2496,7 @@ public final class MainActivity extends Activity {
         startupLocationAttempted = false;
         clearVoicePreparation(); preparationAttemptAt = -60000;
         ApiClient next = new ApiClient(this, development.serverUrl());
+        if (api != null && !api.serverUrl.equals(next.serverUrl)) TaskReminders.clear(this);
         api = next;
         next.setDiagnostics(message -> runOnUiThread(() -> {
             if (isDestroyed() || api != next) return;

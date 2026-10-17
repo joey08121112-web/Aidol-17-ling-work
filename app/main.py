@@ -23,6 +23,8 @@ from .providers.qwen_meeting_asr import QwenMeetingAsrProvider, MeetingTaskFaile
 from .services.insights import MeetingInsights, meeting_coverage
 from .services.work_meetings import WorkMeetingMinutes, attach_times
 from .services.meeting_addresses import MeetingAddresses
+from .services.meeting_revisions import MeetingRevisions, editable_document, validate_document
+from .services.work_meetings import MinutesFailure
 from .services.work_live import live_captions
 from .services.recall import RecallService
 from .services.voice_stream import CompletionBarrier, transcribe_live, reply_live
@@ -129,6 +131,39 @@ def create_hosted_app(config=None, data_directory=None):
         def aware_start(cls, value):
             if value is not None and (value.tzinfo is None or abs((datetime.now(timezone.utc) - value).total_seconds()) > 86400):
                 raise ValueError('会议开始时间需包含时区且在一天内')
+            return value
+
+    class MeetingRevisionInput(BaseModel):
+        request_id: str = Field(pattern=r'^[a-zA-Z0-9-]{16,64}$')
+        base_report_id: str = Field(min_length=1, max_length=64)
+        document: dict
+
+    class CustomTask(BaseModel):
+        task_id: str = Field(pattern=r'^[a-zA-Z0-9-]{16,64}$')
+        content: str = Field(min_length=1, max_length=500)
+        owner: str = Field(default='', max_length=100)
+        due_at: datetime
+        reminder_hours: int = Field(default=1)
+
+        @field_validator('content')
+        @classmethod
+        def nonempty(cls, value):
+            if not value.strip():
+                raise ValueError('请输入待办内容')
+            return value.strip()
+
+        @field_validator('due_at')
+        @classmethod
+        def future_due(cls, value):
+            if value.tzinfo is None or value <= datetime.now(timezone.utc):
+                raise ValueError('请选择未来的截止时间')
+            return value
+
+        @field_validator('reminder_hours')
+        @classmethod
+        def reminder_choice(cls, value):
+            if value not in (1, 6, 24):
+                raise ValueError('提醒提前量仅支持1小时、6小时、1天')
             return value
 
     class LocationRecord(LocationInput):
@@ -898,6 +933,27 @@ def create_hosted_app(config=None, data_directory=None):
                     meeting = store.work_meeting(meeting_id)
                     if meeting is None or meeting['summary_status'] != 'pending':
                         return
+                revision = meeting['revision_request']
+                if revision.get('status') == 'pending':
+                    store.work_summary_progress(meeting_id, 'analyzing', 0, 1)
+                    charge = lambda: accounts.consume('usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400)
+                    try:
+                        report = await MeetingRevisions(config, charge).generate(meeting['report'], revision['document'],
+                            revision['id'], store.work_meeting_evidence(meeting))
+                    except MinutesFailure as exc:
+                        if accounts.user(current['username']) is not None and Path(store.path).exists():
+                            store.fail_work_revision(meeting_id, exc.reason)
+                        return
+                    found = accounts.user(current['username'])
+                    if found is None or found['id'] != current['id']:
+                        return
+                    async with runtimes.use(current['id'], wait_seconds=10) as rt:
+                        attach_times(report, meeting)
+                        report.update(meeting_id=meeting_id, started_at=meeting['started_at'], location=meeting['location'],
+                                      capture_status=meeting['status'], includes_demo=False)
+                        if not rt.store.finish_work_revision(meeting_id, revision['id'], report, [r['id'] for r in meeting['sources']]):
+                            rt.store.fail_work_summary(meeting_id)
+                    return
                 if meeting['transcription_status'] == 'pending':
                     # Whole-meeting diarization from the saved audio: one speaker namespace for the meeting.
                     import tempfile
@@ -1108,6 +1164,44 @@ def create_hosted_app(config=None, data_directory=None):
             resume_work_summaries(background, current, [meeting])
             return meeting
 
+    @api.get('/v1/work-meetings/{meeting_id}/revision')
+    async def get_revision(meeting_id: str, current=Depends(user)):
+        store = read_work_store(current)
+        meeting = store.work_meeting(meeting_id) if store else None
+        if meeting is None:
+            raise HTTPException(404, '会议记录不存在')
+        if not meeting['report'] or meeting['summary_status'] == 'pending' or meeting['status'] == 'recording':
+            raise HTTPException(409, '请等待本场纪要整理完成')
+        draft = meeting['revision_request']
+        document = draft.get('document') if draft.get('status') == 'failed' and draft.get('base_report_id') == meeting['report_id'] else None
+        return {'base_report_id': meeting['report_id'], 'document': document or editable_document(meeting['report'])}
+
+    @api.post('/v1/work-meetings/{meeting_id}/revise-summary')
+    async def revise_summary(meeting_id: str, value: MeetingRevisionInput, request: Request, background: BackgroundTasks, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            meeting = rt.store.work_meeting(meeting_id)
+            if meeting is None:
+                raise HTTPException(404, '会议记录不存在')
+            old = meeting['revision_request']
+            if old.get('id') == value.request_id:
+                if old.get('base_report_id') != value.base_report_id or old.get('document') != value.document:
+                    raise HTTPException(409, '修正请求编号已使用')
+                resume_work_summaries(background, current, [meeting])
+                return meeting
+            if not meeting['report'] or meeting['report_id'] != value.base_report_id:
+                raise HTTPException(409, '纪要已有更新，请重新打开编辑页面')
+            try:
+                doc = validate_document(value.document, editable_document(meeting['report']))
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from None
+            revision = {'id': value.request_id, 'base_report_id': value.base_report_id, 'document': doc,
+                        'status': 'pending', 'created_at': datetime.now(timezone.utc).isoformat()}
+            if not rt.store.queue_work_revision(meeting_id, value.base_report_id, revision):
+                raise HTTPException(409, '纪要正在处理，请稍后重试')
+            meeting = rt.store.work_meeting(meeting_id)
+            resume_work_summaries(background, current, [meeting])
+            return meeting
+
     @api.post('/v1/work-meetings/{meeting_id}/retry-summary')
     async def retry_work_meeting(meeting_id: str, request: Request, background: BackgroundTasks, current=Depends(user)):
         async with runtime(current, request) as rt:
@@ -1116,6 +1210,8 @@ def create_hosted_app(config=None, data_directory=None):
                 raise HTTPException(404, '会议记录不存在')
             if (not meeting['sources'] and meeting['transcription_status'] not in ('pending', 'failed')) or meeting['status'] == 'recording':
                 raise HTTPException(409, '请先结束会议并保存原文')
+            if (meeting['report'] or {}).get('revision_id'):
+                raise HTTPException(409, '这份纪要已有用户修正，请使用修正并重新生成入口')
             if (current['id'], meeting_id) in work_summaries_running:
                 return meeting
             rt.store.retry_work_summary(meeting_id)
@@ -1139,6 +1235,27 @@ def create_hosted_app(config=None, data_directory=None):
             report.update(sources=[row for row in reversed(rows) if row['id'] in selected],
                           coverage=meeting_coverage(rows, report.get('source_ids', [])), hours=value.hours, includes_demo=False)
             return rt.store.save_meeting_report(signature, report)
+
+    @api.get('/v1/tasks')
+    async def all_tasks(current=Depends(user)):
+        store = read_work_store(current)
+        return {'tasks': store.list('action_tasks', 10000) if store else []}
+
+    @api.post('/v1/tasks')
+    async def create_task(value: CustomTask, request: Request, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            try:
+                return rt.store.create_action_task(value.task_id, value.content, value.owner.strip(),
+                    value.due_at.astimezone(timezone.utc).isoformat(), value.reminder_hours)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from None
+
+    @api.delete('/v1/tasks/{task_id}')
+    async def delete_task(task_id: str, request: Request, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            if not rt.store.delete_action_task(task_id):
+                raise HTTPException(404, '待办不存在')
+            return {'ok': True}
 
     @api.patch('/v1/tasks/{task_id}')
     async def mobile_task(task_id: str, value: TaskStatusInput, request: Request, current=Depends(user)):

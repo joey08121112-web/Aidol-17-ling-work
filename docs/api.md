@@ -98,6 +98,25 @@ APK 默认本地基址 `http://127.0.0.1:8108`，可切换内置远端 `https://
 
 state 最多返回 100 条转写（按时间正序）、300 条记忆、300 条行动项、30 条草稿及最新纪要；记忆按收藏优先及时间倒序。导出各集合最多 10000 条，暂不提供分页。纪要中的 tasks 是生成时的草稿快照，当前完成状态以 state.tasks 或 export.tasks 为准。`include_demo` 为兼容模型字段，不会为托管账号注入模拟内容。
 
+### 自定义行动清单与通知（2026-10-18）
+
+- `GET /v1/tasks`：当前账号最多10000条行动项，含原有字段及 `due_at`（UTC ISO时间，旧AI待办为空）、`reminder_hours`（旧记录为0）。此快照不等待语音业务锁。state原有最近300条保持兼容。
+- `POST /v1/tasks`：`{task_id, content, owner, due_at, reminder_hours}`。客户端UUID（16–64位字母/数字/连字符），内容1–500有效字、负责人0–100字、带时区的未来截止时间、提前量仅1/6/24小时。返回行动项，同ID同内容幂等，不同内容409；已删除ID不能被迟到重试重建。手动任务没有report或录音来源，不消耗模型额度。
+- `PATCH /v1/tasks/{id}`：原有open/done契约保留。Android只更新对应卡片、计数及提醒，不刷新整页、不改变排序或当前滚动位置。
+- `DELETE /v1/tasks/{id}`：同账号删除，未知/跨账号404。删除AI待办保留会议本身，并记住同场内容/负责人/截止时间指纹，后续重新生成不重建完全相同的已删除行动项；不影响其他手动任务。
+
+Android以系统AlarmManager安排本地通知，提前量按绝对截止时间计算。提醒时刻已过去而截止时间仍在未来时尽快提醒；已到期、完成、删除的任务不安排。通知可直接进入工作页；重启、时间/时区变动及包更新后恢复，前台/刷新/任务修改时同步。退出账号、切换服务、清空和注销取消相应本地提醒；权限未允许时显示说明与通知设置入口。采用无额外特殊授权的非精确闹钟，省电策略可能延迟（[Android官方说明](https://developer.android.com/develop/background-work/services/alarms)）。本地已知状态下完成/删除会取消提醒；其他设备的更改在本机下次同步后生效，不是服务器远程推送。位置与录音的前后台策略保持原样。
+
+### 用户修正并重新生成纪要（2026-10-18）
+
+`GET /v1/work-meetings/{id}/revision` 返回 `{base_report_id, document}`，仅已结束且有可编辑纪要、当前未在整理时可用。document含title，以及summary/tasks/viewpoints/conflicts/events/topics/decisions/open_questions/chapters/highlights分类。summary为逐段 `{id,text}`；其他分类保留原字段、隐藏source_ids并增加稳定编辑id。Android按分区提供文字编辑、添加与删除；新条目id为 `new-UUID`，技术标识及依据不展示为可编辑文字。失败时优先返回同一版保留的编辑稿。
+
+`POST /v1/work-meetings/{id}/revise-summary`：`{request_id, base_report_id, document}`。请求ID幂等；基版已变化或整理中409，不覆盖其他更新。严格校验分类、条目ID、文字/数量及总长（最多90000字JSON，总结最多8000字）；客户端提交的引用不可信，服务端由基版恢复并为用户改动生成独立 `user-edit:` 依据。编辑稿和pending任务先持久保存；不重新上传/识别录音，不占用原语音业务锁进行模型网络请求。
+
+AI保留剩余条目顺序/数量，分析用户新增、修改、删除后的版本，同步修改未编辑字段中的人物、时间、任务、决策等关联表述。用户改过的字段及新增条目在服务端强制保留；删除项不可被模型恢复，空分类保持空；总结按段保护，允许用户全部清空。未改部分仍执行原有结构与引用校验；不将用户修正冒充录音发言或附上伪造音频时间。真实模型请求逐次计额度，结构不合法最多纠正一次，鉴权/限流/超时等不盲目重试。
+
+`revision_request` 包含id/base_report_id/document/created_at/status（pending/done/failed），失败另含固定error原因码。成功原子替换本场纪要和关联行动项，匹配的旧任务保持完成状态，独立手动任务保留；返回report含revision_id/revision_sources。失败保留上一版report和完整编辑稿，状态恢复到可查看/编辑，不发布规则摘录覆盖用户修改。已有用户修正的纪要拒绝旧retry-summary入口（409），防止旧客户端绕过编辑稿从原文覆盖修正。服务重启后正常读取恢复pending，清空/注销/撤回来源后迟到结果不能重新发布。Android编辑过程中还按服务/账号/会议/基版保存私有本地草稿，稍后继续可恢复，退出账号/清空时删除。
+
 ### 前台位置记录（2026-10-18）
 
 `POST /v1/location-records` 接收 `{record_id, observed_at, trigger, longitude, latitude, accuracy, source, speed?}`。`record_id` 为16–64位字母、数字或连字符；`observed_at` 必须含时区，接受过去10分钟至未来2分钟，统一保存为UTC；`trigger` 仅 `app_open/page_return/interval`；坐标为手机系统 WGS-84，精度0–200米。响应 `{id, observed_at, trigger, longitude, latitude, accuracy, source, speed}`。同一编号和相同内容幂等返回；编号已存在但内容不同返回409。Android 进一步只接收60秒内、带精度的系统结果，每次等待最多25秒。

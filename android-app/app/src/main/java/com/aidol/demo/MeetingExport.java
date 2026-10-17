@@ -36,7 +36,7 @@ final class MeetingExport {
             section(out, "智能章节", array(report, "chapters"), item -> {
                 MeetingTimeline.Entry at = item.has("start_ms") && !item.isNull("start_ms") ? timeline.sentenceAt(item.optLong("start_ms")) : null;
                 return "- " + (at == null ? "" : "[" + clock(at, zone) + "] ") + item.optString("title")
-                    + (item.optString("summary").isEmpty() ? "" : "：" + item.optString("summary"));
+                    + (item.optString("summary").isEmpty() ? "" : "：" + item.optString("summary")) + (userEdited(item) ? "（用户修正）" : "");
             });
             section(out, "关键决策", array(report, "decisions"), item -> "- " + item.optString("text") + evidence(item, timeline, zone));
             section(out, "各人物观点", array(report, "viewpoints"), item -> "- " + fallback(item.optString("person"), "身份未明确的发言")
@@ -77,7 +77,13 @@ final class MeetingExport {
         }
         out.append('\n');
     }
+    private static boolean userEdited(JSONObject item) {
+        JSONArray ids = array(item, "source_ids");
+        for (int i = 0; i < ids.length(); i++) if (ids.optString(i).startsWith("user-edit:")) return true;
+        return false;
+    }
     private static String evidence(JSONObject item, MeetingTimeline timeline, ZoneId zone) {
+        if (userEdited(item)) return "（用户修正）";
         JSONArray ids = array(item, "source_ids");
         for (int i = 0; i < ids.length(); i++) {
             MeetingTimeline.Entry cited = timeline.sentence(ids.optString(i));
