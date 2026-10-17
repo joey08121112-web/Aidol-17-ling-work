@@ -527,6 +527,26 @@ class Store:
                 "WHERE s.meeting_id=m.id) AS duration_ms FROM work_meetings m LEFT JOIN meeting_reports r ON r.id=m.report_id "
                 "ORDER BY m.started_at DESC LIMIT ?", (WORK_SEGMENT_MS, limit))]
 
+    def save_work_meeting_address(self, meeting_id, expected_location, address):
+        """Enrich the original snapshot, never recreate a deleted or replaced meeting."""
+        if not Path(self.path).exists():
+            return False
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT location,report_id FROM work_meetings WHERE id=?', (meeting_id,)).fetchone()
+            if row is None:
+                return False
+            location = json.loads(row['location'] or '{}')
+            if location != expected_location or location.get('address'):
+                return False
+            location['address'] = address
+            encoded = json.dumps(location, ensure_ascii=False)
+            db.execute('UPDATE work_meetings SET location=? WHERE id=?', (encoded, meeting_id))
+            if row['report_id']:
+                db.execute("UPDATE meeting_reports SET payload=json_set(payload,'$.location',json(?)) WHERE id=?",
+                           (encoded, row['report_id']))
+        return True
+
     def work_meeting(self, meeting_id):
         retention = self.settings().work_audio_retention_days
         with self.connect() as db:
@@ -924,6 +944,11 @@ class Store:
             return False
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
+            # Address enrichment may finish while the model is generating the report.
+            fresh = db.execute('SELECT location FROM work_meetings WHERE id=?', (meeting_id,)).fetchone()
+            if fresh is None:
+                return False
+            payload = {**payload, 'location': json.loads(fresh['location'] or '{}')}
             old_id = current['report_id']
             old_tasks = { (task['content'], task['owner'], task['due'], tuple(sorted(json.loads(task['source_ids'])))): dict(task)
                           for task in db.execute('SELECT * FROM action_tasks WHERE report_id=?', (old_id,)) }

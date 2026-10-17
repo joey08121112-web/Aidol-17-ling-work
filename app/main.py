@@ -22,6 +22,7 @@ from .providers.qwen_work_asr import QwenWorkAsrProvider
 from .providers.qwen_meeting_asr import QwenMeetingAsrProvider, MeetingTaskFailed
 from .services.insights import MeetingInsights, meeting_coverage
 from .services.work_meetings import WorkMeetingMinutes, attach_times
+from .services.meeting_addresses import MeetingAddresses
 from .services.work_live import live_captions
 from .services.recall import RecallService
 from .services.voice_stream import CompletionBarrier, transcribe_live, reply_live
@@ -50,6 +51,7 @@ def create_hosted_app(config=None, data_directory=None):
     directory = Path(data_directory or os.getenv('AIDOL_DATA_DIR', 'data/hosted'))
     accounts = AccountStore(str(directory / 'accounts.sqlite3'))
     runtimes = MobileRuntimes(config, directory / 'users')
+    meeting_addresses = MeetingAddresses(config)
     speech = VolcSpeechProvider(config.speech)
     api = FastAPI(title='Aidol Android API', version='0.2.0', docs_url=None, redoc_url=None, openapi_url=None)
     api.state.accounts, api.state.runtimes, api.state.speech = accounts, runtimes, speech
@@ -292,6 +294,7 @@ def create_hosted_app(config=None, data_directory=None):
             await rt.agent.decide()
             meetings = rt.store.work_meetings()
             resume_work_summaries(background, current, meetings)
+            meeting_addresses.schedule(background, rt.store, meetings)
             return {'user': current, 'settings': rt.store.settings().model_dump(),
                     'capabilities': config.capabilities(), 'agent': rt.agent.snapshot(),
                     'transcripts': list(reversed(rt.store.list('transcripts', 100))),
@@ -931,7 +934,7 @@ def create_hosted_app(config=None, data_directory=None):
         return Store(str(path)) if path.exists() else None
 
     @api.post('/v1/work-meetings')
-    async def start_work_meeting(value: WorkMeetingStart, request: Request, current=Depends(user)):
+    async def start_work_meeting(value: WorkMeetingStart, request: Request, background: BackgroundTasks, current=Depends(user)):
         async with runtime(current, request) as rt:
             if rt.store.settings().mode != 'work':
                 raise HTTPException(409, '请先切换到工作模式')
@@ -939,20 +942,12 @@ def create_hosted_app(config=None, data_directory=None):
             if existing and bool(existing['whole_audio']) != value.whole_audio:
                 raise HTTPException(409, '会议录音方式不一致，请开始新的会议')
             location = value.location.model_dump() if value.location else {}
-            if not existing and value.location and value.location.source == 'gps':
-                from .services.maps import MapService
-                try:
-                    async with asyncio.timeout(3):
-                        place = await MapService(config).reverse(value.location)
-                    if place.get('available'):
-                        location['address'] = place['address']
-                except Exception:
-                    pass  # Coordinates remain usable when address lookup is unavailable.
             meeting = rt.store.start_work_meeting(value.meeting_id,
                 value.started_at.isoformat() if value.started_at else None,
                 location, value.whole_audio)
             if meeting['status'] != 'recording':
                 raise HTTPException(409, '这场会议已结束，请开始新的会议')
+            meeting_addresses.schedule(background, rt.store, [meeting])
             return meeting
 
     @api.post('/v1/work-meetings/{meeting_id}/audio')
@@ -983,6 +978,7 @@ def create_hosted_app(config=None, data_directory=None):
             store.purge_work_audio()
         meetings = store.work_meetings() if store else []
         resume_work_summaries(background, current, meetings)
+        meeting_addresses.schedule(background, store, meetings)
         return {'meetings': meetings}
 
     @api.get('/v1/work-meetings/{meeting_id}')
@@ -994,6 +990,7 @@ def create_hosted_app(config=None, data_directory=None):
         if meeting is None:
             raise HTTPException(404, '会议记录不存在')
         resume_work_summaries(background, current, [meeting])
+        meeting_addresses.schedule(background, store, [meeting])
         return meeting
 
     @api.post('/v1/work-meetings/{meeting_id}/events')

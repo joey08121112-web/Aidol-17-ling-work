@@ -827,12 +827,7 @@ public final class MainActivity extends Activity {
         return prefix + "可查看原文";
     }
     private String meetingPlace(JSONObject meeting) {
-        JSONObject location = meeting.optJSONObject("location");
-        if (location == null || !location.has("longitude")) return "地点：未获取（定位未授权或暂无定位）";
-        String address = location.optString("address");
-        if (!address.isEmpty()) return "开始地点：" + address;
-        return String.format(java.util.Locale.US, "开始地点：%.5f, %.5f（经纬度，地址暂不可用）",
-            location.optDouble("longitude"), location.optDouble("latitude"));
+        return MeetingPlace.label(meeting);
     }
     private void renderWorkMeetings() {
         if (workMeetingList == null || tab != 2) return;
@@ -1638,8 +1633,15 @@ public final class MainActivity extends Activity {
         automaticLocation = !updateRoute;
         android.location.LocationManager manager = (android.location.LocationManager) getSystemService(LOCATION_SERVICE);
         boolean precise = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
-        String provider = precise && manager.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER) ? android.location.LocationManager.GPS_PROVIDER : android.location.LocationManager.NETWORK_PROVIDER;
-        if (!manager.isProviderEnabled(provider)) {
+        List<String> providers = new ArrayList<>();
+        if (manager != null) {
+            List<String> enabled = manager.getProviders(true);
+            // Start network/fused alongside GPS: satellite-only requests can time out indoors.
+            for (String provider : new String[]{android.location.LocationManager.NETWORK_PROVIDER, "fused", android.location.LocationManager.GPS_PROVIDER}) {
+                if (enabled.contains(provider) && (precise || !android.location.LocationManager.GPS_PROVIDER.equals(provider))) providers.add(provider);
+            }
+        }
+        if (providers.isEmpty()) {
             if (!updateRoute) { locationFailed("系统定位未开启，可报城市查天气，或在系统设置开启定位"); return; }
             new AlertDialog.Builder(this).setTitle("请开启系统定位").setMessage("用于查询当地天气、附近地点和路线。")
             .setNegativeButton("取消", null).setPositiveButton("打开定位设置", (d, w) -> startActivity(new Intent(android.provider.Settings.ACTION_LOCATION_SOURCE_SETTINGS))).show(); return; }
@@ -1649,8 +1651,8 @@ public final class MainActivity extends Activity {
         locationListener = new android.location.LocationListener() {
             @Override public void onLocationChanged(android.location.Location location) {
                 if (locationListener != this || api != locationApi || !locationToken.equals(api.vault.token())) return;
-                long age = android.os.SystemClock.elapsedRealtimeNanos() - location.getElapsedRealtimeNanos();
-                if (age < 0 || age > 60000000000L || !location.hasAccuracy() || location.getAccuracy() > 200) return;
+                if (!usableLocation(location)) return;
+                if (BuildConfig.DEBUG) android.util.Log.d("AidolLocation", "Accepted provider=" + location.getProvider() + " accuracy_m=" + location.getAccuracy());
                 stopLocation(); if (!visible) return;
                 JSONObject point = json("longitude", location.getLongitude(), "latitude", location.getLatitude(), "accuracy", location.getAccuracy(), "source", "gps"); if (location.hasSpeed()) put(point, "speed", location.getSpeed());
                 JSONObject payload = cloneJson(settings()); put(payload, "mode", "commute"); put(payload, "auto_mode", false);
@@ -1667,8 +1669,29 @@ public final class MainActivity extends Activity {
             @Override public void onProviderDisabled(String p) {}
             @Override public void onStatusChanged(String p, int status, Bundle extras) {}
         };
-        try { manager.requestLocationUpdates(provider, 0, 0, locationListener, android.os.Looper.getMainLooper()); handler.postDelayed(locationTimeout, 25000); }
-        catch (Exception e) { locationFailed("无法获取位置，可报城市查天气，或检查定位权限与系统设置"); }
+        android.location.Location cached = null;
+        int subscribed = 0;
+        for (String provider : providers) {
+            // A provider may reject a request even while another remains usable.
+            try {
+                android.location.Location candidate = manager.getLastKnownLocation(provider);
+                if (usableLocation(candidate) && (cached == null || candidate.getElapsedRealtimeNanos() > cached.getElapsedRealtimeNanos())) cached = candidate;
+            } catch (RuntimeException ignored) {}
+            try {
+                manager.requestLocationUpdates(provider, 0, 0, locationListener, android.os.Looper.getMainLooper());
+                subscribed++;
+                if (BuildConfig.DEBUG) android.util.Log.d("AidolLocation", "Requested provider=" + provider);
+            } catch (RuntimeException ignored) {}
+        }
+        if (cached != null) locationListener.onLocationChanged(cached);
+        else if (subscribed > 0) handler.postDelayed(locationTimeout, 25000);
+        else locationFailed("无法获取位置，可报城市查天气，或检查定位权限与系统设置");
+    }
+    private static boolean usableLocation(android.location.Location location) {
+        if (location == null) return false;
+        long age = android.os.SystemClock.elapsedRealtimeNanos() - location.getElapsedRealtimeNanos();
+        return age >= 0 && age <= 60000000000L && location.hasAccuracy()
+            && Float.isFinite(location.getAccuracy()) && location.getAccuracy() >= 0 && location.getAccuracy() <= 200;
     }
     private void stopLocation() { handler.removeCallbacks(locationTimeout); if (locationListener != null) { try { ((android.location.LocationManager) getSystemService(LOCATION_SERVICE)).removeUpdates(locationListener); } catch (Exception ignored) {} locationListener = null; } }
 

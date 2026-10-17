@@ -49,9 +49,10 @@ def start(client):
     return meeting_id
 
 
-def test_start_snapshot_survives_retries_and_summary(work, monkeypatch):
+def test_start_snapshot_survives_retries_and_summary(work, config, monkeypatch):
     from datetime import datetime, timezone
     client, runtime, words, calls = work
+    config.amap_key = 'offline-only'
     async def reverse(self, location):
         return {'available': True, 'address': '测试会议地点'}
     monkeypatch.setattr('app.services.maps.MapService.reverse', reverse)
@@ -59,7 +60,8 @@ def test_start_snapshot_survives_retries_and_summary(work, monkeypatch):
     started_at = datetime.now(timezone.utc).isoformat()
     body = {'meeting_id': meeting_id, 'started_at': started_at,
             'location': {'longitude': 116.4, 'latitude': 39.9, 'accuracy': 30}}
-    first = client.post('/v1/work-meetings', json=body).json()
+    assert client.post('/v1/work-meetings', json=body).status_code == 200
+    first = client.get('/v1/work-meetings/' + meeting_id).json()
     assert first['location']['address'] == '测试会议地点'
     again = client.post('/v1/work-meetings', json={'meeting_id': meeting_id}).json()
     assert again['started_at'] == started_at and again['location'] == first['location']
