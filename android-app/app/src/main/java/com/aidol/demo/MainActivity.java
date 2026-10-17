@@ -1873,6 +1873,9 @@ public final class MainActivity extends Activity {
         if (development.audioMode() == AudioMode.RISE_SDK) {
             button(body, "连接 / 重新连接 Rise", true, () -> { if (canAct()) connectHeadset(); });
             button(body, "断开耳机", false, () -> { cancelSession("耳机已断开"); headset.disconnect(); });
+            if (BuildConfig.DEBUG) button(body, "结束耳机本地录音（调试）", false, () -> confirm("结束耳机本地录音？",
+                "这会结束耳机自身正在进行的录音片段。确认当前录音可以结束后再继续；结束后可回到对话页接通 AI。",
+                () -> headset.stopLocalRecording(message -> { if (!isDestroyed()) feedback(message, null); })));
             CheckBox controls = new CheckBox(this); controls.setText("开启耳机触控联动（前台或已开启的锁屏会话）");
             controls.setTextColor(INK); controls.setChecked(headsetControlsOptIn); body.addView(controls);
             controls.setOnCheckedChangeListener((button, checked) -> {
