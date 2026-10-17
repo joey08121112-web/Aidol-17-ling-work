@@ -4,6 +4,7 @@ import com.aidol.demo.CaptureSource;
 import java.io.ByteArrayOutputStream;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.Test;
@@ -123,6 +124,64 @@ public class VendorCaptureSourceTest {
                 assertEquals(0, result.endings.get()); assertEquals(1, device.cancels);
             }
         }
+    }
+    @Test public void cancelledQueuedStartCannotOpenThisOrTheNextGeneration() {
+        Device device = new Device(); AtomicInteger starts = new AtomicInteger();
+        try (VendorCaptureSource source = new VendorCaptureSource(device)) {
+            source.start(new Result()); FusionDevice.Listener queued = device.listener;
+            source.cancel();
+            assertFalse(queued.startIfCurrent(starts::incrementAndGet));
+            source.start(new Result()); FusionDevice.Listener current = device.listener;
+            assertFalse(queued.startIfCurrent(starts::incrementAndGet));
+            assertTrue(current.startIfCurrent(starts::incrementAndGet));
+            assertEquals(1, starts.get());
+            source.close();
+            assertFalse(current.startIfCurrent(starts::incrementAndGet));
+            assertEquals(1, starts.get());
+        }
+    }
+    @Test public void closeBeforeStartRejectsWithoutDispatchingToTheDevice() {
+        Device device = new Device(); Result result = new Result();
+        VendorCaptureSource source = new VendorCaptureSource(device);
+        source.close(); source.start(result);
+        assertNull(device.listener); assertNotNull(result.error); assertFalse(result.recording);
+    }
+    @Test public void actualStartCommandAndCancellationAreAtomic() throws Exception {
+        Device device = new Device();
+        CountDownLatch enteredStart = new CountDownLatch(1), releaseStart = new CountDownLatch(1);
+        CountDownLatch attemptedCancel = new CountDownLatch(1), cancelled = new CountDownLatch(1);
+        AtomicBoolean accepted = new AtomicBoolean(); AtomicInteger starts = new AtomicInteger();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        try (VendorCaptureSource source = new VendorCaptureSource(device)) {
+            source.start(new Result()); FusionDevice.Listener queued = device.listener;
+            Thread starter = new Thread(() -> {
+                try { accepted.set(queued.startIfCurrent(() -> {
+                    enteredStart.countDown();
+                    try { assertTrue(releaseStart.await(2, TimeUnit.SECONDS)); }
+                    catch (InterruptedException ex) { Thread.currentThread().interrupt(); throw new AssertionError(ex); }
+                    starts.incrementAndGet();
+                })); } catch (Throwable error) { failure.compareAndSet(null, error); }
+            });
+            Thread canceller = new Thread(() -> {
+                attemptedCancel.countDown();
+                try { source.cancel(); cancelled.countDown(); }
+                catch (Throwable error) { failure.compareAndSet(null, error); }
+            });
+            try {
+                starter.start(); assertTrue(enteredStart.await(1, TimeUnit.SECONDS));
+                canceller.start(); assertTrue(attemptedCancel.await(1, TimeUnit.SECONDS));
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+                while (canceller.isAlive() && canceller.getState() != Thread.State.BLOCKED && System.nanoTime() < deadline) Thread.sleep(1);
+                assertEquals(Thread.State.BLOCKED, canceller.getState());
+                assertEquals("cancel cannot complete between the validity check and SDK start", 1L, cancelled.getCount());
+            } finally {
+                releaseStart.countDown(); starter.join(2000); canceller.join(2000);
+            }
+            assertFalse(starter.isAlive()); assertFalse(canceller.isAlive()); assertNull(failure.get());
+            assertTrue(accepted.get()); assertEquals(1, starts.get()); assertEquals(0L, cancelled.getCount());
+            assertEquals(1, device.cancels);
+            assertFalse(queued.startIfCurrent(starts::incrementAndGet)); assertEquals(1, starts.get());
+        } finally { releaseStart.countDown(); }
     }
     @Test public void halfSampleAtIdleFailsInsteadOfTruncating() throws Exception {
         Device device = new Device(); Result result = new Result();

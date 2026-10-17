@@ -52,6 +52,13 @@ public final class VendorCaptureSource implements CaptureSource, AutoCloseable {
             listener = target; completion = null; active = true; stopping = false; idle = false;
             recording = false; pendingByte = -1; queuedBytes = 0; receivedBytes = 0; queue.clear();
             vendorListener = new FusionDevice.Listener() {
+                @Override public boolean startIfCurrent(Runnable startCommand) {
+                    synchronized (VendorCaptureSource.this) {
+                        if (!current(token)) return false;
+                        startCommand.run();
+                        return true;
+                    }
+                }
                 @Override public void state(String state, int scene) { onState(token, state, scene); }
                 @Override public void pcm(int channel, byte[] bytes) { onPcm(token, channel, bytes); }
                 @Override public void error(String message) { fail(token, message, true); }

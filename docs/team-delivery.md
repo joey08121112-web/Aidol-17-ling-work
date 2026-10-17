@@ -4,6 +4,8 @@
 
 本轮追加的触控、佩戴、重连和电量联动操作见 [Rise 联动](rise-controls.md)。
 
+App 已内置切模式、开始和结束的固定中文操作提示；运行时不额外请求后端合成。五个 WAV 是产品源资产，随 Git 和源码交接包提供，macOS 无需安装 Windows 语音引擎，见 [操作语音](android-audio-prompts.md)。
+
 ## 需要发给同事的文件
 
 1. Git 仓库地址及本轮提交号，或 `artifacts/aidol-m0-m1-handoff.zip` 源码快照。快照含官方资料；Git 不含生成 APK 或 SDK AAR。

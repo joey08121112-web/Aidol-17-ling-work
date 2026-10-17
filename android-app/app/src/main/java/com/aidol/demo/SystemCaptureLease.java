@@ -2,7 +2,7 @@ package com.aidol.demo;
 
 import java.util.concurrent.atomic.AtomicReference;
 
-/** Shared across SDK and AudioRecord; release only after device/route cleanup is confirmed. */
+/** Shared by SDK, AudioRecord and M1 playback; release only after device/route cleanup is confirmed. */
 public final class SystemCaptureLease {
     private static final AtomicReference<Object> OWNER = new AtomicReference<>();
     private SystemCaptureLease() {}

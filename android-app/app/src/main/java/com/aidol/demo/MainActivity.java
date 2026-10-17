@@ -59,6 +59,7 @@ public final class MainActivity extends Activity {
     private ModeChangeRetry modeChange;
     private Runnable modeChangeDelay;
     private boolean sessionIsReplay;
+    private String sessionOperationNotice;
     private boolean headsetControlsOptIn, controlsRequested;
     private String pendingHeadsetNotice = "";
     private final HeadsetInteractionPolicy headsetPolicy = new HeadsetInteractionPolicy();
@@ -617,7 +618,8 @@ public final class MainActivity extends Activity {
         scrollDialog("纪要来源", body);
     }
 
-    private void changeMode(String mode) {
+    private void changeMode(String mode) { changeMode(mode, false); }
+    private void changeMode(String mode, boolean openConversation) {
         if (busy || locationListener != null || permissionPending) { toast("上一项操作正在进行，请稍后切换模式"); return; }
         if (session != null && !session.cancelIfRecording()) { headsetNotice("本轮正在处理，请结束后再切换模式"); return; }
         if (session != null) cancelSession("正在切换模式，未发送的录音已取消");
@@ -625,7 +627,7 @@ public final class MainActivity extends Activity {
         JSONObject body = cloneJson(settings()); put(body, "mode", mode); put(body, "auto_mode", false);
         ModeChangeRetry change = new ModeChangeRetry(mode, api, sessionGeneration, android.os.SystemClock.elapsedRealtime());
         modeChange = change; busy = true; lastNotice = "正在切换" + modeName(mode); updateStatus();
-        submitModeChange(change, api, body);
+        submitModeChange(change, api, body, openConversation);
     }
     private boolean currentModeChange(ModeChangeRetry change) {
         return !isDestroyed() && modeChange == change && change.matches(api, sessionGeneration);
@@ -653,7 +655,7 @@ public final class MainActivity extends Activity {
             lastNotice = "模式尚未切换，请稍后重新选择"; updateStatus();
         }
     }
-    private void submitModeChange(ModeChangeRetry change, ApiClient client, JSONObject body) {
+    private void submitModeChange(ModeChangeRetry change, ApiClient client, JSONObject body, boolean openConversation) {
         if (!currentModeChange(change) || !change.canAttempt(android.os.SystemClock.elapsedRealtime(), api, sessionGeneration, visible)) {
             abandonModeChange(change); return;
         }
@@ -665,11 +667,25 @@ public final class MainActivity extends Activity {
                     if (!currentModeChange(change)) { abandonModeChange(change); return; }
                     finishModeChange(change);
                     put(state, "settings", result);
+                    String appliedMode = result.optString("mode", change.mode);
                     JSONObject agent = state.optJSONObject("agent"); if (agent == null) agent = new JSONObject();
-                    put(agent, "mode", change.mode); put(state, "agent", agent);
+                    put(agent, "mode", appliedMode); put(state, "agent", agent);
                     diagnosticError = "无";
-                    lastNotice = "已切换" + modeName(change.mode) + "；等待你手动开始";
+                    String appliedNotice = "已切换" + modeName(appliedMode);
+                    lastNotice = appliedNotice + "；等待你手动开始";
+                    if (openConversation) tab = 0;
                     showApp(); if (visible) toast(lastNotice);
+                    // Commit the real settings result first. Playback cannot undo or repeat that update.
+                    if (visible && client == api && change.matches(api, sessionGeneration) && session == null) {
+                        try {
+                            newSession(appliedNotice);
+                            session.announceMode(appliedMode);
+                        } catch (RuntimeException unavailable) {
+                            cancelSession("");
+                            lastNotice = appliedNotice + "；操作提示未播放，请检查耳机连接";
+                            diagnosticError = "操作提示无法启动"; renderDiagnostics(); updateStatus();
+                        }
+                    }
                 });
             } catch (Exception error) { runOnUiThread(() -> {
                 if (!currentModeChange(change)) { abandonModeChange(change); return; }
@@ -678,7 +694,7 @@ public final class MainActivity extends Activity {
                     api, sessionGeneration, visible);
                 if (delay >= 0) {
                     lastNotice = "上一轮正在收尾，稍后切换" + modeName(change.mode); updateStatus();
-                    modeChangeDelay = () -> submitModeChange(change, client, body);
+                    modeChangeDelay = () -> submitModeChange(change, client, body, openConversation);
                     handler.postDelayed(modeChangeDelay, delay);
                     return;
                 }
@@ -693,10 +709,7 @@ public final class MainActivity extends Activity {
             }); }
         });
     }
-    private void saveModeAndOpenWork() {
-        JSONObject body = cloneJson(settings()); put(body, "mode", "work"); put(body, "auto_mode", false);
-        request(() -> api.json("PUT", "/v1/settings", body), r -> { tab = 0; refresh(); });
-    }
+    private void saveModeAndOpenWork() { changeMode("work", true); }
     private void mutate(String method, String path, JSONObject body) { if (canAct()) request(() -> api.json(method, path, body), r -> refresh()); }
     private void refresh() {
         if (busy || session != null || api.vault.token().isEmpty()) return;
@@ -742,19 +755,24 @@ public final class MainActivity extends Activity {
     private void startSession(String text) { if (text != null) stopRepeat(); newSession(); sessionUsesCapture = text == null; if (text == null) {
         session.configure(listenMode == 2 ? settings().optInt("listen_seconds", 30) : 60, listenMode != 0 && !"work".equals(mode()), settings().optDouble("vad_threshold", .025)); session.start();
     } else { lastUser = text; session.startText(text); } }
-    private void newSession() {
+    private void newSession() { newSession(null); }
+    private void newSession(String operationNotice) {
+        final boolean operationCue = operationNotice != null;
         final long generation = ++sessionGeneration;
-        sessionUsesCapture = false; sessionIsReplay = false;
-        turnSucceeded = false; recording = false; lastNotice = "正在连接…"; getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        diagnosticInput = "本轮尚未录音"; diagnosticOutput = "本轮尚未播放"; diagnosticError = "无"; diagnosticRms = 0; diagnosticBytes = 0;
+        sessionUsesCapture = false; sessionIsReplay = operationCue; sessionOperationNotice = operationNotice;
+        turnSucceeded = operationCue; recording = false;
+        lastNotice = operationCue ? operationNotice + "；正在播放操作提示" : "正在连接…";
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        diagnosticInput = operationCue ? "操作提示，不采集录音" : "本轮尚未录音";
+        diagnosticOutput = "本轮尚未播放"; diagnosticError = "无"; diagnosticRms = 0; diagnosticBytes = 0;
         HostedSession.Listener listener = new HostedSession.Listener() {
-            @Override public void status(String text) { if (!currentSession(generation)) return; lastNotice = text; diagnosticStage = text; renderDiagnostics(); if (text.contains("正在识别") || text.contains("正在思考") || text.contains("正在结束")) { recording = false; if (voiceButton != null) voiceButton.setText("正在处理…"); } if (status != null) status.setText("●  " + text); }
-            @Override public void failure(String text) { if (!currentSession(generation)) return; turnSucceeded = false; stopRepeat(); lastNotice = text; diagnosticError = text; renderDiagnostics(); updateStatus(); }
+            @Override public void status(String text) { if (!currentSession(generation)) return; lastNotice = operationCue && !text.startsWith(operationNotice) ? operationNotice + "；" + text : text; diagnosticStage = text; renderDiagnostics(); if (text.contains("正在识别") || text.contains("正在思考") || text.contains("正在结束")) { recording = false; if (voiceButton != null) voiceButton.setText("正在处理…"); } if (status != null) status.setText("●  " + lastNotice); }
+            @Override public void failure(String text) { if (!currentSession(generation)) return; turnSucceeded = false; stopRepeat(); lastNotice = operationCue ? operationNotice + "；操作提示未播放，请检查耳机连接" : text; diagnosticError = text; renderDiagnostics(); updateStatus(); }
             @Override public void input(String text) { if (!currentSession(generation)) return; diagnosticInput = text; renderDiagnostics(); }
             @Override public void output(String text) { if (!currentSession(generation)) return; diagnosticOutput = text; renderDiagnostics(); }
             @Override public void diagnostic(String text) { if (!currentSession(generation)) return; diagnosticSession = text; renderDiagnostics(); }
             @Override public void result(JSONObject value) {
-                if (!currentSession(generation)) return;
+                if (!currentSession(generation) || operationCue) return;
                 turnSucceeded = true;
                 lastUser = value.optString("text"); lastAnswer = value.optString("response");
                 if (!isDestroyed() && content != null) { chatBubble(content, false, lastUser, "刚刚"); if (!lastAnswer.isEmpty()) chatBubble(content, true, lastAnswer, "刚刚"); scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN)); }
@@ -764,8 +782,18 @@ public final class MainActivity extends Activity {
             @Override public void done() {
                 if (!currentSession(generation)) return;
                 ++sessionGeneration;
-                session = null; recording = false;
+                session = null; recording = false; sessionOperationNotice = null;
                 if (!isDestroyed()) {
+                    if (operationCue) {
+                        stopRepeat();
+                        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                        if (voiceButton != null) voiceButton.setText("◉  开始说话");
+                        if (cancelButton != null) cancelButton.setVisibility(View.GONE);
+                        if (orb != null) orb.level = 0;
+                        if (turnSucceeded) lastNotice = operationNotice + "；等待你手动开始";
+                        updateStatus();
+                        return; // Local operation cues do not refresh business data or start another recording.
+                    }
                     if (!turnSucceeded || !visible || (listenMode == 2 && !"life".equals(mode()))) stopRepeat();
                     if (repeatArmed) { repeatAt = android.os.SystemClock.elapsedRealtime() + (listenMode == 2 ? settings().optInt("life_poll_seconds", 300) * 1000L : 1000); handler.removeCallbacks(repeatTick); handler.postDelayed(repeatTick, 1000); }
                     else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
@@ -777,19 +805,21 @@ public final class MainActivity extends Activity {
         AudioMode input = development.audioMode();
         if (input == AudioMode.RISE_SDK) session = new HostedSession(this, api, input, new VendorCaptureSource(headset), headset::matchesOutput, listener);
         else session = new HostedSession(this, api, input, listener);
-        if (voiceButton != null) voiceButton.setText("正在准备…"); if (cancelButton != null) cancelButton.setVisibility(View.VISIBLE); updateStatus();
+        if (voiceButton != null) voiceButton.setText(operationCue ? "正在播放操作提示…" : "正在准备…"); if (cancelButton != null) cancelButton.setVisibility(View.VISIBLE); updateStatus();
     }
     private boolean currentSession(long generation) { return !isDestroyed() && generation == sessionGeneration; }
     private boolean hasHeadsetBoundSession() { return session != null && (sessionUsesCapture || sessionIsReplay); }
     private void cancelSession(String reason) {
         stopRepeat(); clearHeadsetGesture(); ++sessionGeneration;
+        String appliedNotice = sessionOperationNotice; sessionOperationNotice = null;
         HostedSession old = session; session = null; recording = false; turnSucceeded = false;
         if (old != null) old.cancel();
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         if (voiceButton != null) voiceButton.setText("◉  开始说话");
         if (cancelButton != null) cancelButton.setVisibility(View.GONE);
         if (orb != null) orb.level = 0;
-        lastNotice = reason; diagnosticStage = "已取消"; renderDiagnostics(); updateStatus();
+        lastNotice = appliedNotice == null ? reason : appliedNotice + "；操作提示已停止";
+        diagnosticStage = "已取消"; renderDiagnostics(); updateStatus();
     }
     @Override public void onRequestPermissionsResult(int code, String[] permissions, int[] grants) {
         super.onRequestPermissionsResult(code, permissions, grants);
@@ -980,7 +1010,7 @@ public final class MainActivity extends Activity {
                 toast(checked ? "已申请触控联动；请看设备状态并实际测试手势" : "触控联动已关闭");
             });
             label(body, "按一下（单击 / 单捏）：开始或结束发送单轮对话\n按两下（双击 / 双捏）：生活 → 工作 → 通勤\n长按 / 长捏：取消本轮\n单击、双击会等待组合手势判定。三击不绑定动作，并撤销尚未执行的组合手势；短按、释放及滑动不映射动作。\n\n以上只响应 SDK 实际上报的事件，不修改耳机系统手势或固件。显示已开启不等于每种手势已实测。", 11, MUTED);
-            label(body, "之前确认佩戴后，双耳都明确未佩戴时暂停；单耳及未知状态不推断摘下。戴回、重连只恢复就绪，不自动开麦。电量 ≤20% 和 ≤10% 分级提醒，回升超过25%后才重新提醒。工作模式提示仅显示文字，保持安静。", 11, MUTED);
+            label(body, "之前确认佩戴后，双耳都明确未佩戴时暂停；单耳及未知状态不推断摘下。戴回、重连只恢复就绪，不自动开麦。电量 ≤20% 和 ≤10% 分级提醒，回升超过25%后才重新提醒。模式切换、开始和结束录音播放简短操作提示；工作模式的业务回答仍保持静音。", 11, MUTED);
         } else label(body, "当前使用 " + audioModeLabel() + "。Rise 接入在开发设置中选择，实物验收后再调整发布策略。", 12, MUTED);
         button(body, "打开系统蓝牙设置", false, () -> startActivity(new Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS)));
         ScrollView container = new ScrollView(this); container.addView(body);

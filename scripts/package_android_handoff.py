@@ -7,6 +7,8 @@ import subprocess
 import zipfile
 
 SDK_SHA256 = "e074506fd3a46346272fdd2ab632a59b4cef2597f4cb37fd160737eb536e2b2c"
+PRODUCT_CUES = {f"android-app/app/src/main/res/raw/cue_{name}.wav"
+                for name in ("life", "work", "commute", "start", "end")}
 
 
 def main():
@@ -36,7 +38,8 @@ def main():
         if not path.is_relative_to(root) or not path.is_file():
             skipped.append(name)
             continue
-        if (set(relative.parts) & blocked_parts or relative.suffix.lower() in blocked_suffixes
+        if (set(relative.parts) & blocked_parts
+                or (relative.suffix.lower() in blocked_suffixes and relative.as_posix() not in PRODUCT_CUES)
                 or (relative.name.startswith(".env") and relative.name != ".env.example")
                 or relative.name == "local.properties"):
             skipped.append(name)

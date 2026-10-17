@@ -34,7 +34,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 public final class HeadsetController implements FusionDevice, AutoCloseable {
     public enum State { DISCONNECTED, INITIALIZING, CONNECTING, CONNECTED, READY, DISCONNECTING, ERROR }
     public interface Listener { void changed(Snapshot snapshot); }
-    public enum ControlsState { DISABLED, ENABLING, ENABLED, DISABLING, ERROR }
+    public enum ControlsState { DISABLED, WAITING_FOR_WEAR, ENABLING, ENABLED, DISABLING, ERROR }
     public enum ControlKind {
         TAP, DOUBLE_TAP, TRIPLE_TAP, SHORT_PRESS, LONG_PRESS, RELEASE, SLIDE_FORWARD, SLIDE_BACKWARD,
         PRESS_SINGLE, PRESS_DOUBLE, PRESS_TRIPLE, PRESS_LONG, PRESS_CLICK_HOLD, PRESS_QUADRUPLE, PRESS_QUINTUPLE
@@ -83,6 +83,7 @@ public final class HeadsetController implements FusionDevice, AutoCloseable {
     private final CopyOnWriteArrayList<Listener> listeners = new CopyOnWriteArrayList<>();
     private final CopyOnWriteArrayList<ControlListener> controlListeners = new CopyOnWriteArrayList<>();
     private final ControlEventGate controlGate = new ControlEventGate();
+    private final ControlWearGate controlWearGate = new ControlWearGate();
     private OnAuraTestEventListener vendorControlListener;
     private boolean controlsWanted, controlsFaulted;
     private ControlFailure controlsFailure;
@@ -90,6 +91,8 @@ public final class HeadsetController implements FusionDevice, AutoCloseable {
     private ControlsState controlsState = ControlsState.DISABLED;
     private String controlsSummary = "触控联动未开启", lastControlEvent = "尚未收到实际触控";
     private Runnable controlsTimeout;
+    private Runnable controlsWearTimeout;
+    private boolean controlsWearTimedOut;
     private boolean reconnectPending, explicitReconnect;
     private int reconnectAttempts;
     private Runnable reconnectTask;
@@ -127,6 +130,7 @@ public final class HeadsetController implements FusionDevice, AutoCloseable {
         boolean changed = controlsWanted != enabled;
         controlsWanted = enabled;
         if (!enabled) {
+            clearControlsWearWait();
             cancelReconnect();
             if (vendorControlListener != null) stopControls(false);
             else if (controlsState != ControlsState.DISABLING) updateControls(ControlsState.DISABLED, "触控联动未开启");
@@ -145,6 +149,10 @@ public final class HeadsetController implements FusionDevice, AutoCloseable {
         if (closed || !controlsWanted || controlsFaulted || vendorControlListener != null
                 || controlsState == ControlsState.DISABLING) return;
         if (!snapshot.ready() || !deviceStillReady()) { updateControls(ControlsState.DISABLED, "等待耳机就绪后开启触控"); return; }
+        // Product policy: one real worn position from this connection is enough. It is not a
+        // meaning assigned to status=6 and does not retry a failed firmware registration.
+        if (!controlWearGate.worn()) { waitForControlWear(); return; }
+        clearControlsWearWait();
         final long operation = ++controlsOperation;
         final long token = controlGate.begin(connectedMac);
         final OnAuraTestEventListener requested = new OnAuraTestEventListener() {
@@ -191,6 +199,30 @@ public final class HeadsetController implements FusionDevice, AutoCloseable {
             });
         } catch (RuntimeException | LinkageError failure) { controlFailure(ControlFailure.Stage.OPEN, 2400, "触控调用异常"); }
     }
+    private void waitForControlWear() {
+        updateControls(ControlsState.WAITING_FOR_WEAR, controlWearGate.bothOut()
+                ? "等待至少一耳佩戴后开启触控"
+                : controlsWearTimedOut ? "尚未收到有效佩戴状态，继续等待；可检查耳机后重新连接"
+                : "正在确认佩戴状态，等待至少一耳佩戴后开启触控");
+        final long connection = connectionGeneration;
+        requestWearQuery(connection);
+        if (controlsWearTimeout != null) return;
+        controlsWearTimeout = () -> {
+            if (closed || connection != connectionGeneration || !controlsWanted || controlsFaulted
+                    || vendorControlListener != null || controlsState != ControlsState.WAITING_FOR_WEAR) return;
+            controlsWearTimedOut = true;
+            if (!controlWearGate.worn() && !controlWearGate.bothOut())
+                updateControls(ControlsState.WAITING_FOR_WEAR, "尚未收到有效佩戴状态，继续等待；可检查耳机后重新连接");
+        };
+        main.postDelayed(controlsWearTimeout, 4000);
+    }
+    private void requestWearQuery(long connection) {
+        if (controlWearGate.claimQuery(connection)) HeadsetManager.refreshAuraPower();
+    }
+    private void clearControlsWearWait() {
+        if (controlsWearTimeout != null) main.removeCallbacks(controlsWearTimeout);
+        controlsWearTimeout = null; controlsWearTimedOut = false;
+    }
     private void controlFailure(ControlFailure.Stage stage, int code, String message) {
         controlsFaulted = true; controlsFailure = new ControlFailure(stage, code, message);
         stopControls(true);
@@ -207,6 +239,7 @@ public final class HeadsetController implements FusionDevice, AutoCloseable {
         updateControls(ControlsState.ERROR, controlsFailure.summary());
     }
     private void stopControls(boolean preserveError) {
+        clearControlsWearWait();
         final OnAuraTestEventListener previous = vendorControlListener;
         vendorControlListener = null; controlGate.invalidate(); clearControlsTimeout();
         final long operation = ++controlsOperation;
@@ -388,15 +421,17 @@ public final class HeadsetController implements FusionDevice, AutoCloseable {
                     if (copy.hasAttribute(PowerEntity.ATTR_CASE_POWER)) caseBattery = reportedBattery(copy.getCasePowerValue());
                     if (copy.hasAttribute(PowerEntity.ATTR_POSITION)) {
                         leftWorn = reportedWear(copy.getLeftPositionCode()); rightWorn = reportedWear(copy.getRightPositionCode());
+                        controlWearGate.observe(token, true, leftWorn, rightWorn);
                     }
                     publish(State.READY, "耳机已就绪");
+                    if (copy.hasAttribute(PowerEntity.ATTR_POSITION)) maybeStartControls();
                 });
             }
             @Override public void onError(int code, String ignoredMessage) { main.post(() -> {
                 if (token == connectionGeneration) { lastCode = "power_" + code; publish(snapshot.state, snapshot.message); }
             }); }
         };
-        HeadsetManager.addAuraPowerListener(powerListener); HeadsetManager.refreshAuraPower();
+        HeadsetManager.addAuraPowerListener(powerListener); requestWearQuery(token);
         HeadsetManager.getSN(new OnResultListener<SNEntity>() {
             @Override public void onResult(SNEntity sn) { main.post(() -> {
                 if (closed || token != connectionGeneration || sn == null) return;
@@ -411,7 +446,8 @@ public final class HeadsetController implements FusionDevice, AutoCloseable {
     private static boolean isA10(String serial) { return serial != null && (serial.startsWith("A10L") || serial.startsWith("A10R")); }
 
     @Override public void startFusion(FusionDevice.Listener listener) {
-        main.post(() -> {
+        // Checking before posting is insufficient: cancellation may invalidate the source while queued.
+        main.post(() -> listener.startIfCurrent(() -> {
             if (closed || !snapshot.ready() || !deviceStillReady() || inCall || captureOwner != null || HeadsetManager.isFusionRecordBusy()) {
                 listener.error(inCall ? "通话期间不能开启 AI 录音" : "耳机尚未就绪或录音未结束，请重新连接"); return;
             }
@@ -445,7 +481,7 @@ public final class HeadsetController implements FusionDevice, AutoCloseable {
                     }
                 });
             } catch (RuntimeException | LinkageError failure) { listener.error("耳机录音无法启动，请重新连接"); }
-        });
+        }));
     }
     @Override public void stopFusion(FusionDevice.Listener owner) {
         main.post(() -> {
@@ -574,6 +610,7 @@ public final class HeadsetController implements FusionDevice, AutoCloseable {
     }
     private void resetProperties() {
         model = "未知"; leftBattery = rightBattery = caseBattery = null; leftWorn = rightWorn = null;
+        controlWearGate.reset(connectionGeneration);
     }
     private void publish(State state, String message) {
         snapshot = new Snapshot(state, message, model, leftBattery, rightBattery, caseBattery, leftWorn, rightWorn,

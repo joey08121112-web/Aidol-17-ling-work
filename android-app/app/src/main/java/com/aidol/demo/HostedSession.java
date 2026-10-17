@@ -35,20 +35,25 @@ public final class HostedSession {
     private final Listener listener;
     private final AudioMode mode;
     private final CaptureSource capture;
-    private final ReplyPlayer player;
+    private final Context context;
+    private final Predicate<AudioDeviceInfo> outputIdentity;
+    private volatile ReplyPlayer player;
     private final AudioManager audioManager;
     private final Handler ui;
     private final SessionEvents events = new SessionEvents();
     private final AtomicBoolean cancelled = new AtomicBoolean(), launched = new AtomicBoolean();
+    private final CapturePromptSequence prompts = new CapturePromptSequence(cancelled::get);
     private final AtomicBoolean firstPcm = new AtomicBoolean();
     private final CountDownLatch end = new CountDownLatch(1);
     private final String sessionId = UUID.randomUUID().toString();
     private final String requestId = UUID.randomUUID().toString();
     private final long createdAt;
     private final Object vadLock = new Object();
+    private final Object captureStartLock = new Object();
     private volatile CaptureTurn turn = new CaptureTurn(60);
     private volatile Call pending;
     private volatile String failure;
+    private String promptNotice = "";
     private volatile boolean captureActive;
     private volatile AudioFocusRequest captureFocus;
     private Thread worker;
@@ -72,9 +77,9 @@ public final class HostedSession {
         this.mode = AudioMode.requirePhysical(mode);
         if (capture == null) throw new IllegalArgumentException("必须明确提供录音来源");
         this.api = api; this.listener = listener; this.capture = capture;
+        this.context = context.getApplicationContext(); this.outputIdentity = outputIdentity;
         ui = new Handler(Looper.getMainLooper()); createdAt = SystemClock.elapsedRealtime();
         audioManager = (AudioManager) context.getApplicationContext().getSystemService(Context.AUDIO_SERVICE);
-        player = new ReplyPlayer(context, mode, outputIdentity);
     }
     private static CaptureSource systemCapture(Context context, AudioMode mode) {
         AudioMode.requirePhysical(mode);
@@ -97,45 +102,48 @@ public final class HostedSession {
         return "session=" + sessionId + " request_id=" + requestId + " phase=" + phase()
             + " bytes=" + turn.size() + " elapsed_ms=" + (SystemClock.elapsedRealtime() - createdAt);
     }
-    public void start() { launch(null, null, "aidol-voice"); }
-    public void startText(String text) { launch(text, null, "aidol-chat"); }
-    public void speak(String text) { launch(null, text, "aidol-play"); }
-    private void launch(String text, String playback, String name) {
+    public void start() { launch(null, null, null, "aidol-voice"); }
+    public void startText(String text) { launch(text, null, null, "aidol-chat"); }
+    public void speak(String text) { launch(null, text, null, "aidol-play"); }
+    /** Announce an already-confirmed settings change; never calls the backend or starts capture. */
+    public void announceMode(String businessMode) { launch(null, null, LocalCue.forMode(businessMode), "aidol-mode-cue"); }
+    private void launch(String text, String playback, LocalCue modeCue, String name) {
         if (!launched.compareAndSet(false, true)) throw new IllegalStateException("每个会话只能启动一次");
-        worker = new Thread(() -> run(text, playback), name); worker.start();
+        worker = new Thread(() -> run(text, playback, modeCue), name); worker.start();
     }
-    private void run(String text, String playback) {
+    private void run(String text, String playback, LocalCue modeCue) {
         try {
             check(); diagnostic("开始");
+            if (modeCue != null) {
+                try {
+                    playCue(modeCue); check();
+                    status("操作提示已播放；等待你手动开始");
+                } catch (Exception cueFailure) {
+                    check(); fail(modeCue.label + "已切换；提示音未播放：" + audioFailure(cueFailure));
+                }
+                return;
+            }
             if (playback != null) { play(playback); return; }
             JSONObject result;
             if (text == null) {
-                captureActive = true;
-                requestCaptureFocus(); check();
-                switch (mode) {
-                    case RISE_SDK: status("正在启动 Rise 耳机麦克风…"); break;
-                    case BLUETOOTH: status("正在连接系统蓝牙麦克风…"); break;
-                    case EMULATOR: throw new IllegalStateException("模拟器来源已停用，请使用安卓真机");
-                }
-                ui.postDelayed(startupTimeout, 12000);
-                capture.start(new CaptureSource.Listener() {
-                    public void status(String value) { if (captureActive) HostedSession.this.status(value); }
-                    public void input(String description) { if (captureActive) post(() -> listener.input(description)); }
-                    public void recording() {
-                        if (cancelled.get() || !captureActive || !turn.recording(SystemClock.elapsedRealtime())) return;
-                        ui.removeCallbacks(startupTimeout);
-                        diagnostic("录音就绪"); post(listener::recording);
-                        ui.postDelayed(limit, turn.recordingBudgetMillis());
-                    }
-                    public void error(String value) { failCapture(value); }
-                    public void pcm(byte[] bytes) { acceptPcm(bytes); }
-                });
+                prompts.start(() -> {
+                    playCue(LocalCue.START);
+                    // Allow the short media tail to clear before opening either microphone.
+                    Thread.sleep(200);
+                }, this::startCapture);
                 if (!end.await(recordSeconds + 15L, TimeUnit.SECONDS))
                     failCapture("录音等待超时，已丢弃本轮，请恢复或重连设备");
                 clearCaptureTimers(); check();
                 if (failure != null) throw new IOException(failure);
-                byte[] pcm = turn.finish();
-                captureActive = false; releaseCaptureFocus(); diagnostic("结束并排空");
+                byte[] pcm = prompts.finish(() -> {
+                    byte[] snapshot = turn.finish();
+                    captureActive = false; releaseCaptureFocus(); diagnostic("结束并排空");
+                    return snapshot;
+                }, () -> playCue(LocalCue.END), cueFailure -> {
+                    promptNotice = "结束提示音未播放";
+                    status("录音已结束，提示音未播放；正在提交录音");
+                    diagnostic("结束提示音失败 · " + audioFailure(cueFailure));
+                });
                 if (pcm.length < 3200) throw new IOException("录音太短，请重新录音");
                 status("正在识别并整理回复…"); diagnostic("上传 bytes=" + pcm.length);
                 result = new JSONObject(new String(request("/v1/voice?request_id=" + requestId,
@@ -154,7 +162,8 @@ public final class HostedSession {
                     return;
                 }
             }
-            status(result.optString("notice").isEmpty() ? "本轮完成 · 随时继续" : result.optString("notice"));
+            String notice = result.optString("notice").isEmpty() ? "本轮完成 · 随时继续" : result.optString("notice");
+            status(notice + (promptNotice.isEmpty() ? "" : "；" + promptNotice));
         } catch (Exception e) {
             if (!cancelled.get()) {
                 if (e instanceof ApiClient.ApiException && ((ApiClient.ApiException) e).status == 401) api.vault.clear();
@@ -165,12 +174,43 @@ public final class HostedSession {
             }
         } finally {
             captureActive = false; clearCaptureTimers();
-            capture.close(); releaseCaptureFocus(); player.cancel();
+            capture.close(); releaseCaptureFocus(); cancelPlayer();
             if (pending != null) pending.cancel();
             if (turn.phase() != CaptureTurn.Phase.ENDED && turn.phase() != CaptureTurn.Phase.FAILED) turn.cancel();
             // Cancellation invalidates queued done too; UI clears its active generation on cancel.
             post(listener::done);
         }
+    }
+    private void startCapture() throws Exception {
+        synchronized (captureStartLock) { check(); captureActive = true; }
+        requestCaptureFocus(); check();
+        switch (mode) {
+            case RISE_SDK: status("正在启动 Rise 耳机麦克风…"); break;
+            case BLUETOOTH: status("正在连接系统蓝牙麦克风…"); break;
+            case EMULATOR: throw new IllegalStateException("模拟器来源已停用，请使用安卓真机");
+        }
+        ui.postDelayed(startupTimeout, 12000);
+        // Mark/check readiness under one session gate, but never call a source while holding it:
+        // SDK callbacks may synchronously report failure under the source's own lifecycle gate.
+        synchronized (captureStartLock) {
+            check();
+            if (!captureActive || failure != null || turn.phase() != CaptureTurn.Phase.NEW)
+                throw new IOException(failure == null ? "录音准备已中止，请重新开始" : failure);
+        }
+        // Terminal cleanup closes the source even before start; the SDK also checks its generation
+        // at the queued command boundary. A failure between this gate and start stays final.
+        capture.start(new CaptureSource.Listener() {
+            public void status(String value) { if (captureActive) HostedSession.this.status(value); }
+            public void input(String description) { if (captureActive) post(() -> listener.input(description)); }
+            public void recording() {
+                if (cancelled.get() || !captureActive || !turn.recording(SystemClock.elapsedRealtime())) return;
+                ui.removeCallbacks(startupTimeout);
+                diagnostic("录音就绪"); post(listener::recording);
+                ui.postDelayed(limit, turn.recordingBudgetMillis());
+            }
+            public void error(String value) { failCapture(value); }
+            public void pcm(byte[] bytes) { acceptPcm(bytes); }
+        });
     }
     private void acceptPcm(byte[] bytes) {
         if (cancelled.get() || !captureActive) return;
@@ -212,14 +252,16 @@ public final class HostedSession {
         } catch (RuntimeException e) { failCapture("停止录音失败，请恢复或重连耳机"); }
     }
     private void failCapture(String message) {
-        synchronized (this) {
-            if (cancelled.get() || !captureActive || turn.phase() == CaptureTurn.Phase.DRAINING
-                || turn.phase() == CaptureTurn.Phase.ENDED) return;
-            if (failure == null) failure = message;
-            turn.fail(failure); captureActive = false;
+        synchronized (captureStartLock) {
+            synchronized (this) {
+                if (cancelled.get() || !captureActive || turn.phase() == CaptureTurn.Phase.DRAINING
+                    || turn.phase() == CaptureTurn.Phase.ENDED) return;
+                if (failure == null) failure = message;
+                turn.fail(failure); captureActive = false;
+            }
         }
         clearCaptureTimers();
-        capture.cancel(); releaseCaptureFocus(); end.countDown(); diagnostic("录音失败");
+        capture.close(); releaseCaptureFocus(); end.countDown(); diagnostic("录音失败");
     }
     private void requestCaptureFocus() throws IOException {
         if (mode != AudioMode.RISE_SDK) return;
@@ -253,15 +295,41 @@ public final class HostedSession {
                 .toString().getBytes(StandardCharsets.UTF_8), "application/json");
             stage = "音频输出"; diagnostic("TTS 响应"); check();
             status("正在核验耳机播放…");
-            player.play(WavAudio.pcm(wav), this::status, description -> {
-                post(() -> listener.output(description)); diagnostic("实际输出已核验");
-            });
+            playAudio(WavAudio.pcm(wav));
             check(); diagnostic("播放完成（听音待人工确认）");
         } catch (Exception e) {
             check();
             if (e instanceof ApiClient.ApiException && ((ApiClient.ApiException) e).status == 401) api.vault.clear();
             throw new IOException("播放失败：" + stage + " · " + (e.getMessage() == null ? "请检查音频输出后重试" : e.getMessage()), e);
         }
+    }
+    private void playCue(LocalCue cue) throws Exception {
+        check(); status("正在播放提示：" + cue.label); diagnostic("本地操作提示 " + cue.name());
+        playAudio(cue.pcm(context)); check();
+        diagnostic("操作提示播放完成（听音待人工确认）");
+    }
+    private void playAudio(byte[] pcm) throws Exception {
+        // Focus/route loss cancels a ReplyPlayer permanently. Give each segment its own player,
+        // so a failed END cue cannot silently suppress the subsequent business reply.
+        ReplyPlayer segment = new ReplyPlayer(context, mode, outputIdentity);
+        player = segment;
+        try (PlaybackLease ignored = PlaybackLease.acquire(cancelled::get, 4000)) {
+            check();
+            segment.play(pcm, this::status, description -> {
+                post(() -> listener.output(description)); diagnostic("实际输出已核验");
+            });
+            check();
+        } finally {
+            segment.cancel();
+            if (player == segment) player = null;
+        }
+    }
+    private static String audioFailure(Exception failure) {
+        return failure instanceof IOException && failure.getMessage() != null ? failure.getMessage() : "请检查耳机音频输出";
+    }
+    private void cancelPlayer() {
+        ReplyPlayer active = player;
+        if (active != null) active.cancel();
     }
     private void post(Runnable event) {
         if (cancelled.get()) return;
@@ -281,7 +349,9 @@ public final class HostedSession {
     public void cancel() {
         if (!cancelled.compareAndSet(false, true)) return;
         events.invalidate(); captureActive = false; turn.cancel(); clearCaptureTimers(); end.countDown();
-        if (pending != null) pending.cancel(); player.cancel(); capture.cancel(); releaseCaptureFocus();
+        if (pending != null) pending.cancel(); cancelPlayer();
+        capture.close();
+        releaseCaptureFocus();
         if (worker != null) worker.interrupt();
     }
 }

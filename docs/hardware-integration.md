@@ -8,9 +8,13 @@
 
 `VendorCaptureSource` 经可注入 `FusionDevice` 使用真实 `startFusionRecord` / `stopFusionRecord`，仅收channel=2的已解码PCM；channel=1扬声器、255结束标记不送ASR。官方为16kHz/mono/PCM16，按小端契约处理；字节序、速率、真实来源仍须实测。跨回调半样本暂存至下一块，结束仍不完整则失败。回调复制缓冲进入有界队列，满时失败，不默认写原始音频文件。
 
+实际 SDK 开麦命令通过 `FusionDevice.Listener.startIfCurrent(Runnable)` 在来源代次锁内执行；取消与排队启动原子互斥，不能先查一个布尔值后再无保护开麦。状态回调的就绪通知与首 PCM 保持顺序，取消后的旧回调不能开启新一轮。
+
 正常停止等待 `idle` 并排空后回调 `ended`，超时/超长/队列溢出不上传。取消立即禁收与丢弃，设备清理完成才能重开。统一采集占用防止SDK与系统AudioRecord/SCO并行。`CaptureTurn` 预留3秒停止预算，默认57秒发停止，含收尾最高60秒/1920000字节，不截断伪装成功。SDK自身停止确认2.5秒，开始最多等待12秒。
 
 输出走 Android `ReplyPlayer`，先静音核验实际路由再播放。Rise要求已就绪目标地址等于 `AudioDeviceInfo.getAddress()`；任意蓝牙、相似名称、SDK已连接不足以放行。系统不给地址或Android8缺该API时明确拒绝Rise播放，文字结果保留；系统蓝牙兼容模式需用户显式选择。采集停止后才上传/播放，工作遵守 `speak=false`，无自动插话。焦点/通话/断连/离开前台停止本轮，恢复不自动开麦。
+
+用户追加的模式/开始/结束提示使用五段本地固定语音，见 [操作语音](android-audio-prompts.md)。播放前通过 `PlaybackLease` 等待采集清理确认（最多4秒），占有同一互斥租约至播放结束；因此录音取消后立刻切模式，也不能与旧 SDK 采集重叠。每段使用独立播放器，提示失败不会使后续业务回复被静默跳过。开始提示失败不开麦；结束提示失败保留已排空录音，显式取消仍中止后续提交。工作模式允许操作提示，但业务回答继续按 `speak=false` 静音。
 
 设备页展示真实上报属性，debug诊断有SDK就绪、首PCM、字节数及阶段；不输出完整SN/MAC/电话号码/音频/Key。session和request ID关联后端ASR/业务/TTS日志。假FusionDevice只用于测试，不在App冒充实物。
 

@@ -1,0 +1,13 @@
+{
+  "voice": "Microsoft Huihui Desktop",
+  "sample_rate": 24000,
+  "channels": 1,
+  "bits_per_sample": 16,
+  "phrases": {
+    "cue_life": "生活模式",
+    "cue_work": "工作模式",
+    "cue_commute": "通勤模式",
+    "cue_start": "开始录音",
+    "cue_end": "录音结束"
+  }
+}
