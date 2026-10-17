@@ -170,16 +170,27 @@ public final class VisualReviewInstrumentation extends Instrumentation {
     private interface Checked { void run() throws Exception; }
     private void reviewWorkMeetings() throws Exception {
         JSONObject meeting = new JSONObject("{\"id\":\"offline-meeting-fixture-01\",\"started_at\":\"2026-10-17T11:00:00+00:00\",\"ended_at\":\"2026-10-17T11:30:00+00:00\",\"status\":\"saved\",\"summary_status\":\"pending\",\"summary_stage\":\"analyzing\",\"processed_sections\":1,\"total_sections\":3,\"transcript_count\":2,\"sources\":[{\"id\":\"source-one\",\"segment_index\":0,\"text\":\"今天讨论新版设计稿。我们原计划周三提交，颜色暂定蓝色，需要先确认客户反馈。\"},{\"id\":\"source-two\",\"segment_index\":1,\"text\":\"更正一下，我们决定改为周五提交蓝色设计稿，小林负责整理。是否增加红色版本还没有确定，下次再讨论。\"}]}");
+        meeting.put("whole_audio", true).put("transcription_status", "ready");
+        meeting.getJSONArray("sources").getJSONObject(0).put("speaker", "发言人 1");
+        meeting.getJSONArray("sources").getJSONObject(1).put("speaker", "发言人 2");
         onMain(() -> {
             set("state", new JSONObject().put("settings", new JSONObject().put("mode", "work"))
                 .put("work_meetings", new org.json.JSONArray().put(meeting)));
             set("tab", 2); invoke("showApp", new Class<?>[]{});
-            if (findText(activity.getWindow().getDecorView(), "原文已保存 · 正在分析 1/3 组") == null)
+            if (findText(activity.getWindow().getDecorView(), "原文已保存 · 正在总结 · 阅读整场文稿") == null)
                 throw new AssertionError("Meeting progress is missing");
         });
         capture("00-progress-list");
         onMain(() -> { invoke("openWorkMeeting", new Class<?>[]{String.class}, meeting.getString("id"));
             invoke("renderWorkMeetingDetail", new Class<?>[]{JSONObject.class}, meeting); });
+        onMain(() -> {
+            android.app.AlertDialog dialog = (android.app.AlertDialog) get("sourceDialog");
+            View root = dialog.getWindow().getDecorView();
+            if (findText(root, "发言人 1") == null || findText(root, "发言人 2") == null)
+                throw new AssertionError("Speaker dialogue is missing");
+            if (findText(root, "片段 1") != null || findText(root, "片段 2") != null)
+                throw new AssertionError("Upload boundaries leaked into dialogue");
+        });
         capture("01-original-transcript");
         onMain(() -> {
             android.app.AlertDialog dialog = (android.app.AlertDialog) get("sourceDialog");

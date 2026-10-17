@@ -653,20 +653,30 @@ public final class MainActivity extends Activity {
         String capture = meeting.optString("status"), summary = meeting.optString("summary_status");
         if ("recording".equals(capture)) {
             if (session != null && meeting.optString("id").equals(session.workMeetingId()))
-                return session.workSaving() ? "正在转写并保存 · 请等待尾段提交" : "正在记录 · 原文陆续保存";
-            return "录音尚未确认结束 · 已保存片段可查看";
+                return session.workSaving() ? "正在保存录音 · 请稍候" : "正在录音 · 结束后识别整场发言人";
+            return "录音尚未确认结束 · 可结束后识别已保存录音";
         }
         if ("empty".equals(capture)) return "未识别到讲话 · 没有可整理的原文";
+        if (meeting.optBoolean("whole_audio") && "pending".equals(meeting.optString("transcription_status")))
+            return "failed".equals(summary) ? "整场转写未完成 · 可重试" : "录音已保存 · 正在识别整场发言人";
         String prefix = "partial".equals(capture) ? "原文有缺段 · " : "原文已保存 · ";
         if ("pending".equals(summary)) {
             String stage = meeting.optString("summary_stage");
-            if ("analyzing".equals(stage)) return prefix + "正在分析 " + meeting.optInt("processed_sections") + "/" + meeting.optInt("total_sections") + " 组";
-            return prefix + ("synthesizing".equals(stage) ? "正在汇总会议纪要" : "等待 AI 整理");
+            if ("analyzing".equals(stage)) return prefix + "正在总结 · 阅读整场文稿";
+            return prefix + ("synthesizing".equals(stage) ? "正在总结 · 汇总中" : "正在总结 · 等待处理");
         }
-        if ("ready".equals(summary)) return prefix + "纪要已完成";
+        if ("ready".equals(summary)) return prefix + "总结完成";
         if ("fallback".equals(summary)) return prefix + "AI 整理未完成，可重试";
         if ("failed".equals(summary)) return prefix + "整理失败，可重试";
         return prefix + "可查看原文";
+    }
+    private String meetingPlace(JSONObject meeting) {
+        JSONObject location = meeting.optJSONObject("location");
+        if (location == null || !location.has("longitude")) return "地点：未获取（定位未授权或暂无定位）";
+        String address = location.optString("address");
+        if (!address.isEmpty()) return "开始地点：" + address;
+        return String.format(java.util.Locale.US, "开始地点：%.5f, %.5f（经纬度，地址暂不可用）",
+            location.optDouble("longitude"), location.optDouble("latitude"));
     }
     private void renderWorkMeetings() {
         if (workMeetingList == null || tab != 2) return;
@@ -683,7 +693,8 @@ public final class MainActivity extends Activity {
             LinearLayout item = card(workMeetingList);
             String title = meeting.isNull("title") ? "会议记录" : fallback(meeting.optString("title"), "会议记录");
             label(item, title, 17, INK);
-            label(item, date(meeting.optString("started_at")) + " · 已保存 " + meeting.optInt("transcript_count") + " 段原文", 11, MUTED);
+            label(item, date(meeting.optString("started_at")) + " · 本次会议文稿", 11, MUTED);
+            label(item, meetingPlace(meeting), 11, MUTED);
             label(item, workMeetingProgress(meeting), 13, WORK);
             String summary = meeting.isNull("summary") ? "" : meeting.optString("summary");
             if (!summary.isEmpty()) label(item, summary.length() > 120 ? summary.substring(0, 120) + "…" : summary, 13, MUTED);
@@ -718,9 +729,11 @@ public final class MainActivity extends Activity {
             });
         });
     }
+    private boolean workMeetingSummaryShown;
     private void openWorkMeeting(String meetingId) {
         if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; }
         openWorkMeetingId = meetingId; workMeetingDetailSnapshot = ""; workMeetingShowOriginal = true;
+        workMeetingSummaryShown = false;
         workMeetingDetail = dialogBody(); label(workMeetingDetail, "正在加载会议原文…", 14, MUTED);
         scrollDialog("会议记录", workMeetingDetail);
         sourceDialog.setOnDismissListener(d -> { openWorkMeetingId = ""; workMeetingDetail = null; workMeetingDetailStatus = null; });
@@ -730,36 +743,60 @@ public final class MainActivity extends Activity {
         if (workMeetingDetail == null || !meeting.optString("id").equals(openWorkMeetingId)) return;
         if (workMeetingDetailStatus != null) workMeetingDetailStatus.setText(workMeetingProgress(meeting));
         JSONObject report = meeting.optJSONObject("report");
+        if (!workMeetingSummaryShown && "ready".equals(meeting.optString("summary_status")) && report != null) {
+            workMeetingShowOriginal = false; workMeetingSummaryShown = true;
+        }
         JSONArray sources = array(meeting, "sources");
         String snapshot = json("sources", sources, "report", report, "summary_status", meeting.optString("summary_status"),
             "error", meeting.optString("error"), "original", workMeetingShowOriginal).toString();
         if (snapshot.equals(workMeetingDetailSnapshot)) return;
         workMeetingDetailSnapshot = snapshot; workMeetingDetail.removeAllViews();
         label(workMeetingDetail, report == null ? "本次会议" : report.optString("title", "本次会议"), 19, INK);
-        label(workMeetingDetail, date(meeting.optString("started_at")), 11, MUTED);
+        label(workMeetingDetail, "开始时间：" + date(meeting.optString("started_at")), 11, MUTED);
+        label(workMeetingDetail, meetingPlace(meeting), 12, MUTED);
         workMeetingDetailStatus = label(workMeetingDetail, workMeetingProgress(meeting), 13, WORK);
         if (!meeting.optString("error").isEmpty()) label(workMeetingDetail, meeting.optString("error"), 13, MUTED);
         LinearLayout tabs = row(); workMeetingDetail.addView(tabs);
         segment(tabs, "原始文稿", workMeetingShowOriginal, () -> { workMeetingShowOriginal = true; renderWorkMeetingDetail(meeting); });
         segment(tabs, "AI 纪要", !workMeetingShowOriginal, () -> { workMeetingShowOriginal = false; renderWorkMeetingDetail(meeting); });
         if (workMeetingShowOriginal) {
-            label(workMeetingDetail, "按录音片段顺序显示语音识别原文，未经 AI 改写；未区分说话人身份。", 12, MUTED);
-            if (sources.length() == 0) label(workMeetingDetail, "暂无已保存原文；录音转写后会陆续显示。", 14, MUTED);
+            boolean wholeDialogue = meeting.optBoolean("whole_audio");
+            label(workMeetingDetail, wholeDialogue ? "按发言顺序显示每个人说的话；同一发言人使用同一编号，编号不代表真实姓名。"
+                : "这份旧记录没有整场身份识别，无法确认的发言不会强行归到同一个人。", 12, MUTED);
+            if (sources.length() == 0) label(workMeetingDetail, "结束录音后，整场识别完成将在这里显示每个人的发言。", 14, MUTED);
             StringBuilder raw = new StringBuilder();
             for (int i = 0; i < sources.length(); i++) {
                 JSONObject source = sources.optJSONObject(i); if (source == null) continue;
-                label(workMeetingDetail, "片段 " + (source.optInt("segment_index") + 1), 11, WORK);
-                label(workMeetingDetail, source.optString("text"), 15, INK).setTextIsSelectable(true);
-                if (raw.length() > 0) raw.append("\n\n"); raw.append(source.optString("text"));
+                String speaker = wholeDialogue ? source.optString("speaker", "未识别发言人") : "身份未确认的发言";
+                JSONArray utterances = array(source, "utterances");
+                if (wholeDialogue || utterances.length() == 0) {
+                    LinearLayout turn = card(workMeetingDetail);
+                    label(turn, speaker, 13, WORK);
+                    label(turn, source.optString("text"), 15, INK).setTextIsSelectable(true);
+                    if (raw.length() > 0) raw.append("\n\n");
+                    raw.append(speaker).append("：").append(source.optString("text"));
+                } else {
+                    for (int j = 0; j < utterances.length(); j++) {
+                        JSONObject utterance = utterances.optJSONObject(j); if (utterance == null) continue;
+                        LinearLayout turn = card(workMeetingDetail);
+                        label(turn, speaker, 13, WORK);
+                        label(turn, utterance.optString("text"), 15, INK).setTextIsSelectable(true);
+                        if (raw.length() > 0) raw.append("\n\n");
+                        raw.append(speaker).append("：").append(utterance.optString("text"));
+                    }
+                }
             }
             if (raw.length() > 0) button(workMeetingDetail, "复制本次会议原文", false, () -> copy("会议原文", raw.toString()));
         } else if (report != null) {
             label(workMeetingDetail, report.optString("notice", "AI 整理稿，请结合原文核对。"), 12, MUTED);
             label(workMeetingDetail, "会议摘要", 16, INK);
             label(workMeetingDetail, report.optString("summary"), 15, INK).setTextIsSelectable(true);
-            meetingItems(workMeetingDetail, "讨论要点", array(report, "topics"), sources, false);
+            meetingItems(workMeetingDetail, "任务总结", array(report, "tasks"), sources, true);
+            meetingItems(workMeetingDetail, "各人物观点", meetingAnalysisItems(report, "viewpoints"), sources, false);
+            meetingItems(workMeetingDetail, "内容冲突与澄清", array(report, "conflicts"), sources, false);
+            meetingItems(workMeetingDetail, "重要事件", meetingAnalysisItems(report, "events"), sources, false);
+            meetingItems(workMeetingDetail, "其他议题与重要信息", array(report, "topics"), sources, false);
             meetingItems(workMeetingDetail, "已确认决策", array(report, "decisions"), sources, false);
-            meetingItems(workMeetingDetail, "行动待办", array(report, "tasks"), sources, true);
             meetingItems(workMeetingDetail, "待确认事项", array(report, "open_questions"), sources, false);
         } else label(workMeetingDetail, "原文可以先看，AI 整理完成后这里会自动更新。", 14, MUTED);
         String summaryStatus = meeting.optString("summary_status");
@@ -774,14 +811,30 @@ public final class MainActivity extends Activity {
                 });
             });
         }
-        if (!"recording".equals(meeting.optString("status")) && sources.length() > 0 && !"pending".equals(summaryStatus))
-            button(workMeetingDetail, "重新生成 AI 纪要", false, () -> {
+        if (!"recording".equals(meeting.optString("status")) && (sources.length() > 0 || "pending".equals(meeting.optString("transcription_status"))) && !"pending".equals(summaryStatus))
+            button(workMeetingDetail, "pending".equals(meeting.optString("transcription_status")) ? "重试整场识别与总结" : "重新生成 AI 纪要", false, () -> {
                 if (!canAct()) return;
                 request(() -> api.json("POST", "/v1/work-meetings/" + Uri.encode(meeting.optString("id")) + "/retry-summary", json()), r -> {
                     workMeetingDetailSnapshot = ""; renderWorkMeetingDetail(r);
                     handler.removeCallbacks(workMeetingPoll); handler.post(workMeetingPoll);
                 });
             });
+    }
+    private JSONArray meetingAnalysisItems(JSONObject report, String key) {
+        JSONArray items = array(report, key), display = new JSONArray();
+        for (int i = 0; i < items.length(); i++) {
+            JSONObject item = items.optJSONObject(i); if (item == null) continue;
+            String text;
+            if ("viewpoints".equals(key)) {
+                text = fallback(item.optString("person"), "身份未明确的发言") + "\n" + item.optString("text");
+            } else {
+                text = item.optString("content") + "\n时间：" + fallback(item.optString("time"), "未明确")
+                    + "\n地点：" + fallback(item.optString("location"), "未明确")
+                    + "\n相关任务：" + fallback(item.optString("task"), "未明确");
+            }
+            display.put(json("text", text, "source_ids", array(item, "source_ids")));
+        }
+        return display;
     }
     private void meetingItems(LinearLayout parent, String title, JSONArray items, JSONArray sources, boolean tasks) {
         label(parent, title, 16, INK);
@@ -1350,11 +1403,14 @@ public final class MainActivity extends Activity {
             stopRepeat(); headsetNotice(InteractionCopy.name(listenMode) + "不适用于" + modeName(mode()) + "，请重新选择通话与记录方式"); return;
         }
         if (listenMode == VoiceInteraction.NOTES && (state.optJSONObject("capabilities") == null
-                || !state.optJSONObject("capabilities").optBoolean("asr"))) {
+                || !state.optJSONObject("capabilities").optBoolean("work_asr"))) {
             stopRepeat(); feedback("工作录音转写当前不可用，请配置后端语音识别后重试", LocalCue.RETRY); return;
         }
         if (listenMode == VoiceInteraction.NOTES && !state.optJSONObject("capabilities").optBoolean("work_meetings")) {
             stopRepeat(); feedback("服务器尚未支持独立会议记录，请更新后端并刷新后再开始", LocalCue.RETRY); return;
+        }
+        if (listenMode == VoiceInteraction.NOTES && !state.optJSONObject("capabilities").optBoolean("work_whole_audio")) {
+            stopRepeat(); feedback("请更新后端以支持整场说话人识别", LocalCue.RETRY); return;
         }
         int audioState = getSystemService(android.media.AudioManager.class).getMode();
         if (audioState == android.media.AudioManager.MODE_IN_CALL || audioState == android.media.AudioManager.MODE_IN_COMMUNICATION

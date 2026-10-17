@@ -6,6 +6,8 @@ from pathlib import Path
 import sqlite3
 import time
 import re
+import hashlib
+import wave
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -78,6 +80,20 @@ class Store:
                 db.execute("ALTER TABLE transcripts ADD COLUMN interaction_source TEXT NOT NULL DEFAULT 'ambient_capture'")
             db.execute("CREATE TABLE IF NOT EXISTS recall_exclusions (transcript_id TEXT PRIMARY KEY)")
             meeting_columns = {row['name'] for row in db.execute('PRAGMA table_info(work_meetings)')}
+            for name, definition in (('whole_audio', 'INTEGER NOT NULL DEFAULT 0'),
+                                     ('transcription_status', "TEXT NOT NULL DEFAULT 'legacy'"),
+                                     ('asr_task_id', "TEXT NOT NULL DEFAULT ''")):
+                if name not in meeting_columns:
+                    db.execute(f'ALTER TABLE work_meetings ADD COLUMN {name} {definition}')
+            db.execute('CREATE TABLE IF NOT EXISTS work_audio_uploads (meeting_id TEXT NOT NULL, '
+                       'upload_index INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, '
+                       'pcm BLOB NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(meeting_id,upload_index))')
+            db.execute("DELETE FROM work_audio_uploads WHERE julianday(created_at)<julianday('now','-1 day')")
+            if 'location' not in meeting_columns:
+                db.execute("ALTER TABLE work_meetings ADD COLUMN location TEXT NOT NULL DEFAULT '{}'")
+            segment_columns = {row['name'] for row in db.execute('PRAGMA table_info(work_meeting_segments)')}
+            if 'utterances' not in segment_columns:
+                db.execute("ALTER TABLE work_meeting_segments ADD COLUMN utterances TEXT NOT NULL DEFAULT '[]'")
             for name in ('processed_sections', 'total_sections'):
                 if name not in meeting_columns:
                     db.execute(f'ALTER TABLE work_meetings ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0')
@@ -264,7 +280,7 @@ class Store:
 
     def clear(self):
         with self.connect() as db:
-            for table in ("work_meeting_segments", "work_meetings", "memories", "transcripts", "events", "drafts", "processed", "meeting_reports", "action_tasks", "mobile_turns", "recall_exclusions"):
+            for table in ("work_audio_uploads", "work_meeting_segments", "work_meetings", "memories", "transcripts", "events", "drafts", "processed", "meeting_reports", "action_tasks", "mobile_turns", "recall_exclusions"):
                 db.execute(f"DELETE FROM {table}")
 
     def mobile_turn(self, turn_id, fingerprint, reserve=True):
@@ -357,14 +373,16 @@ class Store:
                 "AND interaction_source='ambient_capture' AND created_at>=? "
                 "AND NOT EXISTS (SELECT 1 FROM recall_exclusions e WHERE e.transcript_id=r.id) ORDER BY created_at DESC", (cutoff,))]
 
-    def start_work_meeting(self, meeting_id):
+    def start_work_meeting(self, meeting_id, started_at=None, location=None, whole_audio=False):
         with self.connect() as db:
-            db.execute("INSERT OR IGNORE INTO work_meetings(id,started_at) VALUES(?,?)", (meeting_id, now()))
+            db.execute("INSERT OR IGNORE INTO work_meetings(id,started_at,location,whole_audio,transcription_status) VALUES(?,?,?,?,?)",
+                       (meeting_id, started_at or now(), json.dumps(location or {}, ensure_ascii=False),
+                        int(whole_audio), 'recording' if whole_audio else 'legacy'))
         return self.work_meeting(meeting_id)
 
     def work_meetings(self, limit=100):
         with self.connect() as db:
-            return [dict(row) for row in db.execute(
+            return [{**dict(row), 'whole_audio': bool(row['whole_audio']), 'location': json.loads(row['location'])} for row in db.execute(
                 "SELECT m.*,json_extract(r.payload,'$.title') AS title,json_extract(r.payload,'$.summary') AS summary, "
                 "(SELECT count(*) FROM work_meeting_segments s JOIN transcripts t ON t.id=s.transcript_id "
                 "WHERE s.meeting_id=m.id) AS transcript_count FROM work_meetings m LEFT JOIN meeting_reports r ON r.id=m.report_id "
@@ -375,27 +393,33 @@ class Store:
             row = db.execute("SELECT * FROM work_meetings WHERE id=?", (meeting_id,)).fetchone()
             if row is None:
                 return None
-            sources = [dict(item) for item in db.execute(
-                "SELECT t.*,s.segment_index FROM work_meeting_segments s JOIN transcripts t ON t.id=s.transcript_id "
+            sources = [{**dict(item), 'utterances': json.loads(item['utterances'])} for item in db.execute(
+                "SELECT t.*,s.segment_index,s.utterances FROM work_meeting_segments s JOIN transcripts t ON t.id=s.transcript_id "
                 "WHERE s.meeting_id=? ORDER BY s.segment_index", (meeting_id,))]
             report = db.execute("SELECT payload FROM meeting_reports WHERE id=?", (row['report_id'],)).fetchone()
             received = db.execute('SELECT count(*) FROM work_meeting_segments WHERE meeting_id=?', (meeting_id,)).fetchone()[0]
-        return {**dict(row), 'sources': sources, 'transcript_count': len(sources),
+            if row['whole_audio']:
+                received = db.execute('SELECT count(*) FROM work_audio_uploads WHERE meeting_id=?', (meeting_id,)).fetchone()[0]
+                for source in sources:
+                    source['speaker_scope'] = 'meeting'
+        return {**dict(row), 'whole_audio': bool(row['whole_audio']), 'location': json.loads(row['location']), 'sources': sources, 'transcript_count': len(sources),
                 'received_segments': received, 'report': json.loads(report['payload']) if report else None}
 
     def check_work_segment(self, meeting_id, segment_index, request_id):
         with self.connect() as db:
-            meeting = db.execute("SELECT status FROM work_meetings WHERE id=?", (meeting_id,)).fetchone()
+            meeting = db.execute("SELECT status,whole_audio FROM work_meetings WHERE id=?", (meeting_id,)).fetchone()
             segment = db.execute("SELECT request_id FROM work_meeting_segments WHERE meeting_id=? AND segment_index=?",
                                  (meeting_id, segment_index)).fetchone()
         if meeting is None:
             raise ValueError('会议不存在')
+        if meeting['whole_audio']:
+            raise ValueError('整场会议不能单独转写上传数据')
         if meeting['status'] != 'recording':
             raise ValueError('会议已结束，不能追加录音')
         if segment is not None and segment['request_id'] != request_id:
             raise ValueError('会议片段编号已被使用')
 
-    def save_work_segment(self, meeting_id, segment_index, request_id, text):
+    def save_work_segment(self, meeting_id, segment_index, request_id, text, utterances=()):
         """Persist ASR evidence and session membership in the same transaction, including silence receipts."""
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -412,8 +436,8 @@ class Store:
             if transcript_id:
                 db.execute("INSERT INTO transcripts(id,speaker,text,mode,source,created_at,interaction_source) VALUES(?,?,?,?,?,?,?)",
                            (transcript_id, '现场发言（未分离声纹）', text, 'work', 'asr', now(), 'ambient_capture'))
-            db.execute("INSERT INTO work_meeting_segments VALUES(?,?,?,?)",
-                       (meeting_id, segment_index, request_id, transcript_id))
+            db.execute("INSERT INTO work_meeting_segments(meeting_id,segment_index,request_id,transcript_id,utterances) VALUES(?,?,?,?,?)",
+                       (meeting_id, segment_index, request_id, transcript_id, json.dumps(utterances, ensure_ascii=False)))
         return transcript_id
 
     def finish_work_meeting(self, meeting_id, expected_segments, complete):
@@ -427,6 +451,12 @@ class Store:
                     "SELECT segment_index FROM work_meeting_segments WHERE meeting_id=? ORDER BY segment_index", (meeting_id,))]
                 count = db.execute("SELECT count(*) FROM work_meeting_segments s JOIN transcripts t ON t.id=s.transcript_id "
                                    "WHERE s.meeting_id=?", (meeting_id,)).fetchone()[0]
+                if meeting['whole_audio']:
+                    indices = [row[0] for row in db.execute('SELECT upload_index FROM work_audio_uploads '
+                                                          'WHERE meeting_id=? ORDER BY upload_index', (meeting_id,))]
+                    count = len(indices)
+                    db.execute("UPDATE work_meetings SET transcription_status=? WHERE id=?",
+                               ('pending' if count else 'empty', meeting_id))
                 intact = complete and indices == list(range(expected_segments))
                 status = 'saved' if intact and count else 'empty' if intact else 'partial'
                 error = '' if status == 'saved' else '没有识别到可保存的讲话' if status == 'empty' else '录音或上传未完整结束，仅保留已确认保存的原文'
@@ -435,6 +465,64 @@ class Store:
             elif meeting['expected_segments'] != expected_segments:
                 raise ValueError('结束请求与已保存的会议不一致')
         return self.work_meeting(meeting_id)
+
+    def save_work_audio(self, meeting_id, index, request_id, pcm):
+        fingerprint = hashlib.sha256(pcm).hexdigest()
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            meeting = db.execute('SELECT * FROM work_meetings WHERE id=?', (meeting_id,)).fetchone()
+            if not meeting or not meeting['whole_audio'] or meeting['status'] != 'recording':
+                raise ValueError('会议不存在或已结束')
+            previous = db.execute('SELECT * FROM work_audio_uploads WHERE meeting_id=? AND upload_index=?',
+                                  (meeting_id, index)).fetchone()
+            if previous:
+                if previous['request_id'] != request_id or previous['digest'] != fingerprint:
+                    raise ValueError('录音上传编号冲突')
+                return
+            total = db.execute('SELECT coalesce(sum(length(pcm)),0) FROM work_audio_uploads WHERE meeting_id=?',
+                               (meeting_id,)).fetchone()[0]
+            if total + len(pcm) > 2 * 60 * 60 * 32000:
+                raise ValueError('单场会议最多支持两小时，请结束当前会议')
+            db.execute('INSERT INTO work_audio_uploads VALUES(?,?,?,?,?,?)',
+                       (meeting_id, index, request_id, fingerprint, pcm, now()))
+
+    def write_work_wav(self, meeting_id, target):
+        with self.connect() as db, wave.open(target, 'wb') as wav:
+            meeting = db.execute('SELECT status,expected_segments FROM work_meetings WHERE id=?', (meeting_id,)).fetchone()
+            indices = [row[0] for row in db.execute('SELECT upload_index FROM work_audio_uploads WHERE meeting_id=? ORDER BY upload_index', (meeting_id,))]
+            if not meeting or (meeting['status'] == 'saved' and indices != list(range(meeting['expected_segments']))):
+                raise ValueError('整场录音已不完整，不能生成完整转写')
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16000)
+            count = 0
+            for row in db.execute('SELECT pcm FROM work_audio_uploads WHERE meeting_id=? ORDER BY upload_index', (meeting_id,)):
+                wav.writeframesraw(row['pcm'])
+                count += 1
+            if not count:
+                raise ValueError('会议录音已不可用，请重新录制')
+
+    def work_asr_task(self, meeting_id, task_id):
+        with self.connect() as db:
+            db.execute("UPDATE work_meetings SET asr_task_id=? WHERE id=? AND transcription_status='pending'", (task_id, meeting_id))
+
+    def save_work_dialogue(self, meeting_id, turns):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            meeting = db.execute('SELECT * FROM work_meetings WHERE id=?', (meeting_id,)).fetchone()
+            if not meeting or meeting['transcription_status'] != 'pending':
+                return False
+            for index, turn in enumerate(turns):
+                transcript_id = uuid4().hex
+                db.execute('INSERT INTO transcripts(id,speaker,text,mode,source,created_at,interaction_source) VALUES(?,?,?,?,?,?,?)',
+                           (transcript_id, turn['speaker'], turn['text'], 'work', 'asr', now(), 'ambient_capture'))
+                db.execute('INSERT INTO work_meeting_segments(meeting_id,segment_index,request_id,transcript_id,utterances) VALUES(?,?,?,?,?)',
+                           (meeting_id, index, uuid4().hex, transcript_id, json.dumps([turn], ensure_ascii=False)))
+            db.execute("UPDATE work_meetings SET transcription_status='ready',summary_stage='queued',"
+                       "summary_status=?,status=CASE WHEN ?=0 THEN 'empty' ELSE status END WHERE id=?",
+                       ('pending' if turns else 'unavailable', len(turns), meeting_id))
+            db.execute('DELETE FROM work_audio_uploads WHERE meeting_id=?', (meeting_id,))
+            return True
 
     def save_work_summary(self, meeting_id, payload, source_ids):
         # Called while the account runtime lock is held. Never resurrect forgotten evidence.
@@ -515,6 +603,7 @@ class Store:
                 source_id = row['source'].split(':', 1)[1]
                 removed_memories += db.execute('DELETE FROM memories WHERE source=?', (row['source'],)).rowcount
                 removed_transcripts = db.execute('DELETE FROM transcripts WHERE id=?', (source_id,)).rowcount
+                db.execute("UPDATE work_meeting_segments SET utterances='[]' WHERE transcript_id=?", (source_id,))
                 db.execute('DELETE FROM recall_exclusions WHERE transcript_id=?', (source_id,))
                 for task in db.execute('SELECT id,source_ids FROM action_tasks').fetchall():
                     if source_id in json.loads(task['source_ids']):

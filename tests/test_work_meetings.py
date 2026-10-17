@@ -8,12 +8,12 @@ import pytest
 
 from app.providers.volc_speech import AsrResult
 from app.domain import Mode
-from app.services.work_meetings import WorkMeetingMinutes, _batches
+from app.services.work_meetings import WorkMeetingMinutes, _validate_minutes
 
 
 @pytest.fixture
 def work(client, runtime, config, monkeypatch):
-    config.speech = replace(config.speech, asr_api_key='offline-only')
+    config.work_asr.api_key = 'offline-only'
     settings = runtime.store.settings()
     settings.mode, settings.retain_transcripts = Mode.work, False
     runtime.store.save_settings(settings)
@@ -24,7 +24,7 @@ def work(client, runtime, config, monkeypatch):
             pass
         yield AsrResult(words[0], final=True)
 
-    monkeypatch.setattr(client.app.state.speech, 'stream_asr', transcribe)
+    monkeypatch.setattr(client.app.state.work_asr, 'stream_asr', transcribe)
     calls = []
 
     async def generate(self, rows, progress):
@@ -45,6 +45,45 @@ def start(client):
     response = client.post('/v1/work-meetings', json={'meeting_id': meeting_id})
     assert response.status_code == 200, response.text
     return meeting_id
+
+
+def test_start_snapshot_survives_retries_and_summary(work, monkeypatch):
+    from datetime import datetime, timezone
+    client, runtime, words, calls = work
+    async def reverse(self, location):
+        return {'available': True, 'address': '测试会议地点'}
+    monkeypatch.setattr('app.services.maps.MapService.reverse', reverse)
+    meeting_id = uuid4().hex
+    started_at = datetime.now(timezone.utc).isoformat()
+    body = {'meeting_id': meeting_id, 'started_at': started_at,
+            'location': {'longitude': 116.4, 'latitude': 39.9, 'accuracy': 30}}
+    first = client.post('/v1/work-meetings', json=body).json()
+    assert first['location']['address'] == '测试会议地点'
+    again = client.post('/v1/work-meetings', json={'meeting_id': meeting_id}).json()
+    assert again['started_at'] == started_at and again['location'] == first['location']
+    assert upload(client, meeting_id).status_code == 200
+    finish(client, meeting_id)
+    meeting = client.get('/v1/work-meetings/' + meeting_id).json()
+    assert meeting['report']['started_at'] == started_at
+    assert meeting['report']['location'] == first['location']
+    assert client.post('/v1/work-meetings', json={'meeting_id': uuid4().hex,
+        'started_at': '2026-01-01T00:00:00'}).status_code == 422
+
+
+def test_speaker_evidence_is_separate_from_original(work, monkeypatch):
+    client, runtime, words, calls = work
+    async def asr(chunks):
+        yield AsrResult('原始文本', final=True, utterances=({'text': '原始文本', 'speaker_id': 2},))
+    monkeypatch.setattr(client.app.state.work_asr, 'stream_asr', asr)
+    meeting_id = start(client)
+    assert upload(client, meeting_id).status_code == 200
+    source = client.get('/v1/work-meetings/' + meeting_id).json()['sources'][0]
+    assert source['text'] == '原始文本' and source['utterances'][0]['speaker_id'] == 2
+    memory = runtime.store.add('memories', content='测试记录', kind='fact', source='transcript:' + source['id'])
+    runtime.store.forget_memory(memory['id'])
+    with runtime.store.connect() as db:
+        assert db.execute('SELECT utterances FROM work_meeting_segments WHERE meeting_id=?',
+                          (meeting_id,)).fetchone()['utterances'] == '[]'
 
 
 def upload(client, meeting_id, index=0, request_id=None):
@@ -193,47 +232,60 @@ def source(index, text):
 
 
 @pytest.mark.asyncio
-async def test_long_meeting_covers_beginning_middle_and_end_with_hierarchical_synthesis(config, monkeypatch):
+async def test_long_meeting_is_one_complete_document_and_one_model_request(config, monkeypatch):
     config.text_key, config.text_model = 'offline-key', 'offline-model'
     rows = [source(i, f'议题{i}。' + '讨论内容。' * 100) for i in range(100)]
-    progress, seen, merges = [], [], []
+    rows.append(source(100, '开头' + '中间' * 15000 + '结尾'))
+    progress, requests = [], []
     async def analyze(self, content, evidence):
-        if 'transcripts' in content:
-            seen.extend(content['transcripts'])
-        else:
-            merges.append(content)
-        return {'title': '完整会议', 'summary': '讨论要点', 'decisions': [], 'tasks': [], 'topics': [], 'open_questions': []}
+        requests.append(content)
+        assert evidence == rows
+        return {'title': '完整会议', 'summary': '讨论要点', 'decisions': [], 'tasks': [], 'topics': [],
+                'open_questions': [], 'viewpoints': [], 'conflicts': [], 'events': []}
     monkeypatch.setattr(WorkMeetingMinutes, '_analyze', analyze)
     result = await WorkMeetingMinutes(config).generate(rows, lambda *item: progress.append(item))
-    assert [row['text'] for row in seen] == [row['text'] for row in rows]
+    assert len(requests) == 1
+    assert requests[0]['document'] == '\n\n'.join('【原文依据 ' + row['id'] + '】\n' + row['text'] for row in rows)
     assert result['source_ids'] == [row['id'] for row in rows]
-    assert result['extraction'] == 'llm' and merges
+    assert result['extraction'] == 'llm'
     assert progress[-1][0] == 'synthesizing'
-    long_row = source(0, '开头' + '中间' * 15000 + '结尾')
-    assert ''.join(row['text'] for batch in _batches([long_row]) for row in batch) == long_row['text']
 
 
 @pytest.mark.asyncio
 async def test_minutes_model_payload_and_unsupported_citations_fall_back_to_visible_raw(config, monkeypatch):
     config.text_key, config.text_model = 'offline-key', 'offline-model'
-    rows = [source(0, '小林负责周五提交设计稿。下一次是否采用红色还没确定。')]
+    rows = [source(0, '小林负责周五提交设计稿，在北京开评审会。小林认为蓝色更好。下一次是否采用红色还没确定。')]
     output = {'title': '设计讨论', 'summary': '周五提交设计稿，颜色待定。', 'decisions': [],
               'tasks': [{'content': '提交设计稿', 'owner': '小林', 'due': '周五', 'source_ids': ['0']}],
-              'topics': [], 'open_questions': [{'text': '是否用红色', 'source_ids': ['0']}]}
+              'topics': [], 'open_questions': [{'text': '是否用红色', 'source_ids': ['0']}],
+              'viewpoints': [{'person': '小林', 'text': '认为蓝色更好', 'source_ids': ['0']}],
+              'conflicts': [], 'events': [{'content': '计划开评审会', 'time': '周五', 'location': '北京',
+                                         'task': '提交设计稿', 'source_ids': ['0']}]}
     payloads = []
+    finish_reason = 'stop'
     class FakeClient:
         def __init__(self, **kwargs): pass
         async def __aenter__(self): return self
         async def __aexit__(self, *_): pass
         async def post(self, url, **kwargs):
             payloads.append(kwargs['json'])
-            return httpx.Response(200, json={'choices': [{'message': {'content': json.dumps(output, ensure_ascii=False)}}]},
+            return httpx.Response(200, json={'choices': [{'finish_reason': finish_reason, 'message': {'content': json.dumps(output, ensure_ascii=False)}}]},
                                   request=httpx.Request('POST', url))
     monkeypatch.setattr('app.services.work_meetings.httpx.AsyncClient', FakeClient)
     result = await WorkMeetingMinutes(config).generate(rows)
     assert result['extraction'] == 'llm'
     assert result['open_questions'][0]['source_ids'] == ['0']
     assert payloads[0]['response_format'] == {'type': 'json_object'}
+    assert result['viewpoints'][0]['person'] == '小林'
+    assert result['events'][0]['location'] == '北京'
+    output['title'] = '标题：新版产品设计方案评审及后续任务安排'
+    renamed = await WorkMeetingMinutes(config).generate(rows)
+    assert renamed['extraction'] == 'llm'
+    assert renamed['title'] == '新版产品设计方案评审及后'
+    assert len(renamed['title']) == 12
+    finish_reason = 'length'
+    assert (await WorkMeetingMinutes(config).generate(rows))['extraction'] == 'rules_fallback'
+    finish_reason = 'stop'
     assert '后来的更正或撤销优先' in payloads[0]['messages'][0]['content']
     output['tasks'][0]['owner'] = '不存在的人'
     fallback = await WorkMeetingMinutes(config).generate(rows)
@@ -242,3 +294,114 @@ async def test_minutes_model_payload_and_unsupported_citations_fall_back_to_visi
     output['tasks'][0]['owner'] = '小林'
     output['open_questions'][0]['source_ids'] = ['other-meeting']
     assert (await WorkMeetingMinutes(config).generate(rows))['extraction'] == 'rules_fallback'
+
+
+def test_meeting_people_events_and_conflicts_require_evidence():
+    rows = [source(0, '小林建议周五在北京评审。'), source(1, '小王不同意周五，认为周一更合适。')]
+    report = {'title': '评审讨论', 'summary': '时间存在分歧', 'tasks': [], 'decisions': [],
+              'topics': [], 'open_questions': [],
+              'viewpoints': [{'person': '小林', 'text': '建议周五评审', 'source_ids': ['0']}],
+              'conflicts': [{'text': '小林建议周五，小王建议周一；未解决。', 'source_ids': ['0', '1']}],
+              'events': [{'content': '计划评审', 'time': '', 'location': '北京', 'task': '', 'source_ids': ['0']}]}
+    assert _validate_minutes(report, rows)['events'][0]['time'] == ''
+    report['viewpoints'][0]['person'] = '张三'
+    with pytest.raises(ValueError):
+        _validate_minutes(report, rows)
+    report['viewpoints'][0]['person'] = ''
+    report['events'][0]['location'] = '上海'
+    with pytest.raises(ValueError):
+        _validate_minutes(report, rows)
+    report['events'][0]['location'] = '北京'
+    report['conflicts'][0]['source_ids'] = ['other-meeting']
+    with pytest.raises(ValueError):
+        _validate_minutes(report, rows)
+
+
+def test_whole_audio_waits_until_end_then_keeps_one_speaker_namespace(work, monkeypatch):
+    import wave
+    client, runtime, words, summaries = work
+    meeting_id = uuid4().hex
+    started = client.post('/v1/work-meetings', json={'meeting_id': meeting_id, 'whole_audio': True})
+    assert started.status_code == 200 and started.json()['whole_audio'] is True
+    calls = []
+    async def transcribe(wav, task_id, on_task):
+        wav.seek(0)
+        with wave.open(wav, 'rb') as audio:
+            calls.append(audio.readframes(audio.getnframes()))
+        on_task('offline-task')
+        return [{'text': '我负责设计。', 'speaker': '发言人 1', 'speaker_id': 7, 'begin_time': 0, 'end_time': 1000},
+                {'text': '我负责测试。', 'speaker': '发言人 2', 'speaker_id': 3, 'begin_time': 1000, 'end_time': 2000},
+                {'text': '好的。', 'speaker': '发言人 1', 'speaker_id': 7, 'begin_time': 2000, 'end_time': 3000}]
+    monkeypatch.setattr(client.app.state.meeting_asr, 'transcribe', transcribe)
+    for index in range(2):
+        request_id = uuid4().hex
+        params = {'upload_index': index, 'request_id': request_id}
+        pcm = bytes([index]) * 640000  # The phone uploads 20 seconds per request.
+        for _ in range(2):
+            response = client.post('/v1/work-meetings/' + meeting_id + '/audio', params=params,
+                                   content=pcm, headers={'Content-Type': 'audio/pcm'})
+            assert response.status_code == 200
+    assert calls == [] and summaries == []
+    assert client.get('/v1/work-meetings/' + meeting_id).json()['sources'] == []
+    finish(client, meeting_id, 2)
+    result = client.get('/v1/work-meetings/' + meeting_id).json()
+    assert calls == [bytes(640000) + bytes([1]) * 640000]
+    assert result['transcription_status'] == 'ready' and result['summary_status'] == 'ready'
+    assert [s['speaker'] for s in result['sources']] == ['发言人 1', '发言人 2', '发言人 1']
+    assert all(s['speaker_scope'] == 'meeting' for s in summaries[0])
+    with runtime.store.connect() as db:
+        assert db.execute('SELECT count(*) FROM work_audio_uploads').fetchone()[0] == 0
+    assert client.get('/v1/work-meetings').json()['meetings'][0]['whole_audio'] is True
+
+
+@pytest.mark.parametrize('size,status', [(1920000, 200), (1920002, 413)])
+def test_whole_audio_upload_body_limit(work, size, status):
+    client, runtime, _, _ = work
+    meeting_id = uuid4().hex
+    client.post('/v1/work-meetings', json={'meeting_id': meeting_id, 'whole_audio': True})
+    response = client.post('/v1/work-meetings/' + meeting_id + '/audio',
+                           params={'upload_index': 0, 'request_id': uuid4().hex},
+                           content=bytes(size), headers={'Content-Type': 'audio/pcm'})
+    assert response.status_code == status
+    with runtime.store.connect() as db:
+        lengths = [row[0] for row in db.execute('SELECT length(pcm) FROM work_audio_uploads')]
+    assert lengths == ([size] if status == 200 else [])
+    assert client.post('/v1/work-meetings', content=bytes(65537)).status_code == 413
+
+
+def test_whole_audio_failure_keeps_recording_for_explicit_retry(work, monkeypatch):
+    from app.providers.qwen_meeting_asr import MeetingTaskFailed
+    client, runtime, words, summaries = work
+    meeting_id = uuid4().hex
+    client.post('/v1/work-meetings', json={'meeting_id': meeting_id, 'whole_audio': True})
+    response = client.post('/v1/work-meetings/' + meeting_id + '/audio',
+                           params={'upload_index': 0, 'request_id': uuid4().hex},
+                           content=bytes(3200), headers={'Content-Type': 'audio/pcm'})
+    assert response.status_code == 200
+    attempts = []
+    async def transcribe(wav, task_id, on_task):
+        attempts.append(task_id)
+        on_task('failed-task' if len(attempts) == 1 else 'success-task')
+        if len(attempts) == 1:
+            raise MeetingTaskFailed('offline failure')
+        return [{'text': '会议内容', 'speaker': '发言人 1', 'speaker_id': 0, 'begin_time': 0, 'end_time': 100}]
+    monkeypatch.setattr(client.app.state.meeting_asr, 'transcribe', transcribe)
+    finish(client, meeting_id)
+    result = client.get('/v1/work-meetings/' + meeting_id).json()
+    assert result['summary_status'] == 'failed' and result['asr_task_id'] == ''
+    assert not summaries
+    assert client.post('/v1/work-meetings/' + meeting_id + '/retry-summary').status_code == 200
+    assert client.get('/v1/work-meetings/' + meeting_id).json()['summary_status'] == 'ready'
+    assert attempts == ['', '']
+
+
+def test_meeting_scoped_speakers_are_valid_for_viewpoints_and_first_person_tasks():
+    rows = [{**source(0, '我负责设计。'), 'speaker': '发言人 1', 'speaker_scope': 'meeting'}]
+    report = {'title': '设计分工', 'summary': '设计任务已分配', 'tasks': [
+        {'content': '设计', 'owner': '发言人 1', 'due': '', 'source_ids': ['0']}],
+        'viewpoints': [{'person': '发言人 1', 'text': '负责设计', 'source_ids': ['0']}],
+        'events': [], 'conflicts': [], 'decisions': [], 'topics': [], 'open_questions': []}
+    assert _validate_minutes(report, rows)['tasks'][0]['owner'] == '发言人 1'
+    rows[0].pop('speaker_scope')
+    with pytest.raises(ValueError):
+        _validate_minutes(report, rows)
