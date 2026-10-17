@@ -7,6 +7,8 @@ public interface CaptureSource {
         default void input(String description) { status("实际麦克风：" + description); }
         /** Called once the source has started and its mode-specific route is ready. */
         default void recording() {}
+        /** Ordered with PCM, so the call boundary uses the same recorded timeline. */
+        default void callRecording(boolean active) {}
         void pcm(byte[] bytes);
         void error(String message);
     }
@@ -21,5 +23,8 @@ public interface CaptureSource {
     void stop(StopCallback callback);
     /** Immediately discards this turn. Cleanup may complete asynchronously. */
     void cancel();
+    /** System audio state: 0 normal, 1 ringing, 2 active phone/VoIP call. */
+    default void phoneAudioState(int state) {}
+    default void paused(boolean paused) {}
     default void close() { cancel(); }
 }

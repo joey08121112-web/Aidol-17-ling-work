@@ -415,12 +415,20 @@ public final class HeadsetController implements FusionDevice, AutoCloseable {
         HeadsetManager.registerDialogListener(new OnDialogListener() {
             @Override public void onDialogActive() { main.post(() -> {
                 inCall = true;
-                publish(snapshot.state, snapshot.message);
                 FusionDevice.Listener owner = captureOwner;
-                if (owner != null) { owner.error("来电或通话已中断耳机录音"); cancelFusion(owner); }
+                if (owner != null) {
+                    if (owner.recordsPhoneCalls()) owner.phoneCall(true);
+                    else { owner.error("来电或通话已中断耳机录音"); cancelFusion(owner); }
+                }
+                publish(snapshot.state, snapshot.message);
             }); }
             @Override public void onDialogNum(String ignoredPhoneNumber) { /* Never retain call identity. */ }
-            @Override public void onDialogInActive() { main.post(() -> { inCall = false; publish(snapshot.state, snapshot.message); }); }
+            @Override public void onDialogInActive() { main.post(() -> {
+                inCall = false;
+                FusionDevice.Listener owner = captureOwner;
+                if (owner != null && owner.recordsPhoneCalls()) owner.phoneCall(false);
+                publish(snapshot.state, snapshot.message);
+            }); }
         });
     }
 
@@ -464,13 +472,14 @@ public final class HeadsetController implements FusionDevice, AutoCloseable {
     @Override public void startFusion(FusionDevice.Listener listener) {
         // Checking before posting is insufficient: cancellation may invalidate the source while queued.
         main.post(() -> listener.startIfCurrent(() -> {
-            if (closed || !snapshot.ready() || !deviceStillReady() || inCall || captureOwner != null || HeadsetManager.isFusionRecordBusy()) {
+            if (closed || !snapshot.ready() || !deviceStillReady() || inCall && !listener.recordsPhoneCalls() || captureOwner != null || HeadsetManager.isFusionRecordBusy()) {
                 listener.error(inCall ? "通话期间不能开启 AI 录音" : "耳机尚未就绪或录音未结束，请重新连接"); return;
             }
             if (!SystemCaptureLease.acquire(captureLease)) {
                 listener.error("上一段录音仍在清理，请稍后重新开始"); return;
             }
             captureOwner = listener;
+            if (listener.recordsPhoneCalls()) listener.phoneCall(inCall);
             final long token = ++captureGeneration;
             captureStarted = SystemClock.elapsedRealtime(); firstPcmElapsed = 0; microphoneBytes = 0;
             FusionCaptureEvents events = new FusionCaptureEvents(listener,

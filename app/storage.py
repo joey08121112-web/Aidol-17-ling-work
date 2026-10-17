@@ -940,7 +940,7 @@ class Store:
         return len(expired)
 
     def add_work_event(self, meeting_id, event_id, kind, offset_ms, origin):
-        """Idempotent pause/resume/mark on the audio timeline; only while the meeting is recording."""
+        """Idempotent pause/resume/mark/call boundaries; only while the meeting is recording."""
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             meeting = db.execute("SELECT status FROM work_meetings WHERE id=?", (meeting_id,)).fetchone()
@@ -958,6 +958,11 @@ class Store:
                                   "ORDER BY rowid DESC LIMIT 1", (meeting_id,)).fetchone()
                 if (kind == 'pause') == bool(last and last['kind'] == 'pause'):
                     raise ValueError('录音已经暂停' if kind == 'pause' else '录音没有暂停')
+            if kind in ('call_start', 'call_end'):
+                last = db.execute("SELECT kind FROM work_meeting_events WHERE meeting_id=? AND kind IN ('call_start','call_end') "
+                                  "ORDER BY rowid DESC LIMIT 1", (meeting_id,)).fetchone()
+                if (kind == 'call_start') == bool(last and last['kind'] == 'call_start'):
+                    raise ValueError('已经在记录通话' if kind == 'call_start' else '没有正在记录的通话')
             row = {'id': event_id, 'meeting_id': meeting_id, 'kind': kind, 'offset_ms': offset_ms,
                    'origin': origin, 'created_at': now()}
             db.execute("INSERT INTO work_meeting_events VALUES(?,?,?,?,?,?)", tuple(row.values()))

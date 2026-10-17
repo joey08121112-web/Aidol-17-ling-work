@@ -855,3 +855,26 @@ def test_pending_sqlite_audio_from_previous_main_migrates_without_losing_bytes(w
     assert result['status'] == 'saved' and result['summary_status'] == 'ready'
     assert result['sources'][0]['text'] == '从旧录音恢复'
     assert len(summaries) == 1
+
+
+def test_call_boundaries_are_ordered_idempotent_and_independent_of_manual_pause(work):
+    client, runtime, words, calls = work
+    meeting_id = start(client)
+    url = '/v1/work-meetings/' + meeting_id + '/events'
+    def event(kind, offset=0):
+        return {'event_id': uuid4().hex, 'kind': kind, 'offset_ms': offset, 'origin': 'headset'}
+    assert client.post(url, json=event('call_end')).status_code == 409
+    begin = event('call_start', 100)
+    assert client.post(url, json=begin).status_code == 200
+    assert client.post(url, json=begin).status_code == 200
+    assert client.post(url, json=event('call_start', 100)).status_code == 409
+    assert client.post(url, json=event('pause', 200)).status_code == 200
+    assert client.post(url, json=event('call_end', 200)).status_code == 200
+    assert client.post(url, json=event('resume', 200)).status_code == 200
+    assert client.post(url, json=event('call_start', 300)).status_code == 200
+    assert client.post(url, json=event('call_end', 400)).status_code == 200
+    upload(client, meeting_id)
+    detail = finish(client, meeting_id)
+    assert [e['kind'] for e in detail['events']] == ['call_start', 'pause', 'call_end', 'resume', 'call_start', 'call_end']
+    assert client.post(url, json=event('call_start', 500)).status_code == 409
+    assert client.post('/v1/work-meetings/' + uuid4().hex + '/events', json=event('call_start')).status_code == 404

@@ -79,4 +79,13 @@ public class MeetingTimelineTest {
         assertEquals(List.of("说话人1", "说话人2"), timeline.speakers());  // t1.0 (说话人1) speaks first, at 200 ms.
         assertEquals("2026-10-17T06:00:01+00:00", timeline.sentence("t1.0").wallTime);
     }
+    @Test public void callBoundariesAreVisibleButNeverBecomeImportantMarks() throws Exception {
+        JSONObject meeting = new JSONObject().put("events", new JSONArray()
+            .put(new JSONObject().put("kind", "call_start").put("offset_ms", 1000))
+            .put(new JSONObject().put("kind", "call_end").put("offset_ms", 2000)));
+        MeetingTimeline timeline = new MeetingTimeline(meeting);
+        assertEquals(MeetingTimeline.Entry.Kind.CALL_START, timeline.entries.get(0).kind);
+        assertEquals(MeetingTimeline.Entry.Kind.CALL_END, timeline.entries.get(1).kind);
+        assertTrue(timeline.marks().isEmpty());
+    }
 }

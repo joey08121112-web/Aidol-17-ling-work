@@ -82,6 +82,7 @@ public final class MainActivity extends Activity {
     private VoiceSessionService voiceService;
     private boolean voiceServiceBound;
     private boolean callStartPending;
+    private boolean automaticWorkService;
     private VoicePreparation voicePreparation;
     private long preparationAttemptAt = -60000;
     private final Runnable preparationTick = this::prepareVoice;
@@ -124,7 +125,7 @@ public final class MainActivity extends Activity {
                 if (visible && !isDestroyed()) showApp();
             });
             syncHeadsetControls();
-            lastNotice = "耳机会话已开启 · 通话可锁屏继续 · 通知可挂断";
+            lastNotice = "耳机会话已开启 · 录音可锁屏继续 · 通知可停止";
             showApp();
             if (callStartPending) { callStartPending = false; startVoice(); }
         }
@@ -151,7 +152,8 @@ public final class MainActivity extends Activity {
         if (development.audioMode() == AudioMode.RISE_SDK) {
             HeadsetInteractionPolicy.DeviceUpdate update = headsetPolicy.device(new HeadsetInteractionPolicy.Device(
                 snapshot.ready(), snapshot.inCall, snapshot.leftWorn, snapshot.rightWorn,
-                snapshot.leftBattery, snapshot.rightBattery), hasHeadsetBoundSession() || this.repeatArmed || lockScreenEnabled());
+                snapshot.leftBattery, snapshot.rightBattery), hasHeadsetBoundSession() || this.repeatArmed || lockScreenEnabled(),
+                this.session != null && this.session.recordsWorkCalls());
             if (update.stopReason != null) {
                 cancelSession(update.stopReason);
                 // Reconnect and call end do not silently restore lock-screen authorization.
@@ -183,7 +185,7 @@ public final class MainActivity extends Activity {
     private LinearLayout workMeetingList, workMeetingDetail;
     private String openWorkMeetingId = "", workMeetingDetailSnapshot = "", workMeetingJumpId = "";
     private boolean workMeetingSyncError, workMeetingAudioPlayable, meetingSeeking;
-    private TextView workClock, meetingTitle, meetingMeta;
+    private TextView workClock, workAudioLabel, meetingTitle, meetingMeta;
     private LinearLayout workCaptionBox, conversationCaptionBox;
     // Live captions of the meeting being recorded: final sentences in ink, the interim text in grey.
     private final java.util.ArrayList<SpeakerParagraphs.Sentence> workCaptionSentences = new java.util.ArrayList<>();
@@ -1161,6 +1163,8 @@ public final class MainActivity extends Activity {
             switch (entry.kind) {
                 case PAUSE: label(workMeetingDetail, "‖ 暂停 " + TimeFormat.hms(entry.startMs) + " · " + date(entry.wallTime), 12, MUTED); break;
                 case RESUME: label(workMeetingDetail, "▶ 继续 · " + date(entry.wallTime), 12, MUTED); break;
+                case CALL_START: label(workMeetingDetail, "☎ 开始记录电话对话 " + TimeFormat.hms(entry.startMs), 12, WORK); break;
+                case CALL_END: label(workMeetingDetail, "☎ 电话对话记录结束 " + TimeFormat.hms(entry.startMs), 12, MUTED); break;
                 default: label(workMeetingDetail, "★ 重点标记 " + TimeFormat.hms(entry.startMs), 12, WORK); break;
             }
         }
@@ -1546,6 +1550,8 @@ public final class MainActivity extends Activity {
             workClock = label(intro, active.workPaused() ? "已暂停于 " + TimeFormat.clock(active.workOffsetMs()) + " · 暂停期间不记录、不上传"
                 : "已记录 " + TimeFormat.clock(active.workOffsetMs()) + (active.workMarks() > 0 ? " · 已标记 " + active.workMarks() + " 处" : ""), 12, WORK);
             workClock.setGravity(Gravity.CENTER);
+            workAudioLabel = label(intro, active.workAudioStatus(), 12, WORK);
+            workAudioLabel.setGravity(Gravity.CENTER);
             LinearLayout controls = row(); intro.addView(controls);
             button(controls, active.workPaused() ? "继续记录" : "暂停", false, () -> {
                 if (session != active) return;
@@ -2200,6 +2206,13 @@ public final class MainActivity extends Activity {
         voiceService = null;
         if (voiceServiceBound) { voiceServiceBound = false; unbindService(voiceConnection); }
     }
+    private void releaseAutomaticWorkService() {
+        if (!automaticWorkService) return;
+        automaticWorkService = false;
+        // The work result already owns the UI message; ending its service must not cancel that result.
+        if (voiceService != null) voiceService.onStopped(null);
+        stopLockScreenSession();
+    }
     private void stopLockScreenSession() {
         callStartPending = false;
         if (voiceService != null) voiceService.stopSession("锁屏耳机会话已停止；下一次请手动开启");
@@ -2249,7 +2262,7 @@ public final class MainActivity extends Activity {
             }
         }
         ArrayList<String> missing = audioPermissions(development.audioMode() == AudioMode.RISE_SDK);
-        if (visible && listenMode == VoiceInteraction.CALL && Build.VERSION.SDK_INT >= 33
+        if (visible && (listenMode == VoiceInteraction.CALL || listenMode == VoiceInteraction.NOTES) && Build.VERSION.SDK_INT >= 33
                 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
                 && !getSharedPreferences("headset_controls", MODE_PRIVATE).getBoolean("notification_asked", false)) {
             missing.add(Manifest.permission.POST_NOTIFICATIONS);
@@ -2263,11 +2276,16 @@ public final class MainActivity extends Activity {
         if (development.audioMode() == AudioMode.RISE_SDK && !headset.snapshot().ready()) {
             stopRepeat(); showDeviceDetails(); feedback("请先连接耳机，显示就绪后再点击开始", LocalCue.CONNECT); return;
         }
-        if (visible && listenMode == VoiceInteraction.CALL && !lockScreenEnabled() && !voiceServiceBound
+        if (listenMode == VoiceInteraction.NOTES && !getSystemService(android.app.NotificationManager.class).areNotificationsEnabled()) {
+            headsetNotice("请开启通知权限，以便切到音乐或接听电话时继续记录，并随时从通知停止"); return;
+        }
+        if (visible && (listenMode == VoiceInteraction.CALL || listenMode == VoiceInteraction.NOTES) && !lockScreenEnabled() && !voiceServiceBound
                 && getSystemService(android.app.NotificationManager.class).areNotificationsEnabled()) {
+            automaticWorkService = listenMode == VoiceInteraction.NOTES;
             callStartPending = true; enableLockScreenSession();
             if (voiceServiceBound) { lastNotice = "正在接通 AI…"; updateStatus(); return; }
             callStartPending = false;
+            if (listenMode == VoiceInteraction.NOTES) { automaticWorkService = false; return; }
         }
         continuingCall = repeatArmed;
         repeatArmed = listenMode == VoiceInteraction.CALL; handler.removeCallbacks(repeatTick); hideKeyboard(); startSession(null);
@@ -2317,7 +2335,8 @@ public final class MainActivity extends Activity {
         diagnosticInput = operationCue ? "操作提示，不采集录音" : "本轮尚未录音";
         diagnosticOutput = "本轮尚未播放"; diagnosticError = "无"; diagnosticRms = 0; diagnosticBytes = 0;
         HostedSession.Listener listener = new HostedSession.Listener() {
-            @Override public void status(String text) { if (!currentSession(generation)) return; lastNotice = operationCue && !text.startsWith(operationNotice) ? operationNotice + "；" + text : text; diagnosticStage = text; renderDiagnostics(); setStatusText(lastNotice); }
+            @Override public void status(String text) { if (!currentSession(generation)) return; lastNotice = operationCue && !text.startsWith(operationNotice) ? operationNotice + "；" + text : text; diagnosticStage = text; renderDiagnostics(); setStatusText(lastNotice);
+                if (session != null && session.recordsWorkCalls() && workAudioLabel != null) workAudioLabel.setText(session.workAudioStatus()); }
             @Override public void failure(String text) {
                 if (!currentSession(generation)) return;
                 if (!operationCue && !turnHasResult && session != null && session.requestId().equals(lastBusinessRequestId)) uncertainTurnId = lastBusinessRequestId;
@@ -2389,6 +2408,7 @@ public final class MainActivity extends Activity {
                 ++sessionGeneration;
                 if (voiceService != null) voiceService.release(session, repeatArmed && listenMode == VoiceInteraction.CALL && turnSucceeded);
                 session = null; recording = false; sessionOperationNotice = null;
+                releaseAutomaticWorkService();
                 if (!turnSucceeded) { deferredMode = null; deferredOpenConversation = false; }
                 if (deferredMode != null) {
                     String nextMode = deferredMode; boolean open = deferredOpenConversation;
@@ -2422,7 +2442,8 @@ public final class MainActivity extends Activity {
             }
         };
         AudioMode input = development.audioMode();
-        session = new HostedSession(this, api, AudioMode.RISE_SDK, new VendorCaptureSource(headset, !operationCue), headset::matchesOutput, listener);
+        session = new HostedSession(this, api, AudioMode.RISE_SDK,
+            new VendorCaptureSource(headset, !operationCue, !operationCue && listenMode == VoiceInteraction.NOTES), headset::matchesOutput, listener);
         if (lockScreenEnabled()) voiceService.own(session);
         if (voiceButton != null) voiceButton.setText(operationCue ? "正在播放操作提示…" : "正在准备…"); if (cancelButton != null) cancelButton.setVisibility(View.VISIBLE); updateStatus();
     }
@@ -2445,6 +2466,7 @@ public final class MainActivity extends Activity {
         clearLiveTurn();
         if (voiceService != null) voiceService.release(old);
         if (old != null) old.cancel();
+        releaseAutomaticWorkService();
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         if (voiceButton != null) voiceButton.setText(InteractionCopy.start(listenMode));
         if (cancelButton != null) cancelButton.setVisibility(View.GONE);
@@ -2504,7 +2526,7 @@ public final class MainActivity extends Activity {
         clearVoicePreparation();
         visible = false; if (quickFeedback != null) quickFeedback.stop(); if (meetingPlayback != null) meetingPlayback.stop(); if (!lockScreenEnabled()) pauseModeChange(); clearHeadsetGesture(); syncHeadsetControls();
         if ((session != null || repeatArmed) && !lockScreenEnabled()) endVoice();
-        else if (listenMode != VoiceInteraction.CALL && session != null && sessionUsesCapture) endVoice();
+        else if (listenMode != VoiceInteraction.CALL && session != null && sessionUsesCapture && !session.recordsWorkCalls()) endVoice();
         stopLocation(); super.onPause();
     }
     @Override protected void onDestroy() { if (meetingDeleteDialog != null) meetingDeleteDialog.dismiss(); if (workOptionsDialog != null) workOptionsDialog.dismiss(); if (taskBoard != null) taskBoard.close(); if (locationMonitor != null) locationMonitor.close(); if (statusPopup != null) statusPopup.dismiss(); handler.removeCallbacks(automaticHeadsetTick); if (quickFeedback != null) quickFeedback.close(); if (meetingPlayback != null) meetingPlayback.close(); handler.removeCallbacks(workMeetingPlaybackTick); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); super.onDestroy(); }

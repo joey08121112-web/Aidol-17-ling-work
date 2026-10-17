@@ -210,7 +210,7 @@ def create_hosted_app(config=None, data_directory=None):
 
     class WorkMeetingEvent(BaseModel):
         event_id: str = Field(pattern=r'^[a-zA-Z0-9-]{16,64}$')
-        kind: str = Field(pattern=r'^(pause|resume|mark)$')
+        kind: str = Field(pattern=r'^(pause|resume|mark|call_start|call_end)$')
         offset_ms: int = Field(ge=0, le=86_400_000)
         origin: str = Field(default='app', pattern=r'^(app|headset)$')
 
