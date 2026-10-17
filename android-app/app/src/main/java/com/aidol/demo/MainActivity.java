@@ -60,6 +60,9 @@ public final class MainActivity extends Activity {
     private QuickFeedback quickFeedback;
     private TextView dialogFeedback;
     private TextView headsetStatus, deviceDetails, voiceHint, developmentSummary;
+    // The profile tab shows the headset line too; a shared field would go stale across cached tabs.
+    private TextView profileHeadsetStatus;
+    private Button lockScreenButton;
     private long sessionGeneration;
     private String diagnosticSession = "尚未开始";
     private boolean sessionUsesCapture;
@@ -270,6 +273,7 @@ public final class MainActivity extends Activity {
         voiceHint = null;
         developmentSummary = null;
         modeChoices = null; modeHint = null; workClock = null; workMeetingList = null;
+        profileHeadsetStatus = null; lockScreenButton = null;
         root = column(); root.setBackgroundColor(BG);
         root.setFitsSystemWindows(false);
         setContentView(root);
@@ -439,10 +443,11 @@ public final class MainActivity extends Activity {
             callCaption = null; liveWords = null; content = null; conversationCaptionBox = null; conversationCaptionViews.box = null;
             liveTurn = null; liveUserBubble = null; liveAssistantBubble = null; conversationStarters = null;
             conversationScrollQueued = false; headsetStatus = null; voiceHint = null; modeChoices = null; modeHint = null;
+            lockScreenButton = null;
         } else if (which == 2) {
             workClock = null; workMeetingList = null; workCaptionBox = null; workCaptionViews.box = null;
         } else if (which == 4) {
-            headsetStatus = null; developmentSummary = null;
+            profileHeadsetStatus = null; developmentSummary = null;
         }
     }
 
@@ -501,7 +506,7 @@ public final class MainActivity extends Activity {
         LinearLayout listeningDetails = disclosure(page, "通话设置", InteractionCopy.name(listenMode), false);
         voiceHint = label(listeningDetails, voiceHintText(), 12, MUTED);
         label(listeningDetails, "生活与通勤：单击开始连续问答，停顿后自动回复，文字和音频逐步返回；再次单击结束。工作：单击录音转写，再次单击结束并保存。双击结束当前会话并切换模式，切换后待机。通话中持续收音，说“小万”可打断 AI 播报。", 12, MUTED);
-        button(listeningDetails, lockScreenEnabled() ? "停止锁屏耳机会话" : "开启本次锁屏耳机会话", false, () -> {
+        lockScreenButton = button(listeningDetails, lockScreenEnabled() ? "停止锁屏耳机会话" : "开启本次锁屏耳机会话", false, () -> {
             if (lockScreenEnabled()) { stopLockScreenSession(); tabDirty[0] = true; renderTab(); }
             else enableLockScreenSession();
         });
@@ -1436,6 +1441,7 @@ public final class MainActivity extends Activity {
         if (diff.rebuild) {
             box.removeAllViews();
             views.heads.clear(); views.bodies.clear(); views.placeholder = null; views.standaloneBody = null;
+            views.earlierHint = null;  // Detached by removeAllViews; sync re-creates it while history is hidden.
             for (CaptionList.Block block : diff.blocks) addCaptionParagraph(views, box, block.header, block.text);
             views.lastCommitted = diff.lastText;
         } else {
@@ -1847,7 +1853,7 @@ public final class MainActivity extends Activity {
         label(identityText, "每一点偏好，都是独一无二的你。", 12, MUTED);
         sectionHeader(page, "设备与陪伴", "按你的习惯来", "", null);
         LinearLayout device = card(page); label(device, "耳机与音频", 17, INK);
-        headsetStatus = label(device, "", 12, ACCENT); renderHeadset();
+        profileHeadsetStatus = label(device, "", 12, ACCENT); renderHeadset();
         button(device, "设备详情", false, this::showDeviceDetails);
         LinearLayout settings = disclosure(page, "陪伴偏好", "日常习惯与聆听方式", false);
         EditText preferences = field(settings, "关于你的偏好", "喜欢什么、如何与你交流…", false, 2000); preferences.setMinLines(2); preferences.setText(settings().optString("preferences"));
@@ -2538,6 +2544,8 @@ public final class MainActivity extends Activity {
         if (status != null) status.setTextColor(busy ? MUTED : ACCENT);
         if (activeCallRow != null) activeCallRow.setVisibility(
             tab != 0 && repeatArmed && listenMode == VoiceInteraction.CALL ? View.VISIBLE : View.GONE);
+        // The toggle's label is baked at build time; keep it in step when the service state flips.
+        if (lockScreenButton != null) lockScreenButton.setText(lockScreenEnabled() ? "停止锁屏耳机会话" : "开启本次锁屏耳机会话");
         if (voiceButton != null && session == null) voiceButton.setText(callStartPending ? "正在接通…" : repeatArmed ? "通话中 · 我在听" : InteractionCopy.start(listenMode));
         if (cancelButton != null) { cancelButton.setVisibility(session != null || repeatArmed || callStartPending ? View.VISIBLE : View.GONE); cancelButton.setText(InteractionCopy.stop(listenMode)); }
         if (callCaption != null && session == null) callCaption.setText(InteractionCopy.ready(listenMode));
@@ -2639,7 +2647,9 @@ public final class MainActivity extends Activity {
     private void renderHeadset() {
         if (headset == null) return;
         HeadsetController.Snapshot snapshot = headset.snapshot();
-        if (headsetStatus != null) headsetStatus.setText(development.audioMode() == AudioMode.RISE_SDK ? snapshot.summary() + " · 设备详情" : audioModeLabel() + " · 设备详情");
+        String summary = development.audioMode() == AudioMode.RISE_SDK ? snapshot.summary() + " · 设备详情" : audioModeLabel() + " · 设备详情";
+        if (headsetStatus != null) headsetStatus.setText(summary);
+        if (profileHeadsetStatus != null) profileHeadsetStatus.setText(summary);
         if (deviceDetails != null) deviceDetails.setText(snapshot.summary() + "\n输入来源：" + audioModeLabel()
             + "\n型号：" + snapshot.model + "\n左耳电量：" + knownBattery(snapshot.leftBattery) + " · 右耳电量：" + knownBattery(snapshot.rightBattery)
             + "\n左耳佩戴：" + knownWorn(snapshot.leftWorn) + " · 右耳佩戴：" + knownWorn(snapshot.rightWorn)
