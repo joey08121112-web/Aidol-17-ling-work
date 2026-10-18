@@ -42,6 +42,9 @@ from .providers.bocha import BochaSearch
 WORK_SUMMARY_SAVE_ATTEMPTS = 3
 WORK_SUMMARY_SAVE_LOCK_WAIT = 10
 WORK_SUMMARY_SAVE_RETRY_DELAY = 2
+# A mode/settings write queues briefly behind a finishing call or segment instead
+# of failing fast: the lock is usually released within a second of hang-up.
+SETTINGS_LOCK_WAIT = 5
 
 
 def create_hosted_app(config=None, data_directory=None):
@@ -302,9 +305,13 @@ def create_hosted_app(config=None, data_directory=None):
         nonlocal active
         if active >= 8:
             raise HTTPException(503, '服务器正在处理较多请求，请稍后再试')
-        active += 1
-        try:
-            async with runtimes.use(current['id'], wait_seconds=wait_seconds) as value:
+        # Only the lock holder occupies a processing slot: requests queued behind the
+        # same account's call or segment must not starve other accounts with 503s.
+        async with runtimes.use(current['id'], wait_seconds=wait_seconds) as value:
+            if active >= 8:
+                raise HTTPException(503, '服务器正在处理较多请求，请稍后再试')
+            active += 1
+            try:
                 # Recheck after acquiring the per-account lock (password/logout races).
                 if not accounts.authenticate(digest(token(request))):
                     raise HTTPException(401, '登录已失效')
@@ -313,8 +320,8 @@ def create_hosted_app(config=None, data_directory=None):
                 value.agent.tool_charge = lambda: accounts.consume(
                     'usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400)
                 yield value
-        finally:
-            active -= 1
+            finally:
+                active -= 1
 
     @api.get('/healthz')
     async def hosted_health():
@@ -424,7 +431,7 @@ def create_hosted_app(config=None, data_directory=None):
 
     @api.put('/v1/settings')
     async def mobile_settings(value: Settings, request: Request, current=Depends(user)):
-        async with runtime(current, request) as rt:
+        async with runtime(current, request, wait_seconds=SETTINGS_LOCK_WAIT) as rt:
             # Android v1 is foreground-only; do not advertise background listening.
             value.auto_mode = False
             value.life_poll_enabled = False
@@ -437,7 +444,9 @@ def create_hosted_app(config=None, data_directory=None):
                 journey = rt.store.commute_journey()
                 if journey.get('active'):
                     rt.store.stop_commute(journey['id'])
-            rt.store.purge_work_audio()
+            # Retention is enforced lazily on meeting reads; a mode switch skips the scan.
+            if old.work_audio_retention_days != value.work_audio_retention_days:
+                rt.store.purge_work_audio()
             await rt.agent.decide()
             return value
 

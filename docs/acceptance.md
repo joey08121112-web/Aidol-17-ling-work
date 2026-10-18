@@ -821,3 +821,11 @@ Android `testDebugUnitTest lintDebug assembleDebug` 成功：159项单测，零�
 - 软件验证：JBR 21.0.11／SDK 35 执行 Android `testDebugUnitTest lintDebug assembleDebug` 成功，283 项单测通过，Lint 0 errors／28 warnings；Python 离线 623 passed／1 warning，compileall 通过。证据及候选 APK 在忽略目录 `artifacts/life-settings-fix/`：`baseline-regression.log`、`fixed-regression-final.log`、`android-checks.log`、`pytest.log` 与 `screenshots/`。
 - 合并前同步 `origin/main` 的工作／通勤更新 `9b4cc80`，保留双方交接文档后在组合版本复验：Android 296 项单测、Lint 0 errors／31 warnings、debug 构建通过；Python 641 passed／1 warning、compileall 通过；同一生活原生 UI 回归再次通过（`merged-regression.log`、`merged-screenshots/`）。本次修复相对于该主分支仍仅改两个 Android 文件及两份文档。
 - 本轮仅离线结果注入及模拟器 UI；没有模型、录音或供应商 API 请求，没有安装至 USB 真机、更新公网 APK 或部署服务，Rise 听音／锁屏等硬件验收仍待实机完成。
+
+## 2026-10-18 模式切换提速（本地）
+
+- 后端：`PUT /v1/settings` 在账号锁上有界等待 `SETTINGS_LOCK_WAIT=5` 秒；仅保留期变化时执行 `purge_work_audio()`。新增测试：锁在0.3秒后释放时切换返回200（不再409）、仅改模式不触发录音保留扫描；原“锁持续占用仍409”测试改为缩短等待后断言。
+- Android：切换乐观更新并立即播放本地模式耳标，失败/放弃/离开前台/会话取消时回滚；模式请求用独立线程，`/v1/state` 刷新改为独立线程与代次校验，不再设置 `busy`；工作↔通勤切换重建对话页。`ModeChangeRetry` 记录原模式并提供本地快照写入，新增2项单测。
+- 软件验证：Python `.venv` 离线测试 **625 passed**、compileall 通过；JBR 21.0.11、Android SDK 35 执行 `testDebugUnitTest lintDebug assembleDebug` 成功，Android **285 项单测零失败**，Lint **0 errors / 28 warnings**（既有类别）。
+- 未验证：本轮未安装 APK、未用 Rise 实测切换耗时与耳标听音；`ModeSwitchInstrumentation` 未运行，其“切换不重建页面”和“确认后才播放”断言已与当前约定不符（生活布局改版后已不成立），需要按新约定更新后再做真机复核。
+- 代码审查修正（PR #4 Codex 意见）：P1 `runtime()` 改为拿到账号锁后才计入全局8个处理名额，排队等锁的请求不再让其他账号收到503；新增测试：同一账号10个设置请求排队时另一账号请求仍返回200，修复前其中2个请求立即503。P2 后台刷新期间待办与通勤面板暂停操作（恢复改动前的保护），模式切换不受影响；该项为 Activity 接线，无 JVM 单测。合并最新 main（`2fcccb6`，含 PR #5、#6）后：Python 离线测试 **644 passed**、compileall 通过；Android **298 项单测零失败**，Lint **0 errors / 31 warnings**，assembleDebug 成功。仍未在 Rise 真机实测。

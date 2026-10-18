@@ -55,6 +55,9 @@ public final class MainActivity extends Activity {
     // threads so a request hitting the 100s read timeout cannot monopolise the action queue.
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final ExecutorService ioPool = Executors.newFixedThreadPool(2);
+    // Mode writes and state reads never queue behind each other or behind a user mutation.
+    private final ExecutorService modeWorker = Executors.newSingleThreadExecutor();
+    private final ExecutorService stateReads = Executors.newSingleThreadExecutor();
     private ApiClient api;
     private DevelopmentSettings development;
     private HeadsetController headset;
@@ -184,6 +187,8 @@ public final class MainActivity extends Activity {
     private JSONObject state = new JSONObject();
     private LinearLayout root, page, content, composer, conversationHeader, bottomNavigation, lifeOptions;
     private boolean lifeConversationLayout;
+    /** The mode the mounted conversation page was built for: each mode has its own page variant. */
+    private String conversationMode = "";
     private ScrollView scroll;
     private TextView status, voiceButton, cancelButton, authError;
     private EditText chatInput;
@@ -191,6 +196,9 @@ public final class MainActivity extends Activity {
     private String chatDraft = "";
     private HostedSession session;
     private boolean busy, recording;
+    /** A background /v1/state read: it neither blocks user actions nor overwrites a newer local change. */
+    private boolean refreshing, refreshAgain;
+    private long stateGeneration;
     private volatile boolean visible;
     private int tab, authMode;
     // Built-once tab contents: a clean tab switch reattaches the cached container instead of
@@ -297,14 +305,14 @@ public final class MainActivity extends Activity {
         meetingPlayback = new MeetingPlayback(this, headset::matchesOutput, this::meetingPlaybackChanged);
         headset.addListener(headsetListener);
         headset.addControlListener(headsetControlListener);
-        taskBoard = new ActionTaskBoard(this, () -> api, () -> !busy && session == null,
+        taskBoard = new ActionTaskBoard(this, () -> api, this::panelActionsAllowed,
             tasks -> { put(state, "tasks", tasks); }, message -> { lastNotice = message; updateStatus(); }, () -> {
                 if (Build.VERSION.SDK_INT >= 33 && !permissionPending && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                     permissionPending = true; requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 7);
                 }
             });
         connectBackend();
-        commutePanel = new CommutePanel(this, () -> api, () -> state, () -> !busy && session == null, () -> visible,
+        commutePanel = new CommutePanel(this, () -> api, () -> state, this::panelActionsAllowed, () -> visible,
             this::commutePermissions, () -> {
                 boolean changed = !"commute".equals(mode());
                 put(settings(), "mode", "commute"); put(settings(), "auto_mode", false);
@@ -562,7 +570,7 @@ public final class MainActivity extends Activity {
 
     private void conversation() {
         if (session == null && !repeatArmed) listenMode = "work".equals(mode()) ? VoiceInteraction.NOTES : VoiceInteraction.CALL;
-        lifeConversationLayout = "life".equals(mode());
+        lifeConversationLayout = "life".equals(mode()); conversationMode = mode();
         LinearLayout modes = row(); modes.setPadding(dp(4), dp(4), dp(4), dp(4)); modes.setBackground(shape(CARD, 26, CARD));
         (lifeConversationLayout ? conversationHeader : page).addView(modes);
         modeChoices = modes;
@@ -2404,6 +2412,8 @@ public final class MainActivity extends Activity {
         // A repeated tap during the settings request must not introduce a progress/error banner.
         if (modeChange != null) return;
         if (busy || locationListener != null || permissionPending) { feedback("上一项操作正在进行，请稍后切换模式", LocalCue.BUSY); return; }
+        // The PUT body is the full settings snapshot; never send defaults before the first state load.
+        if (state.optJSONObject("settings") == null) { feedback("正在同步，请稍后切换模式", LocalCue.BUSY); return; }
         clearVoicePreparation(); preparationAttemptAt = -60000;
         if (modeCuePlayer != null) modeCuePlayer.stop();
         if (session != null && "work".equals(mode()) && sessionUsesCapture) {
@@ -2416,9 +2426,33 @@ public final class MainActivity extends Activity {
         if (!modeFailureNotice.isEmpty() && lastNotice.equals(modeFailureNotice)) lastNotice = "";
         modeFailureNotice = "";
         JSONObject body = cloneJson(settings()); put(body, "mode", mode); put(body, "auto_mode", false);
-        ModeChangeRetry change = new ModeChangeRetry(mode, api, sessionGeneration, android.os.SystemClock.elapsedRealtime());
-        modeChange = change; busy = true; updateStatus();
+        ModeChangeRetry change = new ModeChangeRetry(mode, mode(), api, sessionGeneration, android.os.SystemClock.elapsedRealtime());
+        modeChange = change; busy = true; ++stateGeneration; diagnosticError = "无";
+        // Optimistic: the target and its local earcon appear now; a rejected write restores the previous mode.
+        showMode(mode, openConversation);
+        playModeCue(mode);
         submitModeChange(change, api, body, openConversation);
+    }
+    /** Renders a mode from the local snapshot, keeping the mounted conversation when its page variant is unchanged. */
+    private void showMode(String mode, boolean openConversation) {
+        ModeChangeRetry.show(state, mode);
+        listenMode = "work".equals(mode) ? VoiceInteraction.NOTES : VoiceInteraction.CALL;
+        boolean navigate = openConversation && tab != 0;
+        if (openConversation) tab = 0;
+        if (tab == 0 && !navigate && modeChoices != null) {
+            // Preserve the mounted conversation, draft/focus and the user's viewport.
+            ScrollView viewport = scroll;
+            int y = viewport == null ? 0 : viewport.getScrollY();
+            renderModeSelection();
+            if (voiceHint != null) voiceHint.setText(voiceHintText());
+            updateStatus();
+            restoreWorkScroll(viewport, y);
+        } else { markTabsDirty(); renderTab(); }
+    }
+    /** The server never accepted the change: silence its earcon and show the confirmed mode again. */
+    private void rollbackMode(ModeChangeRetry change) {
+        if (modeCuePlayer != null) modeCuePlayer.stop();
+        if (!isDestroyed() && change.mode.equals(mode()) && !change.previous.equals(change.mode)) showMode(change.previous, false);
     }
     private boolean currentModeChange(ModeChangeRetry change) {
         return !isDestroyed() && modeChange == change && change.matches(api, sessionGeneration);
@@ -2433,6 +2467,7 @@ public final class MainActivity extends Activity {
         if (modeChange != change) return;
         stopRepeat();
         finishModeChange(change);
+        rollbackMode(change);
         if (!isDestroyed()) {
             modeFailureNotice = lastNotice = "模式切换已停止，请刷新确认当前模式"; updateStatus();
         }
@@ -2443,8 +2478,10 @@ public final class MainActivity extends Activity {
         // A scheduled retry follows a confirmed rejection: there is no update to wait for.
         // An in-flight request may already have applied, so let its existing response finish.
         if (modeChangeDelay != null) {
+            ModeChangeRetry change = modeChange;
             stopRepeat();
-            finishModeChange(modeChange);
+            finishModeChange(change);
+            rollbackMode(change);
             modeFailureNotice = lastNotice = "模式尚未切换，请稍后重新选择"; updateStatus();
         }
     }
@@ -2453,7 +2490,7 @@ public final class MainActivity extends Activity {
             abandonModeChange(change); return;
         }
         modeChangeDelay = null;
-        worker.execute(() -> {
+        modeWorker.execute(() -> {
             try {
                 JSONObject result = client.json("PUT", "/v1/settings", body);
                 runOnUiThread(() -> {
@@ -2461,25 +2498,12 @@ public final class MainActivity extends Activity {
                     finishModeChange(change);
                     put(state, "settings", result);
                     String appliedMode = result.optString("mode", change.mode);
-                    JSONObject agent = state.optJSONObject("agent"); if (agent == null) agent = new JSONObject();
-                    put(agent, "mode", appliedMode); put(state, "agent", agent);
-                    diagnosticError = "无";
                     if (commutePanel != null) commutePanel.modeChanged(appliedMode);
-                    listenMode = "work".equals(appliedMode) ? VoiceInteraction.NOTES : VoiceInteraction.CALL;
-                    boolean navigate = openConversation && tab != 0;
-                    if (openConversation) tab = 0;
-                    if (tab == 0 && !navigate && modeChoices != null) {
-                        // Preserve the mounted conversation, draft/focus and the user's viewport.
-                        ScrollView viewport = scroll;
-                        int y = viewport == null ? 0 : viewport.getScrollY();
-                        renderModeSelection();
-                        if (voiceHint != null) voiceHint.setText(voiceHintText());
-                        updateStatus();
-                        restoreWorkScroll(viewport, y);
-                    } else { markTabsDirty(); renderTab(); }
-                    // Settings succeed independently of the local sound. No conversational session.
-                    if (client == api && change.matches(api, sessionGeneration)) playModeCue(appliedMode);
+                    // The target was already shown and announced when the change began.
+                    if (appliedMode.equals(mode())) { ModeChangeRetry.show(state, appliedMode); updateStatus(); }
+                    else { if (modeCuePlayer != null) modeCuePlayer.stop(); showMode(appliedMode, false); }
                     prepareVoice();
+                    if (refreshAgain) refresh();
                 });
             } catch (Exception error) { runOnUiThread(() -> {
                 if (!currentModeChange(change)) { abandonModeChange(change); return; }
@@ -2493,6 +2517,7 @@ public final class MainActivity extends Activity {
                 }
                 finishModeChange(change);
                 stopRepeat();
+                rollbackMode(change);
                 if (statusCode == 401) client.vault.clear();
                 lastNotice = statusCode == 409 ? "上一轮仍在处理，模式尚未切换；请稍后再试"
                     : statusCode == 401 ? "登录已失效，请重新登录"
@@ -2510,17 +2535,37 @@ public final class MainActivity extends Activity {
     }); }
     private void refresh() {
         if (busy || session != null || api.vault.token().isEmpty()) return;
+        if (refreshing) { refreshAgain = true; return; }
         // Background state sync must not erase the reason a voice turn just failed.
         // The explicit refresh button clears lastNotice before calling this method.
         final String notice = lastNotice;
-        request(() -> api.json("GET", "/v1/state", null), r -> {
-            state = r; lastNotice = notice; markTabsDirty(); renderTab();
-            if (taskBoard != null) taskBoard.refreshReminders();
-            handler.post(startupLocationTick);
+        final ApiClient client = api;
+        final long generation = stateGeneration;
+        refreshing = true; refreshAgain = false; updateStatus();
+        stateReads.execute(() -> {
+            JSONObject loaded = null; Exception failed = null;
+            try { loaded = client.json("GET", "/v1/state", null); } catch (Exception e) { failed = e; }
+            JSONObject value = loaded; Exception error = failed;
+            runOnUiThread(() -> {
+                refreshing = false;
+                if (isDestroyed()) return;
+                // A mode switch, mutation or session that began meanwhile owns newer state than this snapshot.
+                boolean current = client == api && generation == stateGeneration && !busy && session == null;
+                if (current && value != null) {
+                    state = value; lastNotice = notice; markTabsDirty(); renderTab();
+                    if (taskBoard != null) taskBoard.refreshReminders();
+                    handler.post(startupLocationTick);
+                } else if (current) {
+                    lastNotice = fallback(error.getMessage(), "无法连接服务器，请检查网络后重试"); diagnosticError = lastNotice; renderDiagnostics();
+                    if (!(error instanceof ApiClient.ApiException) || ((ApiClient.ApiException) error).status != 409) showError(lastNotice);
+                } else if (client == api) refreshAgain = true;  // Re-read once the newer change settles.
+                updateStatus();
+                if (refreshAgain) refresh();
+            });
         });
     }
     private void request(Job job, Result result) {
-        if (busy) return; busy = true; updateStatus();
+        if (busy) return; busy = true; ++stateGeneration; updateStatus();
         worker.execute(() -> {
             try { JSONObject value = job.run(); runOnUiThread(() -> {
                 busy = false; if (isDestroyed()) return; lastNotice = ""; updateStatus();
@@ -2531,6 +2576,11 @@ public final class MainActivity extends Activity {
         });
     }
     private void signOut() { if (commutePanel != null) commutePanel.reset(); TaskReminders.clear(this); getSharedPreferences("meeting_edit_drafts", MODE_PRIVATE).edit().clear().apply(); clearVoicePreparation(); preparationAttemptAt = -60000; if (quickFeedback != null) quickFeedback.stop(); chatDraft = ""; stopLockScreenSession(); cancelSession(""); clearPrivateSnapshots(); api.vault.clear(); clearLocationCache(); syncHeadsetControls(); state = new JSONObject(); lastNotice = ""; showAuth(0); }
+    /**
+     * Task and commute panels write state on their own threads, outside the refresh generation:
+     * keep them waiting while a /v1/state snapshot is in flight so it cannot overwrite their change.
+     */
+    private boolean panelActionsAllowed() { return !busy && !refreshing && session == null; }
     private boolean canAct() { if (busy || session != null || locationListener != null) { feedback("上一项操作正在进行，请稍候", LocalCue.BUSY); return false; } return true; }
 
     private boolean lockScreenEnabled() { return voiceService != null && voiceService.enabled(); }
@@ -2819,7 +2869,7 @@ public final class MainActivity extends Activity {
         if (modeCuePlayer != null) modeCuePlayer.stop();
         callStartPending = false;
         audioPermissionGeneration = -1;
-        if (modeChange != null) { modeChange.stopRetrying(); finishModeChange(modeChange); }
+        if (modeChange != null) { ModeChangeRetry change = modeChange; change.stopRetrying(); finishModeChange(change); rollbackMode(change); }
         stopRepeat(); clearHeadsetGesture(); ++sessionGeneration;
         deferredMode = null; deferredOpenConversation = false;
         HostedSession old = session; session = null; recording = false; turnSucceeded = false;
@@ -2899,7 +2949,7 @@ public final class MainActivity extends Activity {
         else if (listenMode != VoiceInteraction.CALL && session != null && sessionUsesCapture && !session.recordsWorkCalls()) endVoice();
         stopLocation(); super.onPause();
     }
-    @Override protected void onDestroy() { if (lifeCallSettingsDialog != null) lifeCallSettingsDialog.dismiss(); if (commutePanel != null) commutePanel.close(); if (meetingDeleteDialog != null) meetingDeleteDialog.dismiss(); if (workOptionsDialog != null) workOptionsDialog.dismiss(); if (taskBoard != null) taskBoard.close(); if (locationMonitor != null) locationMonitor.close(); if (statusPopup != null) statusPopup.dismiss(); handler.removeCallbacks(automaticHeadsetTick); if (quickFeedback != null) quickFeedback.close(); if (modeCuePlayer != null) modeCuePlayer.close(); if (meetingPlayback != null) meetingPlayback.close(); handler.removeCallbacks(workMeetingPlaybackTick); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } if (meetingPage != null) meetingPage.dismiss(); stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); ioPool.shutdownNow(); super.onDestroy(); }
+    @Override protected void onDestroy() { if (lifeCallSettingsDialog != null) lifeCallSettingsDialog.dismiss(); if (commutePanel != null) commutePanel.close(); if (meetingDeleteDialog != null) meetingDeleteDialog.dismiss(); if (workOptionsDialog != null) workOptionsDialog.dismiss(); if (taskBoard != null) taskBoard.close(); if (locationMonitor != null) locationMonitor.close(); if (statusPopup != null) statusPopup.dismiss(); handler.removeCallbacks(automaticHeadsetTick); if (quickFeedback != null) quickFeedback.close(); if (modeCuePlayer != null) modeCuePlayer.close(); if (meetingPlayback != null) meetingPlayback.close(); handler.removeCallbacks(workMeetingPlaybackTick); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } if (meetingPage != null) meetingPage.dismiss(); stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); modeWorker.shutdownNow(); stateReads.shutdownNow(); ioPool.shutdownNow(); super.onDestroy(); }
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent); setIntent(intent);
         if (intent.getBooleanExtra("open_commute", false) && api != null && !api.vault.token().isEmpty()) switchTab(3);
@@ -2990,7 +3040,8 @@ public final class MainActivity extends Activity {
 
     private void renderModeSelection() {
         if (tab != 0) { tabDirty[0] = true; return; }
-        if (tab == 0 && modeChoices != null && lifeConversationLayout != "life".equals(mode())) {
+        // Life, work (text record) and commute (recent conversation) render different pages.
+        if (tab == 0 && modeChoices != null && !conversationMode.equals(mode())) {
             tabDirty[0] = true; renderTab(); return;
         }
         if (tab != 0 || modeChoices == null) return;
@@ -3010,8 +3061,9 @@ public final class MainActivity extends Activity {
         status.setVisibility(text.isEmpty() ? View.GONE : View.VISIBLE);
     }
     private void updateStatus() {
-        setStatusText(busy && modeChange == null ? "正在同步…" : lastNotice);
-        if (status != null) status.setTextColor(busy && modeChange == null ? MUTED : ACCENT);
+        boolean syncing = (busy || refreshing) && modeChange == null;
+        setStatusText(syncing ? "正在同步…" : lastNotice);
+        if (status != null) status.setTextColor(syncing ? MUTED : ACCENT);
         if (activeCallRow != null) activeCallRow.setVisibility(
             tab != 0 && repeatArmed && listenMode == VoiceInteraction.CALL ? View.VISIBLE : View.GONE);
         // The toggle's label is baked at build time; keep it in step when the service state flips.
