@@ -33,30 +33,30 @@ public class ApiClientTransportTest {
         assertEquals(0, server.takeRequest(2, TimeUnit.SECONDS).getSequenceNumber());
     }
 
-    @Test public void freshConnectionsAreLimitedToTheExactDebugUsbOrigin() {
-        assertTrue(ApiClient.useFreshConnections(ServerEndpoint.validate(ServerEndpoint.USB_LOCAL + "/", true), true));
-        assertFalse(ApiClient.useFreshConnections(ServerEndpoint.USB_LOCAL, false));
+    @Test public void debugUsbDetectionIsLimitedToTheExactLocalOrigin() {
+        assertTrue(ApiClient.isDebugUsbOrigin(ServerEndpoint.validate(ServerEndpoint.USB_LOCAL + "/", true), true));
+        assertFalse(ApiClient.isDebugUsbOrigin(ServerEndpoint.USB_LOCAL, false));
         for (String origin : new String[] {"https://aidol.example", "https://127.0.0.1:8108",
                 "http://127.0.0.1:8109", "http://localhost:8108", "http://127.0.0.1:8108.evil.example"}) {
-            assertFalse(origin, ApiClient.useFreshConnections(origin, true));
+            assertFalse(origin, ApiClient.isDebugUsbOrigin(origin, true));
         }
     }
 
-    @Test public void usbReadVoiceSpeechAndSettingsAlwaysUseFreshSockets() throws Exception {
+    @Test public void usbDebugOriginReusesConnectionsAcrossRequests() throws Exception {
         ApiClient.HttpTransport transport = new ApiClient.HttpTransport(true);
         try (MockWebServer server = new MockWebServer()) {
             server.start();
             String[][] cases = {{"GET", "/v1/state"}, {"POST", "/v1/voice"},
                 {"POST", "/v1/speech"}, {"PUT", "/v1/settings"}, {"GET", "/v1/state"}};
-            for (String[] item : cases) {
+            for (int i = 0; i < cases.length; i++) {
                 server.enqueue(new MockResponse().setBody("complete"));
-                try (Response response = transport.call(request(server, item[0], item[1])).execute()) {
+                try (Response response = transport.call(request(server, cases[i][0], cases[i][1])).execute()) {
                     assertEquals("complete", response.body().string());
                 }
                 RecordedRequest received = server.takeRequest(2, TimeUnit.SECONDS);
-                assertNotNull(received); assertEquals(item[0], received.getMethod());
-                assertEquals("close", received.getHeader("Connection"));
-                assertEquals("USB requests must never reuse the previous socket", 0, received.getSequenceNumber());
+                assertNotNull(received); assertEquals(cases[i][0], received.getMethod());
+                assertNotEquals("Pooled requests must not force a per-request close", "close", received.getHeader("Connection"));
+                assertEquals("Sequential requests must reuse the pooled socket", i, received.getSequenceNumber());
             }
             assertEquals(cases.length, server.getRequestCount());
         } finally { transport.closeForTest(); }
@@ -97,7 +97,7 @@ public class ApiClientTransportTest {
                     () -> transport.call(request(server, item[0], item[1])).execute());
                 RecordedRequest only = server.takeRequest(2, TimeUnit.SECONDS);
                 assertNotNull(only); assertEquals(item[0], only.getMethod());
-                assertEquals(freshConnections ? 0 : 1, only.getSequenceNumber());
+                assertEquals("A mutation rides the primed pooled connection", 1, only.getSequenceNumber());
                 assertEquals("synthetic-test-input", only.getBody().readUtf8());
                 assertNull("Mutation was replayed", server.takeRequest(150, TimeUnit.MILLISECONDS));
                 assertEquals(2, server.getRequestCount());
@@ -173,7 +173,7 @@ public class ApiClientTransportTest {
             server.enqueue(new MockResponse().setBody("wav"));
             try (Response response = media.execute()) { assertEquals("wav", response.body().string()); }
             RecordedRequest received = server.takeRequest(2, TimeUnit.SECONDS);
-            assertEquals("GET", received.getMethod()); assertEquals("close", received.getHeader("Connection"));
+            assertEquals("GET", received.getMethod()); assertNotEquals("close", received.getHeader("Connection"));
         } finally { transport.closeForTest(); }
     }
 }

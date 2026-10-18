@@ -2,6 +2,7 @@ package com.aidol.demo;
 
 import android.content.Context;
 import android.media.AudioAttributes;
+import android.media.AudioDeviceCallback;
 import android.media.AudioFocusRequest;
 import android.media.AudioDeviceInfo;
 import android.media.AudioFormat;
@@ -15,6 +16,7 @@ import android.os.SystemClock;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.ByteArrayInputStream;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 
@@ -29,6 +31,8 @@ public final class ReplyPlayer {
     private volatile String interruption;
     private volatile AudioTrack activeTrack;
     private AudioTrack preparedTrack;
+    /** Wakes the route/device/marker waits on real events, including cancellation. */
+    private final PlaybackLease.EventSignal waitEvents = new PlaybackLease.EventSignal();
     private static final int PRIMER_BYTES = 2400;
 
     /** Allocate only: standby never plays audio, takes focus or opens a microphone. */
@@ -94,15 +98,28 @@ public final class ReplyPlayer {
         AudioDeviceInfo target = null;
         if (mode.requiresVerifiedHeadsetOutput()) {
             long routeDeadline = SystemClock.elapsedRealtime() + 4000;
-            while (!cancelled && target == null && SystemClock.elapsedRealtime() < routeDeadline) {
-                for (AudioDeviceInfo device : manager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
-                    if (acceptable(device) && (device.getType() == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
-                        || (Build.VERSION.SDK_INT >= 31 && device.getType() == AudioDeviceInfo.TYPE_BLE_HEADSET))) {
-                        target = device; break;
+            // The framework delivers the current device list on registration, so no initial poll.
+            AudioDeviceCallback devices = new AudioDeviceCallback() {
+                @Override public void onAudioDevicesAdded(AudioDeviceInfo[] added) { waitEvents.signal(); }
+                @Override public void onAudioDevicesRemoved(AudioDeviceInfo[] removed) { waitEvents.signal(); }
+            };
+            manager.registerAudioDeviceCallback(devices, new Handler(Looper.getMainLooper()));
+            try {
+                long seen = waitEvents.version();
+                while (!cancelled && target == null && SystemClock.elapsedRealtime() < routeDeadline) {
+                    for (AudioDeviceInfo device : manager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+                        if (acceptable(device) && (device.getType() == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+                            || (Build.VERSION.SDK_INT >= 31 && device.getType() == AudioDeviceInfo.TYPE_BLE_HEADSET))) {
+                            target = device; break;
+                        }
                     }
+                    if (target == null) {
+                        long remaining = routeDeadline - SystemClock.elapsedRealtime();
+                        if (remaining > 0) waitEvents.await(seen, remaining);
+                    }
+                    seen = waitEvents.version();
                 }
-                if (target == null) Thread.sleep(100);
-            }
+            } finally { manager.unregisterAudioDeviceCallback(devices); }
             if (cancelled) { return; }
             if (target == null) throw new IOException(mode.requiresTargetIdentity()
                 ? "未核验到所连接 Rise 的媒体输出，请检查目标耳机的媒体音频和连接状态"
@@ -121,7 +138,12 @@ public final class ReplyPlayer {
         if (manager.requestAudioFocus(focus) != AudioManager.AUDIOFOCUS_REQUEST_GRANTED)
             throw new IOException("无法取得音频焦点，请关闭正在通话或播放的应用后重试");
         AudioTrack track = null;
+        // Registered before play: while unarmed it only wakes the route wait below; once armed
+        // (after the route is verified) it polices route loss for the rest of the segment.
+        final AtomicBoolean routeArmed = new AtomicBoolean();
         AudioRouting.OnRoutingChangedListener routeListener = router -> {
+            waitEvents.signal();
+            if (!routeArmed.get()) return;
             if (!acceptable(router.getRoutedDevice())) {
                 interruption = "实际播放已离开目标耳机，已停止，请重新连接后重试";
                 AudioTrack active = activeTrack;
@@ -129,6 +151,7 @@ public final class ReplyPlayer {
                 cancel();
             }
         };
+        AudioTrack.OnPlaybackPositionUpdateListener marker = null;
         boolean routeObserved = false;
         try {
             interrupted();
@@ -141,14 +164,20 @@ public final class ReplyPlayer {
             if (Build.VERSION.SDK_INT >= 31) track.setStartThresholdInFrames(1);
             if (target != null && !track.setPreferredDevice(target))
                 log.accept("系统未接受首选设备，正在核验实际蓝牙输出…");
+            track.addOnRoutingChangedListener(routeListener, new Handler(Looper.getMainLooper()));
+            routeObserved = true;
             // Prime with silence: never play private speech before proving a Bluetooth route.
             track.setVolume(0);
             byte[] silence = new byte[PRIMER_BYTES];
             if (track.write(silence, 0, silence.length) != silence.length) throw new IOException("音频缓冲初始化失败");
             track.play();
             long readyDeadline = SystemClock.elapsedRealtime() + (mode.requiresVerifiedHeadsetOutput() ? 3000 : 500);
-            while (!cancelled && (track.getRoutedDevice() == null || !acceptable(track.getRoutedDevice()))
-                && SystemClock.elapsedRealtime() < readyDeadline) Thread.sleep(40);
+            long seen = waitEvents.version();
+            while (!cancelled && !acceptable(track.getRoutedDevice()) && SystemClock.elapsedRealtime() < readyDeadline) {
+                long remaining = readyDeadline - SystemClock.elapsedRealtime();
+                if (remaining > 0) waitEvents.await(seen, remaining);
+                seen = waitEvents.version();
+            }
             interrupted();
             if (cancelled) { return; }
             AudioDeviceInfo actual = track.getRoutedDevice();
@@ -156,8 +185,7 @@ public final class ReplyPlayer {
             output.accept(actual.getProductName() + " / type=" + actual.getType());
             // Keep the silent primer in the same playing track: pausing would invalidate
             // getRoutedDevice on some phones and force another unverified route transition.
-            track.addOnRoutingChangedListener(routeListener, new Handler(Looper.getMainLooper()));
-            routeObserved = true;
+            routeArmed.set(true);
             if (!acceptable(track.getRoutedDevice())) {
                 throw new IOException("播放路由已改变，请重新连接目标耳机");
             }
@@ -173,6 +201,8 @@ public final class ReplyPlayer {
                 total += length;
                 if ((length & 1) != 0 || total > maxStreamBytes) throw new IOException("语音格式无效或超过上限");
                 long writeDeadline = SystemClock.elapsedRealtime() + 5000;
+                // No framework event exists for track buffer space; the 20 ms nap matches the
+                // drain quantum of the ~9600-byte buffer and is not a busy wait.
                 for (int offset = 0; !cancelled && offset < length;) {
                     if (!acceptable(track.getRoutedDevice())) throw new IOException("播放路由离开蓝牙耳机，已停止");
                     int count = track.write(pcm, offset, length - offset, AudioTrack.WRITE_NON_BLOCKING);
@@ -199,15 +229,26 @@ public final class ReplyPlayer {
             }
             long deadline = SystemClock.elapsedRealtime() + total * 500 / sampleRate + 5000;
             long expectedFrames = (total + silence.length) / 2L;
+            // The playback-head wait wakes on the reach-the-end marker instead of polling.
+            marker = new AudioTrack.OnPlaybackPositionUpdateListener() {
+                @Override public void onMarkerReached(AudioTrack changed) { waitEvents.signal(); }
+                @Override public void onPeriodicNotification(AudioTrack changed) { waitEvents.signal(); }
+            };
+            track.setPlaybackPositionUpdateListener(marker, new Handler(Looper.getMainLooper()));
+            track.setNotificationMarkerPosition((int) Math.min(Integer.MAX_VALUE, expectedFrames));
+            long markerSeen = waitEvents.version();
             while (!cancelled && Integer.toUnsignedLong(track.getPlaybackHeadPosition()) < expectedFrames) {
                 if (SystemClock.elapsedRealtime() >= deadline) throw new IOException("语音播放超时，请检查音量和媒体输出");
                 if (!acceptable(track.getRoutedDevice())) throw new IOException("播放路由离开蓝牙耳机，已停止");
-                Thread.sleep(40);
+                // A coarse cap survives devices whose marker callbacks are unreliable.
+                waitEvents.await(markerSeen, 500);
+                markerSeen = waitEvents.version();
             }
             interrupted();
         } finally {
             activeTrack = null;
             if (track != null) {
+                if (marker != null) track.setPlaybackPositionUpdateListener(null);
                 if (routeObserved) track.removeOnRoutingChangedListener(routeListener);
                 try { track.stop(); } catch (Exception ignored) {} track.release();
             }
@@ -230,6 +271,7 @@ public final class ReplyPlayer {
         synchronized (this) {
             cancelled = true; prepared = preparedTrack; preparedTrack = null;
         }
+        waitEvents.signal();
         if (prepared != null) prepared.release();
         AudioTrack track = activeTrack;
         if (track != null) { try { track.pause(); track.flush(); } catch (Exception ignored) {} }

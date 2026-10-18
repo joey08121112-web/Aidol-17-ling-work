@@ -132,22 +132,10 @@ class AssistantTools:
         if name == "current_location":
             return await maps.reverse(self.location())
         if name == "weather":
-            if args.city:
-                code = args.city
-                if not (code.isascii() and code.isdigit() and len(code) == 6):
-                    resolved = await maps.geocode(args.city)
-                    if not resolved.get("available"):
-                        return resolved
-                    places = resolved.get("places", [])
-                    if len(places) != 1:
-                        return {"available": False, "reason": "城市不明确，请提供城市/区县名称"}
-                    code = places[0]["adcode"]
-            else:
-                resolved = await maps.reverse(self.location())
-                if not resolved.get("available"):
-                    return resolved
-                code = resolved.get("adcode", "")
-            return await maps.weather(code, args.forecast)
+            # Location is only required when no city was named; missing fix
+            # raises LocationUnavailable and is handled by call().
+            location = None if args.city else self.location()
+            return await maps.weather_for(args.city, location, args.forecast)
         if name == "plan_route":
             settings = self.agent.store.settings().model_copy(deep=True)
             origin = self.location()

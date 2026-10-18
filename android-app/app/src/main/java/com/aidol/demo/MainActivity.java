@@ -50,7 +50,10 @@ public final class MainActivity extends Activity {
     private static final int INK = 0xff202632, MUTED = 0xff697381, ACCENT = 0xff2468db, RED = 0xffb42318;
     private static final int SOFT = 0xffedf1f7;
     private static final int MEMORY = 0xff7356a6, WORK = 0xff305fb5, COMMUTE = 0xff24786d;
+    // User actions stay on one ordered queue; polling, lazy loads and exports share two IO
+    // threads so a request hitting the 100s read timeout cannot monopolise the action queue.
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    private final ExecutorService ioPool = Executors.newFixedThreadPool(2);
     private ApiClient api;
     private DevelopmentSettings development;
     private HeadsetController headset;
@@ -72,6 +75,9 @@ public final class MainActivity extends Activity {
     private final Runnable automaticHeadsetTick = this::maintainHeadset;
     private TextView dialogFeedback;
     private TextView headsetStatus, deviceDetails, voiceHint, developmentSummary;
+    // The profile tab shows the headset line too; a shared field would go stale across cached tabs.
+    private TextView profileHeadsetStatus;
+    private Button lockScreenButton;
     private long sessionGeneration;
     private String diagnosticSession = "尚未开始";
     private boolean sessionUsesCapture;
@@ -124,11 +130,11 @@ public final class MainActivity extends Activity {
                 cancelSession(reason);
                 disconnectVoiceService();
                 syncHeadsetControls();
-                if (visible && !isDestroyed()) showApp();
+                if (visible && !isDestroyed()) updateStatus();
             });
             syncHeadsetControls();
             lastNotice = "耳机会话已开启 · 录音可锁屏继续 · 通知可停止";
-            showApp();
+            updateStatus();
             if (callStartPending) { callStartPending = false; startVoice(); }
         }
         @Override public void onServiceDisconnected(android.content.ComponentName name) {
@@ -181,6 +187,14 @@ public final class MainActivity extends Activity {
     private boolean busy, recording;
     private volatile boolean visible;
     private int tab, authMode;
+    // Built-once tab contents: a clean tab switch reattaches the cached container instead of
+    // re-running the builder; markTabsDirty() forces a rebuild of stale content on next visit.
+    private final LinearLayout[] tabViews = new LinearLayout[5];
+    private final boolean[] tabDirty = {true, true, true, true, true};
+    private LinearLayout activeCallRow;
+    private final IconView[] navIcons = new IconView[5];
+    private final TextView[] navNames = new TextView[5];
+    private final LinearLayout[] navItems = new LinearLayout[5];
     private String memoryFilter = "", lastNotice = "", lastAnswer = "", lastUser = "";
     private JSONArray lastCitations = new JSONArray(), lastTools = new JSONArray();
     private LinearLayout turnDetails;
@@ -191,8 +205,12 @@ public final class MainActivity extends Activity {
     private TextView workClock, workAudioLabel, meetingTitle, meetingMeta;
     private LinearLayout workCaptionBox, conversationCaptionBox;
     // Live captions of the meeting being recorded: final sentences in ink, the interim text in grey.
-    private final java.util.ArrayList<SpeakerParagraphs.Sentence> workCaptionSentences = new java.util.ArrayList<>();
-    private String workCaptionPartial = "", workCaptionMeetingId = "", workCaptionStartedAt = "";
+    // CaptionList keeps the sentence record once; the two boxes render it in different windows.
+    private final CaptionList workCaptionList = new CaptionList(80);
+    private final CaptionList conversationCaptionList = new CaptionList(200);
+    private final CaptionBox workCaptionViews = new CaptionBox();
+    private final CaptionBox conversationCaptionViews = new CaptionBox();
+    private String workCaptionMeetingId = "", workCaptionStartedAt = "";
     private String workMeetingAudioText = "";
     private android.app.Dialog meetingPage;
     private ScrollView meetingScroll;
@@ -238,7 +256,7 @@ public final class MainActivity extends Activity {
     private final Runnable repeatTick = new Runnable() {
         @Override public void run() {
             if (!repeatArmed || !sessionAvailable() || (tab != 0 && listenMode != VoiceInteraction.CALL) || api.vault.token().isEmpty()) return;
-            if (listenMode == 2 && !"life".equals(mode())) { stopRepeat(); lastNotice = "场景已切换，定时聆听已停止"; showApp(); return; }
+            if (listenMode == 2 && !"life".equals(mode())) { stopRepeat(); lastNotice = "场景已切换，定时聆听已停止"; updateStatus(); return; }
             long remaining = repeatAt - android.os.SystemClock.elapsedRealtime();
             if (session == null && !busy && locationListener == null && !permissionPending && remaining <= 0) { startVoice(); return; }
             if (session == null && !busy && status != null && remaining > 0) setStatusText((listenMode == 2 ? "定时聆听" : InteractionCopy.name(listenMode)) + " · " + Math.max(1, (remaining + 999) / 1000) + " 秒后继续 · 点击停止结束");
@@ -298,11 +316,14 @@ public final class MainActivity extends Activity {
         turnDetails = null;
         voiceButton = null; cancelButton = null; orb = null; chatInput = null;
         callCaption = null; liveWords = null; content = null; workCaptionBox = null; conversationCaptionBox = null;
+        workCaptionViews.box = null; conversationCaptionViews.box = null;
         liveTurn = null; liveUserBubble = null; liveAssistantBubble = null; conversationStarters = null;
         conversationScrollQueued = false;
         headsetStatus = null;
         voiceHint = null; modeChoices = null; modeHint = null;
         developmentSummary = null;
+        modeChoices = null; modeHint = null; workClock = null; workMeetingList = null;
+        profileHeadsetStatus = null; lockScreenButton = null;
         root = column(); root.setBackgroundColor(BG);
         root.setFitsSystemWindows(false);
         setContentView(root);
@@ -381,13 +402,15 @@ public final class MainActivity extends Activity {
             .setPositiveButton("我已妥善保存", (d, w) -> {}).show();
     }
 
+    /** Full screen rebuild: new scaffold, all cached tab contents dropped. Cold paths only
+     *  (first show, account or backend switch); state updates and tab switches use renderTab(). */
     private void showApp() {
         handler.removeCallbacks(workMeetingPoll);
-        workMeetingList = null;
-        boolean restoreComposerFocus = tab == 0 && chatInput != null && chatInput.hasFocus();
-        int draftSelection = chatInput == null ? 0 : chatInput.getSelectionStart();
         if (chatInput != null) chatDraft = chatInput.getText().toString();
-        authError = null; base();
+        authError = null;
+        java.util.Arrays.fill(tabViews, null);
+        java.util.Arrays.fill(tabDirty, true);
+        base();
         LinearLayout head = row(); head.setGravity(Gravity.CENTER_VERTICAL); head.setPadding(dp(24), dp(8), dp(24), dp(4));
         root.addView(head);
         LinearLayout wordmark = column(); head.addView(wordmark, new LinearLayout.LayoutParams(0, -2, 1));
@@ -400,16 +423,16 @@ public final class MainActivity extends Activity {
         maintenanceStatus = label(root, "", 10, MUTED);
         maintenanceStatus.setPadding(dp(24), 0, dp(24), dp(5));
         renderMaintenanceStatus();
-        if (tab != 0 && repeatArmed && listenMode == VoiceInteraction.CALL) {
-            LinearLayout activeCall = row(); activeCall.setPadding(dp(24), dp(4), dp(24), dp(4)); root.addView(activeCall);
-            button(activeCall, "AI 通话中 · 返回", false, () -> switchTab(0));
-            button(activeCall, "挂断", false, () -> { cancelSession("通话已结束"); showApp(); });
-        }
+        activeCallRow = row(); activeCallRow.setPadding(dp(24), dp(4), dp(24), dp(4)); root.addView(activeCallRow);
+        button(activeCallRow, "AI 通话中 · 返回", false, () -> switchTab(0));
+        button(activeCallRow, "挂断", false, () -> { cancelSession("通话已结束"); markTabsDirty(); renderTab(); });
         scroll = new ScrollView(this); scroll.setFillViewport(true); scroll.setClipToPadding(false); scroll.setVerticalScrollBarEnabled(false);
         root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
-        page = column(); page.setPadding(dp(24), dp(12), dp(24), dp(32)); scroll.addView(page);
         scroll.setOnScrollChangeListener((v, x, y, oldX, oldY) -> {
-            if (tab == 0 && v == scroll) followingConversation = ConversationFeed.shouldFollow(y, page.getHeight(), scroll.getHeight());
+            if (tab == 0 && v == scroll) {
+                followingConversation = ConversationFeed.shouldFollow(y, page.getHeight(), scroll.getHeight());
+                if (oldY > 0 && y == 0) loadEarlierCaptions();
+            }
         });
         composer = column(); composer.setPadding(dp(20), dp(8), dp(20), dp(8)); root.addView(composer);
         composer.setVisibility(tab == 0 ? View.VISIBLE : View.GONE);
@@ -418,21 +441,77 @@ public final class MainActivity extends Activity {
         String[] names = {"对话", "记忆", "工作", "通勤", "我的"};
         for (int i = 0; i < names.length; i++) {
             final int index = i; LinearLayout item = column(); item.setGravity(Gravity.CENTER); item.setPadding(0, dp(7), 0, dp(5));
-            item.setBackground(ripple(tab == i ? SOFT : BG, 18, tab == i ? SOFT : BG));
             item.setSelected(tab == i); item.setFocusable(true);
             item.setMinimumHeight(dp(60)); nav.addView(item, new LinearLayout.LayoutParams(0, -2, 1));
+            navItems[i] = item;
             IconView icon = new IconView(i, tab == i ? INK : MUTED); item.addView(icon, new LinearLayout.LayoutParams(dp(22), dp(22)));
+            navIcons[i] = icon;
             TextView name = label(item, names[i], 11, tab == i ? INK : MUTED); name.setGravity(Gravity.CENTER); name.setPadding(0, dp(4), 0, 0);
+            navNames[i] = name;
             item.setContentDescription(names[i]); item.setOnClickListener(v -> switchTab(index));
         }
-        if (tab == 0) conversation(); else if (tab == 1) memories(); else if (tab == 2) work(); else if (tab == 3) commute(); else profile();
+        updateNavSelection();
+        renderTab();
+    }
+
+    /** Rebuilds only the current tab's content (when stale) and reattaches it; never touches the scaffold. */
+    private void renderTab() {
+        boolean restoreComposerFocus = tab == 0 && chatInput != null && chatInput.hasFocus();
+        int draftSelection = chatInput == null ? 0 : chatInput.getSelectionStart();
+        if (tab == 0 && chatInput != null) chatDraft = chatInput.getText().toString();
+        if (tabDirty[tab] || tabViews[tab] == null) {
+            clearTabFields(tab);
+            if (tab == 0) composer.removeAllViews();
+            LinearLayout fresh = column(); fresh.setPadding(dp(24), dp(12), dp(24), dp(32));
+            page = fresh;
+            if (tab == 0) conversation(); else if (tab == 1) memories(); else if (tab == 2) work(); else if (tab == 3) commute(); else profile();
+            tabViews[tab] = fresh; tabDirty[tab] = false;
+        } else page = tabViews[tab];
+        if (scroll.getChildCount() == 0 || scroll.getChildAt(0) != tabViews[tab]) {
+            scroll.removeAllViews();
+            scroll.addView(tabViews[tab]);
+            if (tab == 0 && session != null) followConversation();
+        }
+        composer.setVisibility(tab == 0 ? View.VISIBLE : View.GONE);
+        updateNavSelection();
         if (restoreComposerFocus && chatInput != null) {
             chatInput.requestFocus(); chatInput.setSelection(Math.max(0, Math.min(draftSelection, chatInput.length())));
         }
+        if (tab != 0) conversationScrollQueued = false;
         updateStatus();
         syncHeadsetControls();
         prepareVoice();
+        handler.removeCallbacks(workMeetingPoll);
         if (tab == 2 && visible) handler.post(workMeetingPoll);
+    }
+
+    /** Fresh server state arrived: every tab's built content is stale, only the visible one re-renders now. */
+    private void markTabsDirty() { java.util.Arrays.fill(tabDirty, true); }
+
+    /** Drop the per-tab view refs of one tab before its builder runs; other tabs keep their cached refs. */
+    private void clearTabFields(int which) {
+        if (which == 0) {
+            diagnosticsView = null; turnDetails = null;
+            voiceButton = null; cancelButton = null; orb = null; chatInput = null;
+            callCaption = null; liveWords = null; content = null; conversationCaptionBox = null; conversationCaptionViews.box = null;
+            liveTurn = null; liveUserBubble = null; liveAssistantBubble = null; conversationStarters = null;
+            conversationScrollQueued = false; headsetStatus = null; voiceHint = null; modeChoices = null; modeHint = null;
+            lockScreenButton = null;
+        } else if (which == 2) {
+            workClock = null; workMeetingList = null; workCaptionBox = null; workCaptionViews.box = null;
+        } else if (which == 4) {
+            profileHeadsetStatus = null; developmentSummary = null;
+        }
+    }
+
+    private void updateNavSelection() {
+        for (int i = 0; i < navItems.length; i++) {
+            if (navItems[i] == null) continue;
+            navItems[i].setSelected(tab == i);
+            navItems[i].setBackground(ripple(tab == i ? SOFT : BG, 18, tab == i ? SOFT : BG));
+            if (navIcons[i] != null) navIcons[i].setColor(tab == i ? INK : MUTED);
+            if (navNames[i] != null) navNames[i].setTextColor(tab == i ? INK : MUTED);
+        }
     }
 
     private void switchTab(int next) {
@@ -440,7 +519,7 @@ public final class MainActivity extends Activity {
         clearHeadsetGesture();
         boolean keepCall = sessionUsesCapture && session != null || repeatArmed;
         if (session != null && !keepCall) cancelSession("已结束当前操作");
-        if (!keepCall) stopRepeat(); tab = next; if (next == 0) followingConversation = true; hideKeyboard(); showApp();
+        if (!keepCall) stopRepeat(); tab = next; if (next == 0) followingConversation = true; hideKeyboard(); renderTab();
         enterMaintenance("page_return");
     }
 
@@ -481,8 +560,8 @@ public final class MainActivity extends Activity {
         LinearLayout listeningDetails = disclosure(page, "通话设置", "通话与工作记录", false);
         voiceHint = label(listeningDetails, voiceHintText(), 12, MUTED);
         label(listeningDetails, "生活与通勤：单击开始连续问答，停顿后自动回复，文字和音频逐步返回；再次单击结束。工作：单击录音转写，再次单击结束并保存。双击结束当前会话并切换模式，切换后待机。通话中持续收音，说“小万”可打断 AI 播报。", 12, MUTED);
-        button(listeningDetails, lockScreenEnabled() ? "停止锁屏耳机会话" : "开启本次锁屏耳机会话", false, () -> {
-            if (lockScreenEnabled()) { stopLockScreenSession(); showApp(); }
+        lockScreenButton = button(listeningDetails, lockScreenEnabled() ? "停止锁屏耳机会话" : "开启本次锁屏耳机会话", false, () -> {
+            if (lockScreenEnabled()) { stopLockScreenSession(); tabDirty[0] = true; renderTab(); }
             else enableLockScreenSession();
         });
         label(listeningDetails, "开启锁屏会话后，AI 通话可在锁屏时继续；通知可随时挂断。通话会持续到挂断；未通话的待命一小时后关闭。关闭 App、来电或断连后需重新开启。定时与记录仅在当前页面运行。", 12, MUTED);
@@ -544,14 +623,14 @@ public final class MainActivity extends Activity {
         boolean live = session != null && sessionUsesCapture && "work".equals(mode());
         JSONArray meetings = array(state, "work_meetings");
         JSONObject latest = MeetingOrder.latest(meetings);
-        boolean showLatest = !live && workCaptionSentences.isEmpty() && latest != null;
+        boolean showLatest = !live && conversationCaptionList.totalSentences() == 0 && latest != null;
         TextView heading = label(page, "文字记录", 20, INK); heading.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         java.time.ZoneId zone = java.time.ZoneId.systemDefault();
         String started = showLatest ? latest.optString("started_at") : workCaptionStartedAt;
         String ended = showLatest ? latest.optString("ended_at") : "";
         String title = showLatest && !latest.isNull("title") ? fallback(latest.optString("title"), "会议记录") : live ? "本次会议（记录中）" : "本次会议";
         java.util.LinkedHashSet<String> speakers = new java.util.LinkedHashSet<>();
-        for (SpeakerParagraphs.Sentence sentence : workCaptionSentences) if (!sentence.speaker.isEmpty()) speakers.add(SpeakerParagraphs.name(sentence.speaker));
+        for (SpeakerParagraphs.Sentence sentence : conversationCaptionList.sentences()) if (!sentence.speaker.isEmpty()) speakers.add(SpeakerParagraphs.name(sentence.speaker));
         LinearLayout meta = metaBlock(page);
         label(meta, "录音主题：" + title, 14, MUTED);
         if (!started.isEmpty()) label(meta, "录音时间：" + TimeFormat.chineseDay(started, zone) + " " + TimeFormat.hourMinute(started, zone)
@@ -566,7 +645,7 @@ public final class MainActivity extends Activity {
                 label(box, "正在加载最近一场会议的文字记录…", 13, MUTED);
                 ApiClient client = api;
                 long readGeneration = workMeetingReadGeneration;
-                worker.execute(() -> {
+                ioPool.execute(() -> {
                     JSONObject detail = null;
                     try { detail = client.json("GET", "/v1/work-meetings/" + Uri.encode(latestId), null); } catch (Exception ignored) {}
                     JSONObject loaded = detail;
@@ -583,7 +662,7 @@ public final class MainActivity extends Activity {
         }
         conversationCaptionBox = column(); conversationCaptionBox.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         page.addView(conversationCaptionBox);
-        renderWorkCaption();
+        renderCaptionSnapshot(conversationCaptionViews, conversationCaptionList, conversationCaptionBox);
         if (!live && !workCaptionMeetingId.isEmpty())
             button(page, "查看本场纪要、章节与回放", false, () -> openWorkMeeting(workCaptionMeetingId));
     }
@@ -717,7 +796,7 @@ public final class MainActivity extends Activity {
             if ("completed".equals(result.optString("status")) && completed != null) {
                 acceptBusinessResult(completed);
                 lastNotice = "已找回上次处理结果；未重新提交录音或自动播放";
-                showApp(); refresh();
+                refresh();
             } else {
                 String message = "failed".equals(result.optString("status"))
                     ? "上次请求处理失败，未取得完整结果。请先核对历史；本次查询没有重放请求。"
@@ -804,7 +883,7 @@ public final class MainActivity extends Activity {
         sectionHeader(page, "我的记忆", allMemories.length() + " 条 · " + pinnedCount + " 置顶", "＋ 新记忆", () -> { if (canAct()) editMemory(null); });
         LinearLayout filters = row(); filters.setPadding(dp(3), dp(3), dp(3), dp(3)); filters.setBackground(shape(CARD, 16, CARD)); page.addView(filters);
         String[] keys = {"", "preference", "fact", "task", "trip"}, names = {"全部", "偏好", "事实", "待办", "出行"};
-        for (int i = 0; i < keys.length; i++) { final String key = keys[i]; segment(filters, names[i], memoryFilter.equals(key), () -> { memoryFilter = key; showApp(); }); }
+        for (int i = 0; i < keys.length; i++) { final String key = keys[i]; segment(filters, names[i], memoryFilter.equals(key), () -> { memoryFilter = key; tabDirty[1] = true; renderTab(); }); }
         JSONArray items = array(state, "memories"); int count = 0;
         for (int i = 0; i < items.length(); i++) {
             JSONObject memory = items.optJSONObject(i); if (memory == null || (!memoryFilter.isEmpty() && !memoryFilter.equals(memory.optString("kind")))) continue;
@@ -856,7 +935,7 @@ public final class MainActivity extends Activity {
             if (!canAct()) return; if (value(text).isEmpty()) { text.setError("记忆不能为空"); return; }
             JSONObject payload = json("content", value(text), "kind", kinds[picker.getSelectedItemPosition()], "pinned", memory != null && pinned(memory));
             request(() -> api.json(memory == null ? "POST" : "PUT", "/v1/memories" + (memory == null ? "" : "/" + memory.optString("id")), payload), result -> {
-                dialog.dismiss(); if (memory != null) { clearPrivateSnapshots(); showApp(); } refresh();
+                dialog.dismiss(); if (memory != null) clearPrivateSnapshots(); refresh();
             });
         })); dialog.show();
     }
@@ -972,7 +1051,7 @@ public final class MainActivity extends Activity {
                         if (latestMeetingDetail != null && id.equals(latestMeetingDetail.optString("id"))) latestMeetingDetail = null;
                         if (id.equals(openWorkMeetingId) && meetingPage != null) meetingPage.dismiss();
                         if (id.equals(meetingPlayback.meetingId())) meetingPlayback.stop();
-                        if (id.equals(workCaptionMeetingId)) { workCaptionMeetingId = ""; workCaptionSentences.clear(); workCaptionPartial = ""; workCaptionStartedAt = ""; }
+                        if (id.equals(workCaptionMeetingId)) { workCaptionMeetingId = ""; workCaptionList.reset(); workCaptionStartedAt = ""; }
                         android.content.SharedPreferences drafts = getSharedPreferences("meeting_edit_drafts", MODE_PRIVATE);
                         android.content.SharedPreferences.Editor editor = drafts.edit(); String prefix = ActionTaskBoard.account(client) + ":" + id + ":";
                         for (String key : drafts.getAll().keySet()) if (key.startsWith(prefix)) editor.remove(key); editor.apply();
@@ -1001,13 +1080,15 @@ public final class MainActivity extends Activity {
         ApiClient client = api;
         long readGeneration = workMeetingReadGeneration;
         String detailId = openWorkMeetingId;
-        worker.execute(() -> {
+        ioPool.execute(() -> {
             JSONObject list = null, detail = null;
             try {
                 list = client.json("GET", "/v1/work-meetings", null);
                 if (!detailId.isEmpty()) detail = client.json("GET", "/v1/work-meetings/" + Uri.encode(detailId), null);
             } catch (Exception ignored) { /* Keep confirmed state and retry the read, never replay PCM. */ }
             JSONObject loadedList = list, loadedDetail = detail;
+            // Serialize the change fingerprint here so the UI thread never re-serializes a whole meeting every poll.
+            String loadedSnapshot = detail == null ? null : workMeetingSnapshot(detail);
             runOnUiThread(() -> {
                 workMeetingPollInFlight = false;
                 if (isDestroyed() || client != api || client.vault.token().isEmpty()) return;
@@ -1015,7 +1096,7 @@ public final class MainActivity extends Activity {
                     if (loadedList != null) put(state, "work_meetings", array(loadedList, "meetings"));
                     workMeetingSyncError = loadedList == null;
                     renderWorkMeetings();
-                    if (loadedDetail != null && detailId.equals(openWorkMeetingId)) renderWorkMeetingDetail(loadedDetail);
+                    if (loadedDetail != null && detailId.equals(openWorkMeetingId)) renderWorkMeetingDetail(loadedDetail, loadedSnapshot);
                 }
                 handler.removeCallbacks(workMeetingPoll);
                 if (visible && tab == 2) handler.postDelayed(workMeetingPoll, 2500);
@@ -1069,8 +1150,25 @@ public final class MainActivity extends Activity {
         enterMaintenance("page_return");
         handler.removeCallbacks(workMeetingPoll); handler.post(workMeetingPoll);
     }
-    private void renderWorkMeetingDetail(JSONObject meeting) {
+    private void renderWorkMeetingDetail(JSONObject meeting) { renderWorkMeetingDetail(meeting, workMeetingSnapshot(meeting)); }
+    /** Fingerprint of everything the detail view renders; static so the poll worker can build it off the UI thread. */
+    private static String workMeetingSnapshot(JSONObject meeting) {
+        return json("sources", array(meeting, "sources"), "report", meeting.optJSONObject("report"),
+            "summary_status", meeting.optString("summary_status"), "status", meeting.optString("status"),
+            "error", meeting.optString("error"), "utterances", array(meeting, "utterances"),
+            "events", array(meeting, "events"), "audio", meeting.optJSONObject("audio"),
+            // Progress-line inputs (summary_stage/transcription_status drive the header text between
+            // content changes) and detail fields the body branches on; ended_at backfills on finish.
+            "transcription_status", meeting.optString("transcription_status"), "summary_stage", meeting.optString("summary_stage"),
+            "processed_sections", meeting.optInt("processed_sections"), "total_sections", meeting.optInt("total_sections"),
+            "received_segments", meeting.optInt("received_segments"), "ended_at", meeting.optString("ended_at")).toString();
+    }
+    private void renderWorkMeetingDetail(JSONObject meeting, String snapshot) {
         if (workMeetingDetail == null || !meeting.optString("id").equals(openWorkMeetingId)) return;
+        // While recording, the document is still small and the progress line tracks live session
+        // state (workSaving flips) — keep rendering; long finished meetings take the cheap gate.
+        if (snapshot.equals(workMeetingDetailSnapshot) && !"recording".equals(meeting.optString("status"))) return;
+        workMeetingDetailSnapshot = snapshot;
         JSONObject report = meeting.optJSONObject("report");
         JSONArray sources = array(meeting, "sources");
         MeetingTimeline timeline = new MeetingTimeline(meeting);
@@ -1086,11 +1184,7 @@ public final class MainActivity extends Activity {
                 + (speakers.isEmpty() ? "未区分说话人" : speakers.size() + " 位说话人") + " · " + timeline.sentences().size() + " 句 · "
                 + workMeetingProgress(meeting));
         }
-        String snapshot = json("sources", sources, "report", report, "summary_status", meeting.optString("summary_status"),
-            "status", meeting.optString("status"), "error", meeting.optString("error"), "utterances", array(meeting, "utterances"),
-            "events", array(meeting, "events"), "audio", meeting.optJSONObject("audio")).toString();
-        if (snapshot.equals(workMeetingDetailSnapshot)) return;
-        workMeetingDetailSnapshot = snapshot; workMeetingDetail.removeAllViews(); meetingSections.clear();
+        workMeetingDetail.removeAllViews(); meetingSections.clear();
         workMeetingTimeline = timeline; workMeetingLines.clear(); workMeetingRanges.clear(); workMeetingPlayingId = "";
         playingMark[0] = null; jumpMark[0] = null;
         if (!playable && meeting.optString("id").equals(meetingPlayback.meetingId())) meetingPlayback.stop();
@@ -1500,42 +1594,133 @@ public final class MainActivity extends Activity {
         }
     }
 
-    /** Live captions in the reference layout, on the work page (recent part) and the 对话 page (all). */
-    private void renderWorkCaption() {
-        if (workCaptionBox != null) {
-            renderCaptions(workCaptionBox, 80);
-            if (workCaptionBox.getParent() instanceof ScrollView) {
-                ScrollView inner = (ScrollView) workCaptionBox.getParent();
-                inner.post(() -> inner.fullScroll(View.FOCUS_DOWN));
-            }
-        }
-        if (conversationCaptionBox != null) { renderCaptions(conversationCaptionBox, Integer.MAX_VALUE); followConversation(); }
+    /** Live captions in the reference layout: the work page keeps a recent window, the 对话 page the long record. */
+    private void renderCaptionSnapshot(CaptionBox views, CaptionList list, LinearLayout box) {
+        views.attach(box);
+        applyCaptionDiff(views, list, list.snapshot());
     }
-    private void renderCaptions(LinearLayout box, int maxSentences) {
-        box.removeAllViews();
-        java.util.List<SpeakerParagraphs.Sentence> recent = workCaptionSentences.subList(
-            Math.max(0, workCaptionSentences.size() - maxSentences), workCaptionSentences.size());
-        java.util.List<SpeakerParagraphs.Paragraph> paragraphs = SpeakerParagraphs.build(recent);
-        if (paragraphs.isEmpty() && workCaptionPartial.isEmpty()) {
-            label(box, session != null && sessionUsesCapture && "work".equals(mode())
-                ? "正在聆听，开始说话后这里会实时显示说话人和文字…" : "开始会议记录后，这里会实时显示“说话人 1 / 说话人 2”、时间和文字。", 14, MUTED);
-            return;
+    private void scrollWorkCaptionToEnd() {
+        if (workCaptionBox != null && workCaptionBox.getParent() instanceof ScrollView) {
+            ScrollView inner = (ScrollView) workCaptionBox.getParent();
+            inner.post(() -> inner.fullScroll(View.FOCUS_DOWN));
         }
-        TextView last = null;
-        for (SpeakerParagraphs.Paragraph paragraph : paragraphs) {
-            StringBuilder text = new StringBuilder();
-            for (SpeakerParagraphs.Sentence sentence : paragraph.sentences) text.append(sentence.text);
-            last = transcriptParagraph(box, paragraph.header(), text);
+    }
+    /** Applies one caption diff: final sentences become appended views, the partial rewrites one TextView. */
+    private void applyCaptionDiff(CaptionBox views, CaptionList list, CaptionList.Diff diff) {
+        LinearLayout box = views.box;
+        if (box == null) return;
+        boolean structural = diff.dropLeading > 0 || !diff.appended.isEmpty() || !diff.appendToLast.isEmpty();
+        if (diff.rebuild) {
+            box.removeAllViews();
+            views.heads.clear(); views.bodies.clear(); views.placeholder = null; views.standaloneBody = null;
+            views.earlierHint = null;  // Detached by removeAllViews; sync re-creates it while history is hidden.
+            for (CaptionList.Block block : diff.blocks) addCaptionParagraph(views, box, block.header, block.text);
+            views.lastCommitted = diff.lastText;
+        } else {
+            if (structural) {
+                removeStandalonePartial(views, box);
+                if (views.placeholder != null) { box.removeView(views.placeholder); views.placeholder = null; }
+            }
+            for (int i = 0; i < diff.dropLeading; i++) {
+                box.removeView(views.heads.remove(0));
+                box.removeView(views.bodies.remove(0));
+            }
+            for (CaptionList.Block block : diff.appended) addCaptionParagraph(views, box, block.header, block.text);
+            if (structural) views.lastCommitted = diff.lastText;
+            if (!diff.appendToLast.isEmpty() && !views.bodies.isEmpty())
+                views.bodies.get(views.bodies.size() - 1).setText(diff.lastText);
         }
-        if (!workCaptionPartial.isEmpty()) {
-            // Interim words stay grey at the end of the last paragraph until the server confirms them.
-            if (last == null) last = transcriptParagraph(box, "正在识别", new StringBuilder());
-            android.text.SpannableStringBuilder grey = new android.text.SpannableStringBuilder(last.getText());
-            int start = grey.length(); grey.append(workCaptionPartial);
+        applyCaptionPartial(views, box, diff);
+        syncCaptionPlaceholder(views, box, diff);
+        syncEarlierHint(views, list, box);
+    }
+    private void addCaptionParagraph(CaptionBox views, LinearLayout box, String header, String text) {
+        int before = box.getChildCount();
+        TextView body = transcriptParagraph(box, header, text);
+        views.heads.add((TextView) box.getChildAt(before));
+        views.bodies.add(body);
+    }
+    /** Interim words stay grey at the end of the last paragraph until the server confirms them. */
+    private void applyCaptionPartial(CaptionBox views, LinearLayout box, CaptionList.Diff diff) {
+        if (!views.bodies.isEmpty()) {
+            TextView last = views.bodies.get(views.bodies.size() - 1);
+            if (diff.partial.isEmpty()) { if (!diff.rebuild) last.setText(views.lastCommitted); return; }
+            android.text.SpannableStringBuilder grey = new android.text.SpannableStringBuilder(views.lastCommitted);
+            int start = grey.length(); grey.append(diff.partial);
             grey.setSpan(new android.text.style.ForegroundColorSpan(MUTED), start, grey.length(), 0);
             last.setText(grey);
+            return;
+        }
+        if (views.standaloneBody != null) {
+            if (diff.partial.isEmpty()) removeStandalonePartial(views, box);
+            else views.standaloneBody.setText(greyWhole(diff.partial));
+        } else if (!diff.partial.isEmpty()) {
+            TextView head = label(box, "正在识别", 13, MUTED); head.setPadding(0, dp(14), 0, dp(2));
+            views.standaloneBody = label(box, "", 17, INK);
+            views.standaloneBody.setLineSpacing(dp(6), 1.05f); views.standaloneBody.setPadding(0, 0, 0, dp(6));
+            views.standaloneBody.setText(greyWhole(diff.partial));
         }
     }
+    private CharSequence greyWhole(String text) {
+        android.text.SpannableStringBuilder grey = new android.text.SpannableStringBuilder(text);
+        grey.setSpan(new android.text.style.ForegroundColorSpan(MUTED), 0, grey.length(), 0);
+        return grey;
+    }
+    private void removeStandalonePartial(CaptionBox views, LinearLayout box) {
+        if (views.standaloneBody == null) return;
+        int index = box.indexOfChild(views.standaloneBody);
+        if (index > 0) box.removeViewAt(index - 1);  // Its header was added immediately before the body.
+        box.removeView(views.standaloneBody);
+        views.standaloneBody = null;
+    }
+    private void syncCaptionPlaceholder(CaptionBox views, LinearLayout box, CaptionList.Diff diff) {
+        if (!views.bodies.isEmpty() || views.standaloneBody != null || !diff.partial.isEmpty()) {
+            if (views.placeholder != null && !diff.rebuild) { box.removeView(views.placeholder); views.placeholder = null; }
+            return;
+        }
+        if (views.placeholder == null) {
+            views.placeholder = label(box, "", 14, MUTED);
+        }
+        views.placeholder.setText(session != null && sessionUsesCapture && "work".equals(mode())
+            ? "正在聆听，开始说话后这里会实时显示说话人和文字…" : "开始会议记录后，这里会实时显示“说话人 1 / 说话人 2”、时间和文字。");
+    }
+    /** The 对话 page caps the rendered record; a hint at the top offers the hidden earlier sentences. */
+    private void syncEarlierHint(CaptionBox views, CaptionList list, LinearLayout box) {
+        boolean wanted = views == conversationCaptionViews && list.hasEarlier() && box.getParent() != null;
+        if (!wanted) { if (views.earlierHint != null) views.earlierHint.setVisibility(View.GONE); return; }
+        if (views.earlierHint == null) {
+            views.earlierHint = label(box, "", 12, ACCENT);
+            views.earlierHint.setPadding(0, dp(6), 0, dp(6));
+            views.earlierHint.setOnClickListener(v -> loadEarlierCaptions());
+            box.removeView(views.earlierHint); box.addView(views.earlierHint, 0);
+        }
+        views.earlierHint.setVisibility(View.VISIBLE);
+        views.earlierHint.setText("上面还有 " + list.earlierSentences() + " 句更早内容，回到顶部或点这里加载");
+    }
+    /** The reader came back to the top: grow the window by one page and keep their reading position. */
+    private void loadEarlierCaptions() {
+        if (conversationCaptionViews.box == null || !conversationCaptionList.hasEarlier()) return;
+        ScrollView scroller = scroll;
+        LinearLayout box = conversationCaptionViews.box;
+        int previousHeight = box.getHeight(), previousScroll = scroller == null ? 0 : scroller.getScrollY();
+        applyCaptionDiff(conversationCaptionViews, conversationCaptionList, conversationCaptionList.loadEarlier());
+        if (scroller != null) box.post(() -> {
+            if (scroll == scroller) scroller.scrollTo(0, Math.max(0, previousScroll + box.getHeight() - previousHeight));
+        });
+    }
+    /** View bookkeeping for one caption box: paragraph views plus placeholder, history hint and interim line. */
+    private static final class CaptionBox {
+        LinearLayout box;
+        final java.util.ArrayList<TextView> heads = new java.util.ArrayList<>();
+        final java.util.ArrayList<TextView> bodies = new java.util.ArrayList<>();
+        TextView placeholder, earlierHint, standaloneBody;
+        String lastCommitted = "";
+        void attach(LinearLayout fresh) {
+            box = fresh; heads.clear(); bodies.clear();
+            placeholder = null; earlierHint = null; standaloneBody = null; lastCommitted = "";
+        }
+    }
+
     /** Reference layout: small grey "说话人 1  00:00:41" header above a readable paragraph. */
     private TextView transcriptParagraph(LinearLayout parent, String header, CharSequence text) {
         TextView head = label(parent, header, 13, MUTED); head.setPadding(0, dp(14), 0, dp(2));
@@ -1572,11 +1757,11 @@ public final class MainActivity extends Activity {
             LinearLayout controls = row(); intro.addView(controls);
             button(controls, active.workPaused() ? "继续记录" : "暂停", false, () -> {
                 if (session != active) return;
-                if (active.workPaused() ? active.resumeWork() : active.pauseWork()) showApp();
+                if (active.workPaused() ? active.resumeWork() : active.pauseWork()) { tabDirty[2] = true; renderTab(); }
             });
             button(controls, "标记重点", false, () -> {
                 if (session != active) return;
-                if (active.markWork("app")) { feedback("已标记 " + TimeFormat.clock(active.workOffsetMs()), null); showApp(); }
+                if (active.markWork("app")) { feedback("已标记 " + TimeFormat.clock(active.workOffsetMs()), null); tabDirty[2] = true; renderTab(); }
             });
         }
         if (recordingMeeting) {
@@ -1589,7 +1774,7 @@ public final class MainActivity extends Activity {
             workCaptionBox = column(); workCaptionBox.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
             captionScroll.addView(workCaptionBox);
             captions.addView(captionScroll, new LinearLayout.LayoutParams(-1, dp(320)));
-            renderWorkCaption();
+            renderCaptionSnapshot(workCaptionViews, workCaptionList, workCaptionBox);
         } else workCaptionBox = null;
         label(intro, "结束后自动保存原文，再由 AI 整理摘要、决策与待办", 11, MUTED).setGravity(Gravity.CENTER);
         int retention = settings().optInt("work_audio_retention_days", 30);
@@ -1826,7 +2011,7 @@ public final class MainActivity extends Activity {
                     return locationApi.json("GET", "/v1/state", null);
                 }, r -> {
                     if (api != locationApi || !locationToken.equals(api.vault.token())) return;
-                    state = r; lastNotice = "定位已更新 · 可查询当地天气与附近地点"; showApp();
+                    state = r; lastNotice = "定位已更新 · 可查询当地天气与附近地点"; markTabsDirty(); renderTab();
                 });
             }
             @Override public void onProviderEnabled(String p) {}
@@ -1870,7 +2055,7 @@ public final class MainActivity extends Activity {
         label(identityText, "每一点偏好，都是独一无二的你。", 12, MUTED);
         sectionHeader(page, "设备与陪伴", "按你的习惯来", "", null);
         LinearLayout device = card(page); label(device, "耳机与音频", 17, INK);
-        headsetStatus = label(device, "", 12, ACCENT); renderHeadset();
+        profileHeadsetStatus = label(device, "", 12, ACCENT); renderHeadset();
         button(device, "设备详情", false, this::showDeviceDetails);
         LinearLayout settings = disclosure(page, "陪伴偏好", "日常习惯与聆听方式", false);
         EditText preferences = field(settings, "关于你的偏好", "喜欢什么、如何与你交流…", false, 2000); preferences.setMinLines(2); preferences.setText(settings().optString("preferences"));
@@ -1932,7 +2117,7 @@ public final class MainActivity extends Activity {
         dialog.setOnShowListener(v -> { dialog.getButton(-1).setTextColor(RED); dialog.getButton(-1).setOnClickListener(w -> {
             if (!canAct()) return; if (password.length() == 0) { password.setError("请输入密码"); return; }
             request(() -> api.json("DELETE", account ? "/auth/account" : "/v1/data", json("password", password.getText().toString())), r -> {
-                dialog.dismiss(); if (commutePanel != null) commutePanel.reset(); clearLocationCache(); TaskReminders.clear(this); getSharedPreferences("meeting_edit_drafts", MODE_PRIVATE).edit().clear().apply(); clearPrivateSnapshots(); if (account) signOut(); else { showApp(); refresh(); }
+                dialog.dismiss(); if (commutePanel != null) commutePanel.reset(); clearLocationCache(); TaskReminders.clear(this); getSharedPreferences("meeting_edit_drafts", MODE_PRIVATE).edit().clear().apply(); clearPrivateSnapshots(); if (account) signOut(); else refresh();
             });
         }); }); dialog.show();
     }
@@ -1967,7 +2152,7 @@ public final class MainActivity extends Activity {
         byte[] payload = exportData; exportData = null;
         if (result != RESULT_OK || data == null || payload == null) return;
         Uri uri = data.getData();
-        worker.execute(() -> { try (OutputStream output = getContentResolver().openOutputStream(uri)) { if (output == null) throw new Exception("文件无法写入"); output.write(payload); runOnUiThread(() -> feedback(notice, cue)); } catch (Exception e) { runOnUiThread(() -> showError("导出失败，请选择其他保存位置")); } });
+        ioPool.execute(() -> { try (OutputStream output = getContentResolver().openOutputStream(uri)) { if (output == null) throw new Exception("文件无法写入"); output.write(payload); runOnUiThread(() -> feedback(notice, cue)); } catch (Exception e) { runOnUiThread(() -> showError("导出失败，请选择其他保存位置")); } });
     }
 
     private void privacyInfo() {
@@ -2061,7 +2246,7 @@ public final class MainActivity extends Activity {
                         if (voiceHint != null) voiceHint.setText(voiceHintText());
                         updateStatus();
                         restoreWorkScroll(viewport, y);
-                    } else showApp();
+                    } else { markTabsDirty(); renderTab(); }
                     // Settings succeed independently of the local sound. No conversational session.
                     if (client == api && change.matches(api, sessionGeneration)) playModeCue(appliedMode);
                     prepareVoice();
@@ -2090,7 +2275,7 @@ public final class MainActivity extends Activity {
     }
     private void saveModeAndOpenWork() { changeMode("work", true); }
     private void mutate(String method, String path, JSONObject body) { if (canAct()) request(() -> api.json(method, path, body), r -> {
-        if (path.startsWith("/v1/memories/") && ("DELETE".equals(method) || "PUT".equals(method))) { clearPrivateSnapshots(); showApp(); }
+        if (path.startsWith("/v1/memories/") && ("DELETE".equals(method) || "PUT".equals(method))) clearPrivateSnapshots();
         refresh();
     }); }
     private void refresh() {
@@ -2099,7 +2284,7 @@ public final class MainActivity extends Activity {
         // The explicit refresh button clears lastNotice before calling this method.
         final String notice = lastNotice;
         request(() -> api.json("GET", "/v1/state", null), r -> {
-            state = r; lastNotice = notice; showApp();
+            state = r; lastNotice = notice; markTabsDirty(); renderTab();
             if (taskBoard != null) taskBoard.refreshReminders();
             handler.post(startupLocationTick);
         });
@@ -2174,7 +2359,7 @@ public final class MainActivity extends Activity {
     private void endVoice() {
         if ("work".equals(mode()) && session != null && sessionUsesCapture) {
             stopRepeat(); session.stopRecording(); lastNotice = "正在结束并保存工作记录…"; updateStatus();
-            if (visible) { tab = 2; showApp(); }  // Also hides pause/mark controls while saving.
+            if (visible) { tab = 2; markTabsDirty(); renderTab(); }  // Also hides pause/mark controls while saving.
             renderWorkMeetings();
         } else cancelSession("会话已结束，单击可重新开始");
     }
@@ -2297,23 +2482,32 @@ public final class MainActivity extends Activity {
             }
             @Override public void captionFinals(JSONArray sentences) {
                 if (!currentSession(generation)) return;
+                java.util.List<SpeakerParagraphs.Sentence> added = new java.util.ArrayList<>();
                 for (int i = 0; i < sentences.length(); i++) {
                     JSONObject sentence = sentences.optJSONObject(i);
                     if (sentence == null || sentence.optString("text").isEmpty()) continue;
-                    workCaptionSentences.add(new SpeakerParagraphs.Sentence(sentence.optString("id"), sentence.optString("speaker"),
+                    added.add(new SpeakerParagraphs.Sentence(sentence.optString("id"), sentence.optString("speaker"),
                         sentence.optLong("start_ms"), sentence.optString("text")));
                 }
-                renderWorkCaption();
+                if (added.isEmpty()) return;
+                applyCaptionDiff(workCaptionViews, workCaptionList, workCaptionList.append(added));
+                scrollWorkCaptionToEnd();
+                applyCaptionDiff(conversationCaptionViews, conversationCaptionList, conversationCaptionList.append(added));
+                followConversation();
             }
             @Override public void captionPartial(String text) {
                 if (!currentSession(generation)) return;
-                workCaptionPartial = text == null ? "" : text; renderWorkCaption();
+                String interim = text == null ? "" : text;
+                applyCaptionDiff(workCaptionViews, workCaptionList, workCaptionList.partial(interim));
+                scrollWorkCaptionToEnd();
+                applyCaptionDiff(conversationCaptionViews, conversationCaptionList, conversationCaptionList.partial(interim));
+                followConversation();
             }
             @Override public void meeting(JSONObject value) {
                 if (!currentSession(generation)) return;
                 if (!value.optString("id").equals(workCaptionMeetingId)) {
-                    workCaptionMeetingId = value.optString("id"); workCaptionSentences.clear(); workCaptionPartial = "";
-                    workCaptionStartedAt = value.optString("started_at"); showApp();
+                    workCaptionMeetingId = value.optString("id"); workCaptionList.reset(); conversationCaptionList.reset();
+                    workCaptionStartedAt = value.optString("started_at"); markTabsDirty(); renderTab();
                 }
                 JSONArray previous = array(state, "work_meetings"), updated = new JSONArray();
                 updated.put(value);
@@ -2341,7 +2535,7 @@ public final class MainActivity extends Activity {
             @Override public void processing() { if (!currentSession(generation)) return; recording = false; if (voiceButton != null) voiceButton.setText(submittedInteraction == VoiceInteraction.NOTES ? "正在保存…" : "结束会话"); if (callCaption != null) callCaption.setText(submittedInteraction == VoiceInteraction.NOTES ? "正在保存工作记录" : "正在思考 · 单击结束会话"); }
             @Override public void idle() { if (!currentSession(generation)) return; turnSucceeded = listenMode == VoiceInteraction.CALL; if (!turnSucceeded) stopRepeat(); uncertainTurnId = ""; }
             @Override public void recording() { if (!currentSession(generation)) return; recording = true; if (voiceButton != null) voiceButton.setText(listenMode == VoiceInteraction.NOTES ? "结束并保存记录" : "结束会话"); if (callCaption != null) callCaption.setText(InteractionCopy.recording(listenMode, settings().optBoolean("vad_enabled", true))); setStatusText("正在听你说…");
-                if (listenMode == VoiceInteraction.NOTES && visible && tab == 2) showApp(); }  // Show pause/mark controls.
+                if (listenMode == VoiceInteraction.NOTES && visible && tab == 2) { markTabsDirty(); renderTab(); } }  // Show pause/mark controls.
             @Override public void meter(long bytes, double rms) { if (currentSession(generation)) { diagnosticBytes = bytes; diagnosticRms = rms; renderDiagnostics(); if (orb != null) orb.level = (float) Math.min(1, rms * 9);
                 if (workClock != null && workClock.isAttachedToWindow() && session != null && !session.workPaused())
                     workClock.setText("已记录 " + TimeFormat.clock(session.workOffsetMs()) + (session.workMarks() > 0 ? " · 已标记 " + session.workMarks() + " 处" : "")); } }
@@ -2369,7 +2563,7 @@ public final class MainActivity extends Activity {
                     else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                     if (voiceButton != null) voiceButton.setText(InteractionCopy.start(listenMode)); if (cancelButton != null) cancelButton.setVisibility(repeatArmed ? View.VISIBLE : View.GONE); if (orb != null) orb.level = 0;
                     if (api.vault.token().isEmpty()) { showAuth(0); authError.setText("登录已失效，请重新登录"); } else {
-                        if (visible && submittedInteraction == VoiceInteraction.NOTES) { tab = 2; showApp(); }
+                        if (visible && submittedInteraction == VoiceInteraction.NOTES) { tab = 2; markTabsDirty(); renderTab(); }
                         updateStatus(); if (visible && !repeatArmed) refresh();
                     }
                 }
@@ -2473,7 +2667,7 @@ public final class MainActivity extends Activity {
         else if (listenMode != VoiceInteraction.CALL && session != null && sessionUsesCapture && !session.recordsWorkCalls()) endVoice();
         stopLocation(); super.onPause();
     }
-    @Override protected void onDestroy() { if (commutePanel != null) commutePanel.close(); if (meetingDeleteDialog != null) meetingDeleteDialog.dismiss(); if (workOptionsDialog != null) workOptionsDialog.dismiss(); if (taskBoard != null) taskBoard.close(); if (locationMonitor != null) locationMonitor.close(); if (statusPopup != null) statusPopup.dismiss(); handler.removeCallbacks(automaticHeadsetTick); if (quickFeedback != null) quickFeedback.close(); if (modeCuePlayer != null) modeCuePlayer.close(); if (meetingPlayback != null) meetingPlayback.close(); handler.removeCallbacks(workMeetingPlaybackTick); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); super.onDestroy(); }
+    @Override protected void onDestroy() { if (commutePanel != null) commutePanel.close(); if (meetingDeleteDialog != null) meetingDeleteDialog.dismiss(); if (workOptionsDialog != null) workOptionsDialog.dismiss(); if (taskBoard != null) taskBoard.close(); if (locationMonitor != null) locationMonitor.close(); if (statusPopup != null) statusPopup.dismiss(); handler.removeCallbacks(automaticHeadsetTick); if (quickFeedback != null) quickFeedback.close(); if (modeCuePlayer != null) modeCuePlayer.close(); if (meetingPlayback != null) meetingPlayback.close(); handler.removeCallbacks(workMeetingPlaybackTick); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } if (meetingPage != null) meetingPage.dismiss(); stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); ioPool.shutdownNow(); super.onDestroy(); }
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent); setIntent(intent);
         if (intent.getBooleanExtra("open_commute", false) && api != null && !api.vault.token().isEmpty()) switchTab(3);
@@ -2526,7 +2720,7 @@ public final class MainActivity extends Activity {
                     stopRepeat();
                     listenMode = VoiceInteraction.CALL;
                     int targetTab = "work".equals(mode()) ? 2 : 0;
-                    if (tab != targetTab) { tab = targetTab; showApp(); }
+                    if (tab != targetTab) { tab = targetTab; markTabsDirty(); renderTab(); }
                     startVoice();
                     break;
                 case STOP_AND_SEND:
@@ -2536,7 +2730,7 @@ public final class MainActivity extends Activity {
                     // No earbud cue: the capture owns the headset audio path while recording.
                     if (session != null && session.markWork("headset")) {
                         feedback("耳机已标记 " + TimeFormat.clock(session.workOffsetMs()), null);
-                        if (visible && tab == 2) showApp();
+                        if (visible && tab == 2) { tabDirty[2] = true; renderTab(); }
                     }
                     break;
                 case INTERRUPT:
@@ -2580,6 +2774,10 @@ public final class MainActivity extends Activity {
     private void updateStatus() {
         setStatusText(busy && modeChange == null ? "正在同步…" : lastNotice);
         if (status != null) status.setTextColor(busy && modeChange == null ? MUTED : ACCENT);
+        if (activeCallRow != null) activeCallRow.setVisibility(
+            tab != 0 && repeatArmed && listenMode == VoiceInteraction.CALL ? View.VISIBLE : View.GONE);
+        // The toggle's label is baked at build time; keep it in step when the service state flips.
+        if (lockScreenButton != null) lockScreenButton.setText(lockScreenEnabled() ? "停止锁屏耳机会话" : "开启本次锁屏耳机会话");
         if (voiceButton != null && session == null) voiceButton.setText(callStartPending ? "正在接通…" : repeatArmed ? "通话中 · 我在听" : InteractionCopy.start(listenMode));
         if (cancelButton != null) { cancelButton.setVisibility(session != null || repeatArmed || callStartPending ? View.VISIBLE : View.GONE); cancelButton.setText(InteractionCopy.stop(listenMode)); }
         if (callCaption != null && session == null) callCaption.setText(InteractionCopy.ready(listenMode));
@@ -2620,7 +2818,7 @@ public final class MainActivity extends Activity {
                 JSONObject caps = state.optJSONObject("capabilities");
                 availability = caps != null && caps.optBoolean("voice_realtime")
                     ? "千问实时语音已配置（实际通话仍需验证）" : "千问实时语音未配置，请检查电脑后端";
-                showApp();
+                markTabsDirty(); renderTab();
             }
             new AlertDialog.Builder(this).setTitle("后端可达").setMessage(api.serverUrl + "\n" + availability).setPositiveButton("完成", null).show();
         }); });
@@ -2685,7 +2883,9 @@ public final class MainActivity extends Activity {
     private void renderHeadset() {
         if (headset == null) return;
         HeadsetController.Snapshot snapshot = headset.snapshot();
-        if (headsetStatus != null) headsetStatus.setText(development.audioMode() == AudioMode.RISE_SDK ? snapshot.summary() + " · 设备详情" : audioModeLabel() + " · 设备详情");
+        String summary = development.audioMode() == AudioMode.RISE_SDK ? snapshot.summary() + " · 设备详情" : audioModeLabel() + " · 设备详情";
+        if (headsetStatus != null) headsetStatus.setText(summary);
+        if (profileHeadsetStatus != null) profileHeadsetStatus.setText(summary);
         if (deviceDetails != null) deviceDetails.setText(snapshot.summary() + "\n输入来源：" + audioModeLabel()
             + "\n型号：" + snapshot.model + "\n左耳电量：" + knownBattery(snapshot.leftBattery) + " · 右耳电量：" + knownBattery(snapshot.rightBattery)
             + "\n左耳佩戴：" + knownWorn(snapshot.leftWorn) + " · 右耳佩戴：" + knownWorn(snapshot.rightWorn)
@@ -2930,9 +3130,11 @@ public final class MainActivity extends Activity {
     }
 
     private final class IconView extends View {
-        final int icon, color; final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        final int icon; final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
         final Path path = new Path();
+        private int color;
         IconView(int i, int c) { super(MainActivity.this); icon = i; color = c; setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO); }
+        void setColor(int c) { color = c; invalidate(); }
         @Override protected void onDraw(Canvas c) { c.save(); c.scale(getWidth() / 24f, getHeight() / 24f); p.setColor(color); p.setStyle(Paint.Style.STROKE); p.setStrokeWidth(1.5f); p.setStrokeCap(Paint.Cap.ROUND);
             if (icon == 0) { c.drawRoundRect(3, 3, 21, 18, 5, 5, p); c.drawLine(7, 18, 7, 22, p); c.drawLine(7, 22, 12, 18, p); c.drawLine(8, 9, 8, 12, p); c.drawLine(12, 7, 12, 14, p); c.drawLine(16, 9, 16, 12, p); }
             else if (icon == 1) { c.drawRoundRect(4, 3, 20, 21, 3, 3, p); c.drawLine(8, 8, 16, 8, p); c.drawLine(8, 12, 16, 12, p); c.drawLine(8, 16, 12, 16, p); }
@@ -2940,4 +3142,142 @@ public final class MainActivity extends Activity {
             else if (icon == 3) { path.reset(); path.moveTo(12, 22); path.cubicTo(8, 16, 4, 12, 4, 8); path.cubicTo(4, -1, 20, -1, 20, 8); path.cubicTo(20, 12, 16, 16, 12, 22); c.drawPath(path, p); c.drawCircle(12, 8, 3, p); }
             else { c.drawCircle(12, 7, 4, p); c.drawArc(4, 13, 20, 28, 180, 180, false, p); } c.restore(); }
     }
+}
+
+/**
+ * Caption document shared by the work page (recent window) and the 对话 page (long window with
+ * load-earlier): every final sentence is kept, the visible window slides on paragraph boundaries,
+ * and domain events turn into view-level diffs so live caption updates never rebuild the list.
+ */
+final class CaptionList {
+    /** One rendered paragraph: reference-layout header plus the committed text of its sentences. */
+    static final class Block {
+        final String header, text;
+        Block(String header, String text) { this.header = header; this.text = text; }
+    }
+
+    /** View-level changes since the previous diff. Rebuild (reset, bulk insert, window growth) is
+     *  reserved for cold paths; live appends and partials are described incrementally. */
+    static final class Diff {
+        final boolean rebuild;
+        final java.util.List<Block> blocks;   // visible blocks, valid when rebuilding
+        final int dropLeading;                // paragraphs the sliding window removed from the top
+        final java.util.List<Block> appended; // new paragraphs at the end
+        final String appendToLast;            // text added to the last paragraph by same-speaker continuation
+        final String lastText;                // committed text of the last paragraph after this diff
+        final String partial;                 // interim words to show greyed after lastText
+        final boolean partialParagraph;       // partial with no committed paragraph: render it standalone
+        Diff(boolean rebuild, java.util.List<Block> blocks, int dropLeading, java.util.List<Block> appended,
+             String appendToLast, String lastText, String partial, boolean partialParagraph) {
+            this.rebuild = rebuild; this.blocks = blocks; this.dropLeading = dropLeading; this.appended = appended;
+            this.appendToLast = appendToLast; this.lastText = lastText; this.partial = partial;
+            this.partialParagraph = partialParagraph;
+        }
+    }
+
+    private final java.util.List<SpeakerParagraphs.Sentence> all = new java.util.ArrayList<>();
+    // Visible blocks: spans index into all as [start, end); headers/texts/speakers describe each block.
+    private final java.util.List<int[]> spans = new java.util.ArrayList<>();
+    private final java.util.List<String> headers = new java.util.ArrayList<>();
+    private final java.util.List<String> texts = new java.util.ArrayList<>();
+    private final java.util.List<String> speakers = new java.util.ArrayList<>();
+    private final int window;
+    private int from;  // first visible sentence index; always on a block boundary
+    private String partial = "";
+
+    CaptionList(int window) { this.window = Math.max(1, window); }
+
+    int totalSentences() { return all.size(); }
+    int visibleSentences() { return all.size() - from; }
+    int earlierSentences() { return from; }
+    boolean hasEarlier() { return from > 0; }
+    java.util.List<SpeakerParagraphs.Sentence> sentences() { return java.util.Collections.unmodifiableList(all); }
+
+    Diff reset() {
+        all.clear(); spans.clear(); headers.clear(); texts.clear(); speakers.clear();
+        partial = ""; from = 0;
+        return snapshot();
+    }
+
+    /** Full re-render of what is visible: a fresh box or a grown window. */
+    Diff snapshot() {
+        java.util.List<Block> blocks = new java.util.ArrayList<>();
+        for (int i = 0; i < headers.size(); i++) blocks.add(new Block(headers.get(i), texts.get(i)));
+        return new Diff(true, blocks, 0, java.util.List.of(), "", lastCommitted(), partial, texts.isEmpty() && !partial.isEmpty());
+    }
+
+    /** Newly finalized sentences: extends the last paragraph or appends new ones. */
+    Diff append(java.util.List<SpeakerParagraphs.Sentence> added) {
+        int firstNewBlock = headers.size();
+        StringBuilder joined = new StringBuilder();
+        boolean touched = false;
+        for (SpeakerParagraphs.Sentence sentence : added) {
+            if (sentence.text.isEmpty()) continue;
+            touched = true;
+            all.add(sentence);
+            int last = texts.size() - 1;
+            if (last >= 0 && speakers.get(last).equals(sentence.speaker)
+                && texts.get(last).length() + sentence.text.length() <= SpeakerParagraphs.MAX_CHARS) {
+                // Only continuation into a paragraph from before this batch counts as appendToLast;
+                // text added to a paragraph created within the batch arrives inside its block.
+                if (last < firstNewBlock) joined.append(sentence.text);
+                texts.set(last, texts.get(last) + sentence.text);
+                spans.get(last)[1]++;
+            } else {
+                spans.add(new int[]{all.size() - 1, all.size()});
+                speakers.add(sentence.speaker);
+                headers.add(new SpeakerParagraphs.Paragraph(sentence.speaker, sentence.startMs).header());
+                texts.add(sentence.text);
+            }
+        }
+        if (!touched) return incremental(0, java.util.List.of(), "");
+        java.util.List<Block> appendedBlocks = new java.util.ArrayList<>();
+        for (int i = firstNewBlock; i < headers.size(); i++) appendedBlocks.add(new Block(headers.get(i), texts.get(i)));
+        int dropped = slide();
+        // The window slid across paragraphs this batch just described (a bulk insert): one rebuild says it all.
+        if (dropped > firstNewBlock || (dropped == firstNewBlock && joined.length() > 0)) return snapshot();
+        return incremental(dropped, appendedBlocks, joined.toString());
+    }
+
+    /** Interim recognition text; rewrites only the tail of the last rendered paragraph. */
+    Diff partial(String text) {
+        partial = text == null ? "" : text;
+        return incremental(0, java.util.List.of(), "");
+    }
+
+    /** Show one more window of history (the reader came back to the top); returns a full snapshot. */
+    Diff loadEarlier() {
+        from = Math.max(0, from - window);
+        // Sliding dropped the earlier blocks from the visible structure: recompute them wholesale.
+        spans.clear(); headers.clear(); texts.clear(); speakers.clear();
+        int index = from;
+        for (SpeakerParagraphs.Paragraph paragraph : SpeakerParagraphs.build(all.subList(from, all.size()))) {
+            StringBuilder text = new StringBuilder();
+            for (SpeakerParagraphs.Sentence sentence : paragraph.sentences) text.append(sentence.text);
+            spans.add(new int[]{index, index + paragraph.sentences.size()});
+            index += paragraph.sentences.size();
+            speakers.add(paragraph.speaker);
+            headers.add(paragraph.header());
+            texts.add(text.toString());
+        }
+        return snapshot();
+    }
+
+    /** Advance from on block boundaries so at most `window` sentences stay visible; never empties the list. */
+    private int slide() {
+        if (headers.isEmpty() || all.size() - from <= window) return 0;
+        int target = all.size() - window, dropped = 0;
+        while (headers.size() > 1 && spans.get(0)[0] < target) {
+            spans.remove(0); headers.remove(0); texts.remove(0); speakers.remove(0); dropped++;
+        }
+        from = spans.get(0)[0];
+        return dropped;
+    }
+
+    private Diff incremental(int dropLeading, java.util.List<Block> appended, String appendToLast) {
+        return new Diff(false, java.util.List.of(), dropLeading, appended, appendToLast,
+            lastCommitted(), partial, texts.isEmpty() && !partial.isEmpty());
+    }
+
+    private String lastCommitted() { return texts.isEmpty() ? "" : texts.get(texts.size() - 1); }
 }

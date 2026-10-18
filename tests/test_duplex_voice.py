@@ -548,3 +548,60 @@ def test_keyword_still_interrupts_during_thinking(client, config, runtime, monke
         assert results[0]['voice_interrupted']
         assert results[1]['response_complete']
         ws.send_json({'type': 'end'}); assert ws.receive_json()['type'] == 'call.done'
+
+
+def test_backlogged_sentences_are_rejected_but_the_call_survives(client, config, runtime, monkeypatch):
+    import threading
+    from app.services.mobile import MobileRuntime
+
+    class QueuingNative(Native):
+        """Every follow-up starts with the interrupt keyword so it is accepted while a turn runs."""
+        async def append(self, pcm):
+            self.bytes += len(pcm); self.utterances += 1
+            item = str(self.utterances)
+            text = '请讲一个简单例子' if self.utterances == 1 else f'小万，第{self.utterances}个问题'
+            for event in [
+                {'type': 'input_audio_buffer.speech_started', 'item_id': item},
+                {'type': 'input_audio_buffer.speech_stopped', 'item_id': item},
+                {'type': 'conversation.item.input_audio_transcription.completed', 'transcript': text, 'item_id': item}]:
+                await self.inputs.put(event)
+
+    native = QueuingNative()
+    setup(client, config, monkeypatch, native)
+    gate = threading.Event()
+    original = MobileRuntime.turn
+
+    async def blocked(rt, text, source, interaction_source='ambient_capture', on_response=None, response_provider=None):
+        # The first turn stalls with the pending queue frozen behind it.
+        await asyncio.to_thread(gate.wait, 10)
+        return await original(rt, text, source, interaction_source, on_response=on_response,
+                              response_provider=response_provider)
+
+    monkeypatch.setattr(MobileRuntime, 'turn', blocked)
+    with client.websocket_connect(endpoint()) as ws:
+        ws.receive_json()
+        ws.send_bytes(bytes(640))
+        while read_event(ws)['type'] != 'thinking': pass
+        for _ in range(4):  # items 2-5 fill pending(4) as accepted interruptions
+            ws.send_bytes(bytes(640))
+        ws.send_bytes(bytes(640))  # item 6: queue full -> sentence rejected with feedback
+        ws.send_json({'type': 'text', 'text': '文字版的问题'})  # text path rejects too
+        feedback = []
+        for _ in range(80):
+            event = read_event(ws)
+            if event['type'] == 'reply.error':
+                feedback.append(event['detail'])
+                if len(feedback) == 2:
+                    break
+        assert len(feedback) == 2 and all('还在处理上一句' in detail for detail in feedback)
+        gate.set()
+        results = []
+        for _ in range(200):
+            event = read_event(ws)
+            if event['type'] == 'result':
+                results.append(event)
+                if len(results) == 5:  # the five accepted sentences still complete
+                    break
+        ws.send_json({'type': 'end'})
+        assert ws.receive_json()['type'] == 'call.done'
+    assert len(results) == 5 and native.closed

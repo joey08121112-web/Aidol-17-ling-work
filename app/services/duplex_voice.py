@@ -86,8 +86,13 @@ async def duplex_call(socket, runtime, native, speech, request_id, charge):
                     await interrupt()
                 elif set(command) == {'type', 'text'} and command.get('type') == 'text':
                     text = command['text']
-                    if not isinstance(text, str) or not text.strip() or len(text) > 6000 or pending.full():
-                        raise ValueError('文字消息无效或仍在处理中')
+                    if not isinstance(text, str) or not text.strip() or len(text) > 6000:
+                        raise ValueError('文字消息无效')
+                    if pending.full():
+                        # Reject this sentence, not the whole call: the queue drains
+                        # as each reply finishes.
+                        await send({'type': 'reply.error', 'detail': '还在处理上一句，请稍候再发'})
+                        continue
                     speech_epoch += 1
                     await interrupt()
                     await native.text(text)
@@ -149,8 +154,11 @@ async def duplex_call(socket, runtime, native, speech, request_id, charge):
                     text = request if request is not None else text
                 if text.strip():
                     if pending.full():
-                        raise SpeechProviderError('实时发言处理积压，请结束后重新接通')
-                    pending.put_nowait((text, epochs.get(event.get('item_id'), speech_epoch), 'asr'))
+                        # One backed-up sentence is rejected with feedback instead of
+                        # tearing down the whole call.
+                        await send({'type': 'reply.error', 'detail': '还在处理上一句，请稍候再说'})
+                    else:
+                        pending.put_nowait((text, epochs.get(event.get('item_id'), speech_epoch), 'asr'))
             elif kind == 'conversation.item.input_audio_transcription.failed':
                 raise SpeechProviderError('实时转写失败，请重新接通')
 
