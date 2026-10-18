@@ -22,6 +22,8 @@
 
 ## 本地开发：安卓真机 + 电脑后端
 
+Mac Studio M3 Ultra 的双人中文实时转写与在线说话人区分，部署准备、现有实时入口及后续接入清单见 [Mac 双人语音部署方案](docs/macos-two-speaker-deployment.md)。该文为方案交接，模型服务尚未接入或验收。
+
 要求 Python 3.11+、JDK 17、Android SDK 35，以及允许 USB 调试的安卓真机。耳机配对手机，Windows/macOS 电脑运行同一套多账号后端。
 
 | 系统 | 在仓库根目录启动后端 |

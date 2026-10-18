@@ -2,6 +2,8 @@
 
 当前项目包含 Android App、账号后端和静态官网。代码通过 Git 共享，账号与数据库按电脑和服务器独立。真机结果见 [验收记录](acceptance.md)，完整 USB 步骤见 [本地开发](android-local-testing.md)。
 
+2026-10-18 Mac Studio 接续：双人中文实时转写与在线说话人区分的选型、Mac 环境准备、当前 live 协议差距及逐项实施清单见 [Mac 双人语音部署方案](macos-two-speaker-deployment.md)。本次共享方案文档，尚未部署模型或改变运行配置；另一台电脑先拉取 `main`，按文中第5节验证环境，再继续第6节接入，不复制本机账号库、录音、凭证或虚拟环境。
+
 本轮追加的触控、佩戴、重连和电量联动操作见 [Rise 联动](rise-controls.md)。
 
 App 的固定操作语音已改为本地无语音耳标；三个模式各有固定声音，其他操作共用确认音。WAV是产品源资产，按Python脚本可重建，无需语音引擎或网络，见[操作提示音](android-audio-prompts.md)。
