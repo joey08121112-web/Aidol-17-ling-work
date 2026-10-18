@@ -53,6 +53,21 @@ public class MeetingExportTest {
         assertFalse(text.contains("[14:03:05] 新增章节"));
     }
 
+    @Test public void speakerNamesReplaceLabelsInTranscriptAndMinutes() throws Exception {
+        JSONObject value = meeting(), report = value.getJSONObject("report");
+        value.put("speaker_names", new JSONObject().put("说话人2", "李四"));
+        report.put("summary", "说话人 2建议推迟两天，说话人1同意。");
+        report.getJSONArray("tasks").getJSONObject(0).put("owner", "说话人2");
+        String text = MeetingExport.markdown(value, SHANGHAI);
+        assertTrue(text.contains("- 说话人：说话人 1、李四（按声音自动区分，名称由你指定）"));
+        assertTrue(text.contains("## 摘要\n\n李四建议推迟两天，说话人1同意。"));
+        assertTrue(text.contains("- [ ] 通知测试（负责人：李四；截止：未提及）（依据 14:03:09）"));
+        assertTrue(text.contains("[14:03:09] 李四：我建议推迟两天。"));
+        assertTrue(text.contains("[14:03:05] 说话人 1：大家好。"));
+        // The saved minutes keep the label; only the exported copy is named.
+        assertEquals("说话人2", report.getJSONArray("tasks").getJSONObject(0).getString("owner"));
+    }
+
     @Test public void meetingWithoutMinutesOrSpeakersStillExports() throws Exception {
         JSONObject plain = meeting(); plain.remove("report");
         plain.getJSONArray("utterances").getJSONObject(0).put("speaker", "").put("wall_at", "");

@@ -25,7 +25,8 @@ final class SpeakerParagraphs {
         final List<Sentence> sentences = new ArrayList<>();
         Paragraph(String speaker, long startMs) { this.speaker = speaker; this.startMs = startMs; }
         int length() { int n = 0; for (Sentence s : sentences) n += s.text.length(); return n; }
-        String header() { return name(speaker) + "  " + TimeFormat.hms(startMs); }
+        String header() { return header(SpeakerNames.NONE); }
+        String header(SpeakerNames names) { return names.display(speaker) + "  " + TimeFormat.hms(startMs); }
     }
 
     private SpeakerParagraphs() {}

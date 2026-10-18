@@ -199,7 +199,9 @@ class Store(CommuteStorage):
                                      ('address_attempts', 'INTEGER NOT NULL DEFAULT 0'),
                                      ('address_retry_at', 'REAL'),
                                      ('revision_request', "TEXT NOT NULL DEFAULT '{}'"),
-                                     ('pinned', 'INTEGER NOT NULL DEFAULT 0')):
+                                     ('pinned', 'INTEGER NOT NULL DEFAULT 0'),
+                                     # User-given names for speaker labels ("说话人1" -> "张三"); display only.
+                                     ('speaker_names', "TEXT NOT NULL DEFAULT '{}'")):
                 if name not in meeting_columns:
                     db.execute(f'ALTER TABLE work_meetings ADD COLUMN {name} {definition}')
             db.execute('CREATE TABLE IF NOT EXISTS work_audio_uploads (meeting_id TEXT NOT NULL, '
@@ -679,7 +681,7 @@ class Store(CommuteStorage):
 
     def work_meetings(self, limit=100):
         with self.connect() as db:
-            return [{**dict(row), 'pinned': bool(row['pinned']), 'whole_audio': bool(row['whole_audio']), 'location': json.loads(row['location']), 'revision_request': {k: v for k, v in json.loads(row['revision_request']).items() if k != 'document'}} for row in db.execute(
+            return [{**dict(row), 'pinned': bool(row['pinned']), 'whole_audio': bool(row['whole_audio']), 'location': json.loads(row['location']), 'revision_request': {k: v for k, v in json.loads(row['revision_request']).items() if k != 'document'}, 'speaker_names': json.loads(row['speaker_names'] or '{}')} for row in db.execute(
                 "SELECT m.*,json_extract(r.payload,'$.title') AS title,json_extract(r.payload,'$.summary') AS summary, "
                 "(SELECT count(*) FROM work_meeting_segments s JOIN transcripts t ON t.id=s.transcript_id "
                 "WHERE s.meeting_id=m.id) + (SELECT count(DISTINCT u.transcript_id) FROM work_utterances u JOIN transcripts t ON t.id=u.transcript_id WHERE u.meeting_id=m.id AND u.segment_index=-1) AS transcript_count, "
@@ -690,6 +692,27 @@ class Store(CommuteStorage):
     def pin_work_meeting(self, meeting_id, pinned):
         with self.connect() as db:
             return db.execute('UPDATE work_meetings SET pinned=? WHERE id=?', (int(pinned), meeting_id)).rowcount > 0
+
+    def name_work_speaker(self, meeting_id, label, name):
+        """Give a speaker label a display name ('' clears it); the stored sentences keep the label.
+
+        Only after the transcript is final: whole-meeting diarization replaces labels and clears names."""
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT status,transcription_status,speaker_names FROM work_meetings WHERE id=?', (meeting_id,)).fetchone()
+            if row is None:
+                return None
+            if row['status'] == 'recording' or row['transcription_status'] == 'pending':
+                raise ValueError('录音整理完成后才能修改说话人名称')
+            if not db.execute('SELECT 1 FROM work_utterances WHERE meeting_id=? AND speaker=? LIMIT 1', (meeting_id, label)).fetchone():
+                raise LookupError('这场会议没有这位说话人')
+            names = json.loads(row['speaker_names'] or '{}')
+            if name:
+                names[label] = name
+            else:
+                names.pop(label, None)
+            db.execute('UPDATE work_meetings SET speaker_names=? WHERE id=?', (json.dumps(names, ensure_ascii=False), meeting_id))
+        return self.work_meeting(meeting_id)
 
     def delete_work_meeting(self, meeting_id):
         """Delete one ended meeting; durable receipts reject late start/upload/model results."""
@@ -839,6 +862,8 @@ class Store(CommuteStorage):
             expires = (datetime.fromisoformat(row['ended_at']) + timedelta(days=retention)).isoformat()
         return {**dict(row), 'pinned': bool(row['pinned']), 'whole_audio': bool(row['whole_audio']), 'location': json.loads(row['location'] or '{}'),
                 'revision_request': json.loads(row['revision_request']),
+                'speaker_names': {label: name for label, name in json.loads(row['speaker_names'] or '{}').items()
+                                  if any(item['speaker'] == label for item in utterances)},
                 'sources': sources, 'transcript_count': len(sources),
                 'received_segments': audio['total'], 'utterances': utterances, 'events': events,
                 'speakers': sorted({item['speaker'] for item in utterances if item['speaker']},
@@ -1190,8 +1215,9 @@ class Store(CommuteStorage):
                 db.execute("INSERT INTO work_utterances(id,meeting_id,transcript_id,segment_index,ordinal,start_ms,end_ms,text,speaker) "
                            "VALUES(?,?,?,-1,0,?,?,?,?)", (transcript_id + '.0', meeting_id, transcript_id,
                                                           turn['begin_time'], turn['end_time'], turn['text'], label))
-            db.execute("UPDATE work_meetings SET transcription_status='ready',summary_stage='queued',summary_status='pending' WHERE id=?",
-                       (meeting_id,))
+            # New clusters: names given to the old labels would now point at other voices.
+            db.execute("UPDATE work_meetings SET transcription_status='ready',summary_stage='queued',summary_status='pending',"
+                       "speaker_names='{}' WHERE id=?", (meeting_id,))
             db.execute('DELETE FROM work_audio_uploads WHERE meeting_id=?', (meeting_id,))  # Pre-merge uploads only.
         if self.settings().work_audio_retention_days == 0:
             self.delete_work_audio(meeting_id)

@@ -887,10 +887,11 @@ public final class MainActivity extends Activity {
             sentences.add(new SpeakerParagraphs.Sentence(entry.id, entry.speaker, entry.startMs, entry.text));
         java.util.List<SpeakerParagraphs.Paragraph> paragraphs = SpeakerParagraphs.build(sentences);
         if (paragraphs.isEmpty()) { label(box, "这场会议没有保存到文字。", 13, MUTED); return; }
+        SpeakerNames names = new SpeakerNames(meeting);
         for (SpeakerParagraphs.Paragraph paragraph : paragraphs) {
             StringBuilder text = new StringBuilder();
             for (SpeakerParagraphs.Sentence sentence : paragraph.sentences) text.append(sentence.text);
-            transcriptParagraph(box, paragraph.header(), text).setTextIsSelectable(true);
+            transcriptParagraph(box, paragraph.header(names), text).setTextIsSelectable(true);
         }
     }
     /** A quiet block with a thin rule on the left, like the reference header. */
@@ -1232,7 +1233,7 @@ public final class MainActivity extends Activity {
                 + " · 已保存 " + meeting.optInt("transcript_count") + " 段原文", 11, MUTED);
             label(item, meetingPlace(meeting), 11, MUTED);
             label(item, workMeetingProgress(meeting), 13, WORK);
-            String summary = meeting.isNull("summary") ? "" : meeting.optString("summary");
+            String summary = meeting.isNull("summary") ? "" : new SpeakerNames(meeting).apply(meeting.optString("summary"));
             if (!summary.isEmpty()) label(item, summary.length() > 120 ? summary.substring(0, 120) + "…" : summary, 13, MUTED);
             button(item, "查看原文与纪要", false, () -> openWorkMeeting(meeting.optString("id")));
         }
@@ -1405,7 +1406,7 @@ public final class MainActivity extends Activity {
             "transcription_status", meeting.optString("transcription_status"), "summary_stage", meeting.optString("summary_stage"),
             "processed_sections", meeting.optInt("processed_sections"), "total_sections", meeting.optInt("total_sections"),
             "received_segments", meeting.optInt("received_segments"), "ended_at", meeting.optString("ended_at"),
-            "action_tasks", array(meeting, "action_tasks")).toString();
+            "action_tasks", array(meeting, "action_tasks"), "speaker_names", meeting.optJSONObject("speaker_names")).toString();
     }
     private static boolean onlyMeetingAddressChanged(String before, String after) {
         if (before.isEmpty()) return false;
@@ -1450,7 +1451,9 @@ public final class MainActivity extends Activity {
             return;
         }
         workMeetingDetailSnapshot = snapshot;
-        JSONObject report = meeting.optJSONObject("report");
+        // Speaker names are display-only: the minutes keep labels and get names on the way to the screen.
+        SpeakerNames names = new SpeakerNames(meeting);
+        JSONObject report = names.report(meeting.optJSONObject("report"));
         JSONArray sources = array(meeting, "sources");
         MeetingTimeline timeline = new MeetingTimeline(meeting);
         boolean playable = MeetingTimeline.audioPlayable(meeting);
@@ -1476,7 +1479,7 @@ public final class MainActivity extends Activity {
         java.time.ZoneId zone = java.time.ZoneId.systemDefault();
         String recordedFrom = meeting.optString("audio_started_at", meeting.optString("started_at"));
         java.util.List<String> speakerNames = new java.util.ArrayList<>();
-        for (String label : timeline.speakers()) speakerNames.add(SpeakerParagraphs.name(label));
+        for (String label : timeline.speakers()) speakerNames.add(names.display(label));
         LinearLayout meta = metaBlock(workMeetingDetail);
         label(meta, "录音主题：" + (report == null ? "本次会议" : fallback(report.optString("title"), "本次会议")), 14, MUTED);
         label(meta, "录音时间：" + TimeFormat.chineseDay(recordedFrom, zone) + " " + TimeFormat.hourMinute(recordedFrom, zone) + " - "
@@ -1537,6 +1540,7 @@ public final class MainActivity extends Activity {
 
         meetingSection("原文", "文字记录");
         label(workMeetingDetail, "语音识别原文，未经 AI 改写；说话人按声音自动区分，不代表真实身份。"
+            + (speakerRenamable(meeting) && !timeline.speakers().isEmpty() ? "点段首的说话人可改名。" : "")
             + (playable ? "点任意一句从那里播放。" : ""), 11, MUTED);
         if (timeline.sentences().isEmpty()) label(workMeetingDetail, "暂无已保存原文；录音转写后会陆续显示。", 14, MUTED);
         StringBuilder raw = new StringBuilder();
@@ -1547,7 +1551,7 @@ public final class MainActivity extends Activity {
                 String wall = TimeFormat.clockOf(entry.wallTime);
                 if (raw.length() > 0) raw.append("\n");
                 raw.append("[").append(wall.isEmpty() ? TimeFormat.hms(entry.startMs) : wall).append("] ")
-                    .append(entry.speaker.isEmpty() ? "" : SpeakerParagraphs.name(entry.speaker) + "：").append(entry.text);
+                    .append(entry.speaker.isEmpty() ? "" : names.display(entry.speaker) + "：").append(entry.text);
                 continue;
             }
             meetingParagraphs(run, meeting, timeline, playable); run.clear();
@@ -1636,9 +1640,13 @@ public final class MainActivity extends Activity {
     }
     /** Speaker paragraphs whose sentences stay individually tappable (play from there) and highlightable. */
     private void meetingParagraphs(java.util.List<SpeakerParagraphs.Sentence> sentences, JSONObject meeting, MeetingTimeline timeline, boolean playable) {
+        SpeakerNames names = new SpeakerNames(meeting);
+        boolean renamable = speakerRenamable(meeting);
         for (SpeakerParagraphs.Paragraph paragraph : SpeakerParagraphs.build(sentences)) {
             android.text.SpannableStringBuilder text = new android.text.SpannableStringBuilder();
-            TextView body = transcriptParagraph(workMeetingDetail, paragraph.header(), "");
+            String label = paragraph.speaker;
+            TextView body = transcriptParagraph(workMeetingDetail, paragraph.header(names), "",
+                renamable && !label.isEmpty() ? () -> renameSpeaker(meeting, label) : null);
             for (SpeakerParagraphs.Sentence sentence : paragraph.sentences) {
                 int start = text.length(); text.append(sentence.text);
                 workMeetingLines.put(sentence.id, body); workMeetingRanges.put(sentence.id, new int[]{start, text.length()});
@@ -1653,6 +1661,55 @@ public final class MainActivity extends Activity {
             if (playable) { body.setMovementMethod(android.text.method.LinkMovementMethod.getInstance()); body.setHighlightColor(Color.TRANSPARENT); }
             else body.setTextIsSelectable(true);
         }
+    }
+    /** Names wait for the final transcript: live labels and a pending whole-meeting pass still change. */
+    private static boolean speakerRenamable(JSONObject meeting) {
+        return !"recording".equals(meeting.optString("status")) && !"pending".equals(meeting.optString("transcription_status"));
+    }
+    private void renameSpeaker(JSONObject meeting, String label) {
+        if (!canAct()) return;
+        String id = meeting.optString("id"), number = SpeakerParagraphs.name(label), current = new SpeakerNames(meeting).custom(label);
+        LinearLayout root = EditorUi.column(this); root.setPadding(dp(20), dp(14), dp(20), dp(18));
+        root.setBackground(shape(0xfff8faff, 24, EditorUi.LINE));
+        TextView heading = EditorUi.text(this, "修改" + number + "的名称", 20, INK); heading.setTypeface(null, Typeface.BOLD); root.addView(heading);
+        // Without the whole-meeting pass, numbers are per recording run and may name different voices.
+        root.addView(EditorUi.text(this, "ready".equals(meeting.optString("transcription_status"))
+            ? "整场会议里的" + number + "都会显示为新名称，纪要和导出同步更新。原文和录音不变。"
+            : "这场会议的说话人编号可能前后不一致，改名会作用于所有标为" + number + "的段落。", 12, EditorUi.MUTED));
+        EditText input = EditorUi.input(this, root, "姓名或角色（最多20字）", current, false);
+        input.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(20)});
+        input.setSelection(input.getText().length());
+        TextView problem = EditorUi.text(this, "", 12, 0xffc34f5a); root.addView(problem);
+        android.app.Dialog dialog = new android.app.Dialog(this); dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE); dialog.setContentView(root);
+        boolean[] sending = {false};
+        java.util.function.Consumer<String> save = value -> {
+            if (sending[0]) return;
+            String name = value.trim().replaceAll("\\s+", " ");
+            if (name.matches("(说话人|发言人) ?\\d+")) { problem.setText("请填写姓名或角色，不要使用其他说话人编号"); return; }
+            sending[0] = true; problem.setText("正在保存…");
+            ApiClient client = api; String token = client.vault.token();
+            operations.execute("meeting:" + id + ":speakers", () -> {
+                try {
+                    JSONObject result = client.json("PUT", "/v1/work-meetings/" + Uri.encode(id) + "/speakers", json("label", label, "name", name));
+                    runOnUiThread(() -> {
+                        if (isDestroyed() || client != api || !token.equals(client.vault.token())) return;
+                        dialog.dismiss();
+                        if (latestMeetingDetail != null && id.equals(latestMeetingDetail.optString("id"))) latestMeetingDetail = result;
+                        workMeetingDetailSnapshot = ""; renderWorkMeetingDetail(result);
+                    });
+                } catch (Exception e) {
+                    runOnUiThread(() -> { sending[0] = false; problem.setText(fallback(e.getMessage(), "保存失败，请检查网络后重试")); });
+                }
+            });
+        };
+        root.addView(EditorUi.button(this, "保存", true, () -> save.accept(input.getText().toString())));
+        if (!current.isEmpty()) root.addView(EditorUi.button(this, "恢复为" + number, false, () -> save.accept("")));
+        root.addView(EditorUi.button(this, "取消", false, dialog::dismiss));
+        android.view.Window window = dialog.getWindow();
+        window.setBackgroundDrawableResource(android.R.color.transparent);
+        window.setLayout(getResources().getDisplayMetrics().widthPixels - dp(28), WindowManager.LayoutParams.WRAP_CONTENT);
+        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE | WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+        dialog.show(); input.requestFocus();
     }
     /** Background on one sentence inside its paragraph; null colour clears it. */
     private void markSentence(String id, Integer colour, Object[] holder) {
@@ -1716,16 +1773,17 @@ public final class MainActivity extends Activity {
             return;
         }
         label(workMeetingDetail, "已同步到工作页“行动清单”，在这里或清单里勾选都会同步。", 12, MUTED);
+        SpeakerNames names = new SpeakerNames(meeting);  // "说话人2" owners show the name the user gave.
         for (int i = 0; i < actions.length(); i++) {
             JSONObject task = actions.optJSONObject(i); if (task == null) continue;
             boolean done = "done".equals(task.optString("status"));
-            CheckBox check = new CheckBox(this); check.setText(task.optString("content")); check.setTextSize(15); check.setTextColor(done ? MUTED : INK);
+            CheckBox check = new CheckBox(this); check.setText(names.apply(task.optString("content"))); check.setTextSize(15); check.setTextColor(done ? MUTED : INK);
             check.setMinHeight(dp(48)); check.setChecked(done);
             check.setButtonTintList(android.content.res.ColorStateList.valueOf(ACCENT));
             check.setPaintFlags(done ? check.getPaintFlags() | Paint.STRIKE_THRU_TEXT_FLAG : check.getPaintFlags() & ~Paint.STRIKE_THRU_TEXT_FLAG);
             workMeetingDetail.addView(check);
             String due = task.optString("due_at").isEmpty() ? fallback(task.optString("due"), "未提及") : TimeFormat.format(task.optString("due_at"));
-            label(workMeetingDetail, "负责人：" + fallback(task.optString("owner"), "未明确") + " · 截止：" + due, 12, MUTED);
+            label(workMeetingDetail, "负责人：" + fallback(names.apply(task.optString("owner")), "未明确") + " · 截止：" + due, 12, MUTED);
             meetingEvidence(meeting, timeline, array(task, "source_ids"));
             check.setOnClickListener(v -> toggleMeetingAction(task, check));
         }
@@ -2060,8 +2118,14 @@ public final class MainActivity extends Activity {
     }
 
     /** Reference layout: small grey "说话人 1  00:00:41" header above a readable paragraph. */
-    private TextView transcriptParagraph(LinearLayout parent, String header, CharSequence text) {
+    private TextView transcriptParagraph(LinearLayout parent, String header, CharSequence text) { return transcriptParagraph(parent, header, text, null); }
+    /** onHeader, when given, makes the "说话人 1  00:00:41" line a button (rename that speaker). */
+    private TextView transcriptParagraph(LinearLayout parent, String header, CharSequence text, Runnable onHeader) {
         TextView head = label(parent, header, 13, MUTED); head.setPadding(0, dp(14), 0, dp(2));
+        if (onHeader != null) {
+            head.setClickable(true); head.setFocusable(true); head.setOnClickListener(v -> onHeader.run());
+            head.setContentDescription(header + "，点按修改说话人名称");
+        }
         TextView body = label(parent, "", 17, INK); body.setText(text);
         body.setLineSpacing(dp(6), 1.05f); body.setPadding(0, 0, 0, dp(6));
         return body;

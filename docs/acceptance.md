@@ -901,3 +901,11 @@ Android `testDebugUnitTest lintDebug assembleDebug` 成功：159项单测，零�
 - 后端：`action_tasks.meeting_id`（升级时按纪要签名或引用句子回填）、`/v1/tasks` 返回 `meeting_id`/`meeting`、会议详情返回 `action_tasks`。新增 2 项回归：来源会议字段、详情与清单共用完成状态、编辑后保留会议、手动任务无来源；旧任务按报告与按句子两种方式回填。全量 **645 passed**，compileall 通过。
 - Android：JBR 21 / SDK 35 `testDebugUnitTest lintDebug assembleDebug` 成功，315 项单测零失败，Lint 0 errors / 31 warnings（数量与基线相同）。卡片来源行、跳转原话、详情勾选为界面代码，无单测覆盖。
 - 未做：真机点按来源行跳转与高亮、详情勾选后返回清单的状态、离线勾选失败回滚。
+
+## 2026-10-18 说话人改名（本地，未上真机）
+
+- 分支 `feat/speaker-names`，基于 `origin/main` `7b23bda`。依据飞书妙记差距调研 P0 第 1 项实现，改动见 [更新清单](change-list-2026-10-18-speaker-names.md)。
+- 后端：`work_meetings.speaker_names` 列、`PUT /v1/work-meetings/{id}/speakers`；新增回归覆盖录音中409、名称空白合并、未知标签/会议404、编号或超长或控制字符422、清除名称、列表返回、整场识别后清空。全量 **642 passed**（变基到 `origin/main` `edfdbca` 后复跑 **644 passed**），compileall 通过。
+- Android：JBR 21.0.11 / SDK 35 执行 `testDebugUnitTest lintDebug assembleDebug` 成功，**301** 项单测零失败（变基后复跑 **320** 项零失败），Lint 0 errors / 31 warnings（新代码无告警）；新增 `SpeakerNamesTest` 4 项、`MeetingExportTest` 改名导出 1 项。本机默认 JDK 25/26 无法运行 Gradle 8.9，需指定 JDK 17/21。
+- 真机（Redmi K70 `4fb3c538`）：手机原有 `com.aidol.app.debug` 签名不同无法覆盖，改装并存的 `com.aidol.app.review`（`-PaidolVisualReview`，同一源码）；`adb reverse tcp:8108 tcp:8118` 指向本分支后端。旧包后台持有 Rise SDK 的 GAIA BLE/BR-EDR 服务时，新包显示“耳机服务尚未完成释放”（`state=ERROR error=disconnect_error`）；停止旧包、Rise 重连系统蓝牙后新包显示“耳机已就绪”，13:45 一场工作录音的实时字幕正常出字，`/v1/voice` 分段上传 200。
+- 未在真机完成：录音结束后点按段首改名、键盘与长名称换行、改名后纪要/导出显示。未做界面截图（截屏为黑屏），未请求供应商 API。

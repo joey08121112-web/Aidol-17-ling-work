@@ -16,7 +16,8 @@ final class MeetingExport {
 
     static String markdown(JSONObject meeting, ZoneId zone) {
         MeetingTimeline timeline = new MeetingTimeline(meeting);
-        JSONObject report = meeting.optJSONObject("report");
+        SpeakerNames names = new SpeakerNames(meeting);
+        JSONObject report = names.report(meeting.optJSONObject("report"));
         StringBuilder out = new StringBuilder();
         String title = report == null ? "" : report.optString("title");
         out.append("# ").append(title.isEmpty() ? "会议记录" : title).append("\n\n");
@@ -27,8 +28,9 @@ final class MeetingExport {
             .append(end.isEmpty() ? "" : " – " + end)
             .append("（录音时长 ").append(TimeFormat.clock(timeline.audioEndMs())).append("）\n");
         java.util.List<String> speakers = new java.util.ArrayList<>();
-        for (String label : timeline.speakers()) speakers.add(SpeakerParagraphs.name(label));
-        out.append("- 说话人：").append(speakers.isEmpty() ? "未区分" : String.join("、", speakers) + "（按声音自动区分，不代表真实身份）").append('\n');
+        for (String label : timeline.speakers()) speakers.add(names.display(label));
+        out.append("- 说话人：").append(speakers.isEmpty() ? "未区分" : String.join("、", speakers)
+            + (names.isEmpty() ? "（按声音自动区分，不代表真实身份）" : "（按声音自动区分，名称由你指定）")).append('\n');
         out.append("- ").append(MeetingPlace.label(meeting, zone)).append('\n');
         out.append("- 原文句数：").append(timeline.sentences().size()).append("\n\n");
         if (report != null) {
@@ -56,13 +58,13 @@ final class MeetingExport {
             out.append("## 我的标记\n\n");
             for (MeetingTimeline.Entry mark : timeline.marks()) {
                 MeetingTimeline.Entry at = timeline.sentenceAt(mark.startMs);
-                out.append("- ★ ").append(at == null ? TimeFormat.clock(mark.startMs) : clock(at, zone)).append(at == null ? "" : " " + line(at)).append('\n');
+                out.append("- ★ ").append(at == null ? TimeFormat.clock(mark.startMs) : clock(at, zone)).append(at == null ? "" : " " + line(at, names)).append('\n');
             }
             out.append('\n');
         }
         out.append("## 原文\n\n");
         for (MeetingTimeline.Entry entry : timeline.sentences())
-            out.append("[").append(clock(entry, zone)).append("] ").append(line(entry)).append("  \n");
+            out.append("[").append(clock(entry, zone)).append("] ").append(line(entry, names)).append("  \n");
         out.append("\n> AI 整理稿请结合原文核对；时间为录音时的本地时间。\n");
         return out.toString();
     }
@@ -96,8 +98,8 @@ final class MeetingExport {
         String wall = TimeFormat.clockOf(entry.wallTime, zone);
         return wall.isEmpty() ? TimeFormat.clock(entry.startMs) : wall;
     }
-    private static String line(MeetingTimeline.Entry entry) {
-        return (entry.speaker.isEmpty() ? "" : SpeakerParagraphs.name(entry.speaker) + "：") + entry.text;
+    private static String line(MeetingTimeline.Entry entry, SpeakerNames names) {
+        return (entry.speaker.isEmpty() ? "" : names.display(entry.speaker) + "：") + entry.text;
     }
     private static JSONArray array(JSONObject value, String key) {
         JSONArray items = value.optJSONArray(key); return items == null ? new JSONArray() : items;
