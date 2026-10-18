@@ -136,9 +136,13 @@ public final class MainActivity extends Activity {
         @Override public void onServiceConnected(android.content.ComponentName name, android.os.IBinder binder) {
             voiceService = ((VoiceSessionService.LocalBinder) binder).service();
             if (!visible || isDestroyed() || !voiceService.enabled()) { stopLockScreenSession(); return; }
-            voiceService.onStopped(reason -> {
+            voiceService.onStopped((reason, cause) -> {
+                boolean wasCapturing = session != null && sessionUsesCapture;
+                boolean wasCall = wasCapturing && !"work".equals(mode());
                 cancelSession(reason);
                 disconnectVoiceService();
+                if (wasCall && cause == VoiceSessionService.StopCause.USER) awaitAvatarRest();
+                else if (wasCapturing && cause == VoiceSessionService.StopCause.SYSTEM) setAvatarPhase(CompanionPhase.ERROR);
                 syncHeadsetControls();
                 if (visible && !isDestroyed()) updateStatus();
             });
@@ -149,6 +153,7 @@ public final class MainActivity extends Activity {
         }
         @Override public void onServiceDisconnected(android.content.ComponentName name) {
             cancelSession("耳机会话服务已中断，请回到 App 重新开启");
+            setAvatarPhase(CompanionPhase.ERROR);
             disconnectVoiceService(); syncHeadsetControls();
         }
     };
@@ -176,6 +181,7 @@ public final class MainActivity extends Activity {
                 cancelSession(update.stopReason);
                 // Reconnect and call end do not silently restore lock-screen authorization.
                 stopLockScreenSession();
+                setAvatarPhase(CompanionPhase.ERROR);
             }
             if (!update.notices.isEmpty()) headsetNotice(android.text.TextUtils.join("；", update.notices));
         }
@@ -192,7 +198,11 @@ public final class MainActivity extends Activity {
     private ScrollView scroll;
     private TextView status, voiceButton, cancelButton, authError;
     private EditText chatInput;
-    private CompanionOrbView orb;
+    private CompanionAvatarView orb, workAvatar;
+    private CompanionPhase avatarPhase = CompanionPhase.IDLE;
+    private String avatarMode = "", avatarMeetingId = "";
+    private long avatarPhaseStartedAt;
+    private Runnable avatarStopCheck;
     private String chatDraft = "";
     private HostedSession session;
     private boolean busy, recording;
@@ -325,6 +335,8 @@ public final class MainActivity extends Activity {
 
     private void base() {
         if (lifeCallSettingsDialog != null) lifeCallSettingsDialog.dismiss();
+        hideAvatars();
+        workAvatar = null;
         bottomNavigation = null;
         lifeOptions = null;
         maintenanceStatus = null;
@@ -452,7 +464,7 @@ public final class MainActivity extends Activity {
         renderMaintenanceStatus();
         activeCallRow = row(); activeCallRow.setPadding(dp(24), dp(4), dp(24), dp(4)); root.addView(activeCallRow);
         button(activeCallRow, "AI 通话中 · 返回", false, () -> switchTab(0));
-        button(activeCallRow, "挂断", false, () -> { cancelSession("通话已结束"); markTabsDirty(); renderTab(); });
+        button(activeCallRow, "挂断", false, () -> { endVoice(); markTabsDirty(); renderTab(); });
         conversationHeader = column();
         conversationHeader.setPadding(dp(24), dp(12), dp(24), dp(4));
         root.addView(conversationHeader);
@@ -529,6 +541,7 @@ public final class MainActivity extends Activity {
     /** Drop the per-tab view refs of one tab before its builder runs; other tabs keep their cached refs. */
     private void clearTabFields(int which) {
         if (which == 0) {
+            if (orb != null) orb.setHostVisible(false);
             diagnosticsView = null; turnDetails = null;
             voiceButton = null; cancelButton = null; orb = null; chatInput = null;
             callCaption = null; liveWords = null; content = null; conversationCaptionBox = null; conversationCaptionViews.box = null;
@@ -537,6 +550,8 @@ public final class MainActivity extends Activity {
             lockScreenButton = null;
             lifeOptions = null;
         } else if (which == 2) {
+            if (workAvatar != null) workAvatar.setHostVisible(false);
+            workAvatar = null;
             workClock = null; workMeetingList = null; workCaptionBox = null; workCaptionViews.box = null;
             workSectionTabs = null; java.util.Arrays.fill(workSections, null);
             workRetentionAction = null; historyRangeAction = null; historyReportBox = null;
@@ -567,9 +582,17 @@ public final class MainActivity extends Activity {
 
     private void conversation() {
         if (session == null && !repeatArmed) listenMode = "work".equals(mode()) ? VoiceInteraction.NOTES : VoiceInteraction.CALL;
-        lifeConversationLayout = "life".equals(mode());
+        // Life and commute share the same continuous-call layout and control positions.
+        lifeConversationLayout = !"work".equals(mode());
         LinearLayout modes = row(); modes.setPadding(dp(4), dp(4), dp(4), dp(4)); modes.setBackground(shape(CARD, 26, CARD));
-        (lifeConversationLayout ? conversationHeader : page).addView(modes);
+        if (lifeConversationLayout) {
+            LinearLayout headerControls = row(); headerControls.setGravity(Gravity.CENTER_VERTICAL);
+            conversationHeader.addView(headerControls);
+            headerControls.addView(modes, new LinearLayout.LayoutParams(0, -2, 1));
+            TextView options = action(headerControls, "", this::showLifeCallSettings);
+            options.setForeground(getDrawable(R.drawable.ic_voice_settings)); options.setForegroundGravity(Gravity.CENTER);
+            options.setContentDescription("通话设置与耳机详情");
+        } else page.addView(modes);
         modeChoices = modes;
         String[] keys = {"life", "work", "commute"};
         for (int i = 0; i < keys.length; i++) {
@@ -578,11 +601,13 @@ public final class MainActivity extends Activity {
         if (lifeConversationLayout) { lifeConversation(); return; }
         LinearLayout hero = card(page); hero.setGravity(Gravity.CENTER);
         hero.setPadding(dp(8), dp(18), dp(8), dp(20)); hero.setBackgroundColor(BG);
-        TextView eyebrow = label(hero, "你的随身 AI 伙伴", 12, MUTED); eyebrow.setGravity(Gravity.CENTER); eyebrow.setLetterSpacing(.08f);
-        TextView hint = label(hero, conversationHeading(), 30, INK);
+        LinearLayout identity = row(); identity.setGravity(Gravity.CENTER_VERTICAL); hero.addView(identity);
+        LinearLayout words = column(); identity.addView(words, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView hint = label(words, conversationHeading(), 25, INK);
         modeHint = hint;
-        hint.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL)); hint.setGravity(Gravity.CENTER);
-        orb = new CompanionOrbView(this); hero.addView(orb, new LinearLayout.LayoutParams(-1, dp(160)));
+        hint.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        label(words, "安静记录，结束后整理。", 13, MUTED);
+        orb = addAvatar(identity, 92, 116);
         gap(hero, 4);
         LinearLayout voiceRow = row(); voiceRow.setGravity(Gravity.CENTER_VERTICAL); hero.addView(voiceRow, new LinearLayout.LayoutParams(-1, -2));
         voiceButton = button(voiceRow, InteractionCopy.start(listenMode), true, this::toggleVoice);
@@ -660,16 +685,14 @@ public final class MainActivity extends Activity {
         if (session != null) followConversation();
     }
 
-    /** Life keeps the transcript scrollable and the voice controls within reach. */
+    /** Both continuous-call modes keep the transcript scrollable and controls in the same place. */
     private void lifeConversation() {
         page.setPadding(dp(20), dp(8), dp(20), dp(16));
-        LinearLayout tools = row(); tools.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
-        lifeOptions = tools;
-        conversationHeader.addView(tools);
-        if (!settings().optBoolean("retain_transcripts", true)) label(tools, "本次对话不保存", 11, MUTED);
-        TextView options = action(tools, "", this::showLifeCallSettings);
-        options.setForeground(getDrawable(R.drawable.ic_voice_settings)); options.setForegroundGravity(Gravity.CENTER);
-        options.setContentDescription("通话设置与耳机详情");
+        if (!settings().optBoolean("retain_transcripts", true)) {
+            lifeOptions = row(); lifeOptions.setPadding(dp(4), dp(6), 0, 0);
+            conversationHeader.addView(lifeOptions);
+            label(lifeOptions, "本次对话不保存", 11, MUTED);
+        }
         content = column(); page.addView(content);
         JSONArray history = array(state, "transcripts");
         for (int i = Math.max(0, history.length() - 30); i < history.length(); i++) {
@@ -688,11 +711,10 @@ public final class MainActivity extends Activity {
         turnDetails = column(); page.addView(turnDetails); renderTurnDetails();
 
         composer.setPadding(dp(20), 0, dp(20), dp(10));
-        orb = new CompanionOrbView(this); orb.conversationStyle();
-        LinearLayout.LayoutParams orbParams = new LinearLayout.LayoutParams(dp(112), dp(100));
-        orbParams.gravity = Gravity.CENTER_HORIZONTAL; composer.addView(orb, orbParams);
+        orb = addAvatar(composer);
         callCaption = label(composer, session == null ? "随时可以开始聊天" : "通话中 · 说“小万”可打断", 11, MUTED);
         callCaption.setGravity(Gravity.CENTER); callCaption.setMaxLines(2);
+        callCaption.setVisibility(session != null && sessionUsesCapture ? View.VISIBLE : View.GONE);
         callCaption.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         gap(composer, 8);
         LinearLayout controls = row(); controls.setGravity(Gravity.CENTER_VERTICAL); composer.addView(controls);
@@ -729,7 +751,7 @@ public final class MainActivity extends Activity {
         boolean typing = tab == 0 && lifeConversationLayout && keyboardVisible;
         if (tab == 0 && lifeConversationLayout) {
             if (orb != null) orb.setVisibility(typing ? View.GONE : View.VISIBLE);
-            if (callCaption != null) callCaption.setVisibility(typing ? View.GONE : View.VISIBLE);
+            if (callCaption != null) callCaption.setVisibility(!typing && session != null && sessionUsesCapture ? View.VISIBLE : View.GONE);
             if (lifeOptions != null) lifeOptions.setVisibility(typing ? View.GONE : View.VISIBLE);
             if (chatInput != null) chatInput.setMaxLines(typing ? 2 : 4);
         }
@@ -791,8 +813,10 @@ public final class MainActivity extends Activity {
             if (lifeCallSettingsDialog == dialog) lifeCallSettingsDialog = null;
             if (voiceHint == settingsHint) voiceHint = null;
             if (lockScreenButton == settingsLockButton) lockScreenButton = null;
+            renderAvatars();
         });
         dialog.show();
+        hideAvatars();
     }
 
     private void voiceButtonText(String text) {
@@ -1165,6 +1189,7 @@ public final class MainActivity extends Activity {
         return MeetingPlace.label(meeting);
     }
     private void renderWorkMeetings() {
+        updateWorkAvatar();
         if (workMeetingList == null || tab != 2) return;
         String snapshot = array(state, "work_meetings").toString() + workMeetingSyncError;
         if (lastRenderedMeetingList == workMeetingList && lastRenderedMeetingSnapshot.equals(snapshot)) return;
@@ -1351,8 +1376,10 @@ public final class MainActivity extends Activity {
             workMeetingPlayer = null; workMeetingPlayerStatus = null; workMeetingTimeline = null; workMeetingLines.clear(); workMeetingPlayingId = "";
             meetingSections.clear(); meetingPlayback.stop(); workMeetingOpen = null;
             meetingMaintenanceStatus = null; enterMaintenance("page_return");
+            renderAvatars();
         });
         meetingPage.show();
+        hideAvatars();
         enterMaintenance("page_return");
         handler.removeCallbacks(workMeetingPoll); handler.post(workMeetingPoll);
     }
@@ -1978,9 +2005,12 @@ public final class MainActivity extends Activity {
     private void work() {
         pageHeading("工作");
         LinearLayout intro = featureCard(page, 0xffeef3fc);
-        eyebrow(intro, "FOCUS  /  专注当下", WORK);
-        label(intro, "你专心，琐事交给我。", 22, INK);
-        label(intro, "安静记录讨论，结束后整理重点与待办。", 13, MUTED);
+        LinearLayout identity = row(); identity.setGravity(Gravity.CENTER_VERTICAL); intro.addView(identity);
+        LinearLayout words = column(); identity.addView(words, new LinearLayout.LayoutParams(0, -2, 1));
+        eyebrow(words, "FOCUS  /  专注当下", WORK);
+        label(words, "你专心，琐事交给我。", 22, INK);
+        label(words, "安静记录讨论，结束后整理重点与待办。", 13, MUTED);
+        workAvatar = addAvatar(identity, 84, 112);
         gap(intro, 12);
         LinearLayout process = row(); intro.addView(process);
         badge(process, "记录", WORK, BG); badge(process, "整理", WORK, BG); badge(process, "行动", WORK, BG);
@@ -2714,7 +2744,11 @@ public final class MainActivity extends Activity {
             stopRepeat(); session.stopRecording(); lastNotice = "正在结束并保存工作记录…"; updateStatus();
             if (visible) { tab = 2; markTabsDirty(); renderTab(); }  // Also hides pause/mark controls while saving.
             renderWorkMeetings();
-        } else cancelSession("会话已结束，单击可重新开始");
+        } else {
+            boolean wasCall = session != null && sessionUsesCapture && !"work".equals(mode());
+            cancelSession("会话已结束，单击可重新开始");
+            if (wasCall) awaitAvatarRest();
+        }
     }
     private void startVoice() {
         listenMode = "work".equals(mode()) ? VoiceInteraction.NOTES : VoiceInteraction.CALL;
@@ -2767,7 +2801,7 @@ public final class MainActivity extends Activity {
                 && getSystemService(android.app.NotificationManager.class).areNotificationsEnabled()) {
             automaticWorkService = listenMode == VoiceInteraction.NOTES;
             callStartPending = true; enableLockScreenSession();
-            if (voiceServiceBound) { lastNotice = "正在接通 AI…"; updateStatus(); return; }
+            if (voiceServiceBound) { lastNotice = "正在接通 AI…"; setAvatarPhase(CompanionPhase.CONNECTING); updateStatus(); return; }
             callStartPending = false;
             if (listenMode == VoiceInteraction.NOTES) { automaticWorkService = false; return; }
         }
@@ -2811,6 +2845,9 @@ public final class MainActivity extends Activity {
         final int submittedInteraction = listenMode;
         sessionUsesCapture = false; sessionIsReplay = false;
         turnSucceeded = false; turnHasResult = false; recording = false;
+        cancelAvatarStopCheck();
+        avatarMeetingId = "";
+        setAvatarPhase(CompanionPhase.CONNECTING);
         clearLiveTurn(); followingConversation = true;
         liveTranscript = ""; liveReplyText = ""; if (liveWords != null && !continuingCall) liveWords.setText("");
         lastNotice = continuingCall ? "我在，直接说就好" : "正在接通 AI…";
@@ -2824,10 +2861,20 @@ public final class MainActivity extends Activity {
                 if (!currentSession(generation)) return;
                 if (!turnHasResult && session != null && session.requestId().equals(lastBusinessRequestId)) uncertainTurnId = lastBusinessRequestId;
                 turnSucceeded = false; stopRepeat(); lastNotice = text;
+                setAvatarPhase(CompanionPhase.ERROR);
                 clearLiveTurn(); diagnosticError = text; renderDiagnostics(); renderTurnDetails(); updateStatus();
             }
             @Override public void input(String text) { if (!currentSession(generation)) return; diagnosticInput = text; renderDiagnostics(); }
             @Override public void output(String text) { if (!currentSession(generation)) return; diagnosticOutput = text; renderDiagnostics(); }
+            @Override public void visualPhase(CompanionPhase phase) {
+                if (currentSession(generation)) setAvatarPhase(phase);
+            }
+            @Override public void playbackLevel(double rms) {
+                if (!currentSession(generation)) return;
+                float level = (float) Math.min(1, rms * 9);
+                if (orb != null) orb.outputLevel(level);
+                if (workAvatar != null && "work".equals(mode())) workAvatar.outputLevel(level);
+            }
             @Override public void diagnostic(String text) { if (!currentSession(generation)) return; diagnosticSession = text; renderDiagnostics(); }
             @Override public void submitted(String id) {
                 if (!currentSession(generation)) return;
@@ -2858,6 +2905,7 @@ public final class MainActivity extends Activity {
             }
             @Override public void meeting(JSONObject value) {
                 if (!currentSession(generation)) return;
+                avatarMeetingId = value.optString("id");
                 if (!value.optString("id").equals(workCaptionMeetingId)) {
                     workCaptionMeetingId = value.optString("id"); workCaptionList.reset(); conversationCaptionList.reset();
                     workCaptionStartedAt = value.optString("started_at"); markTabsDirty(); if (tab == 2) renderTab();
@@ -2887,12 +2935,12 @@ public final class MainActivity extends Activity {
                 if (value.optBoolean("voice_error")) { turnSucceeded = false; stopRepeat(); }
             }
             @Override public void transcript(String text) { if (!currentSession(generation)) return; liveTranscript = text; if (liveWords != null) liveWords.setText(text); if (submittedInteraction != VoiceInteraction.NOTES && conversationFeed.transcript(text)) renderLiveTurn(); }
-            @Override public void reply(String text) { if (!currentSession(generation)) return; liveReplyText = text; recording = false; if (liveWords != null) liveWords.setText(text); if (conversationFeed.reply(text)) renderLiveTurn(); if (voiceButton != null) voiceButtonText("结束会话"); if (callCaption != null) callCaption.setText("正在回答 · 说“小万”可打断 · 单击结束通话"); }
-            @Override public void processing() { if (!currentSession(generation)) return; recording = false; if (voiceButton != null) voiceButtonText(submittedInteraction == VoiceInteraction.NOTES ? "正在保存…" : "结束会话"); if (callCaption != null) callCaption.setText(submittedInteraction == VoiceInteraction.NOTES ? "正在保存工作记录" : "正在思考 · 单击结束会话"); }
+            @Override public void reply(String text) { if (!currentSession(generation)) return; liveReplyText = text; recording = false; if (liveWords != null) liveWords.setText(text); if (conversationFeed.reply(text)) renderLiveTurn(); if (voiceButton != null) voiceButtonText("结束会话"); }
+            @Override public void processing() { if (!currentSession(generation)) return; recording = false; if (voiceButton != null) voiceButtonText(submittedInteraction == VoiceInteraction.NOTES ? "正在保存…" : "结束会话"); }
             @Override public void idle() { if (!currentSession(generation)) return; turnSucceeded = listenMode == VoiceInteraction.CALL; if (!turnSucceeded) stopRepeat(); uncertainTurnId = ""; }
-            @Override public void recording() { if (!currentSession(generation)) return; recording = true; if (voiceButton != null) voiceButtonText(listenMode == VoiceInteraction.NOTES ? "结束并保存记录" : "结束会话"); if (callCaption != null) callCaption.setText(InteractionCopy.recording(listenMode, settings().optBoolean("vad_enabled", true))); setStatusText("正在听你说…");
+            @Override public void recording() { if (!currentSession(generation)) return; recording = true; if (voiceButton != null) voiceButtonText(listenMode == VoiceInteraction.NOTES ? "结束并保存记录" : "结束会话"); setStatusText(listenMode == VoiceInteraction.NOTES ? "正在记录会议" : "正在听你说…");
                 if (listenMode == VoiceInteraction.NOTES && visible && tab == 2) { markTabsDirty(); renderTab(); } }  // Show pause/mark controls.
-            @Override public void meter(long bytes, double rms) { if (currentSession(generation)) { diagnosticBytes = bytes; diagnosticRms = rms; renderDiagnostics(); if (orb != null) orb.level = (float) Math.min(1, rms * 9);
+            @Override public void meter(long bytes, double rms) { if (currentSession(generation)) { diagnosticBytes = bytes; diagnosticRms = rms; renderDiagnostics(); float level = (float) Math.min(1, rms * 9); if (orb != null) orb.inputLevel(level); if (workAvatar != null && "work".equals(mode())) workAvatar.inputLevel(level);
                 if (workClock != null && workClock.isAttachedToWindow() && session != null && !session.workPaused())
                     workClock.setText("已记录 " + TimeFormat.clock(session.workOffsetMs()) + (session.workMarks() > 0 ? " · 已标记 " + session.workMarks() + " 处" : "")); } }
             @Override public void done() {
@@ -2904,6 +2952,8 @@ public final class MainActivity extends Activity {
                 if (voiceService != null) voiceService.release(session, repeatArmed && listenMode == VoiceInteraction.CALL && turnSucceeded);
                 session = null; recording = false;
                 handler.post(MainActivity.this::startPendingCommute);
+                if (avatarPhase != CompanionPhase.ERROR) setAvatarPhase(CompanionPhase.COMPLETE);
+                updateWorkAvatar();
                 releaseAutomaticWorkService();
                 if (!turnSucceeded) { deferredMode = null; deferredOpenConversation = false; }
                 if (deferredMode != null) {
@@ -2918,7 +2968,7 @@ public final class MainActivity extends Activity {
                     if (!turnSucceeded || !sessionAvailable() || (!visible && listenMode != VoiceInteraction.CALL) || (listenMode == 2 && !"life".equals(mode()))) stopRepeat();
                     if (repeatArmed) scheduleNextTurn();
                     else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                    if (voiceButton != null) voiceButtonText(InteractionCopy.start(listenMode)); if (cancelButton != null) cancelButton.setVisibility(repeatArmed ? View.VISIBLE : View.GONE); if (orb != null) orb.level = 0;
+                    if (voiceButton != null) voiceButtonText(InteractionCopy.start(listenMode)); if (cancelButton != null) cancelButton.setVisibility(repeatArmed ? View.VISIBLE : View.GONE);
                     if (api.vault.token().isEmpty()) { showAuth(0); authError.setText("登录已失效，请重新登录"); } else {
                         if (visible && submittedInteraction == VoiceInteraction.NOTES && tab == 2) { markTabsDirty(); renderTab(); }
                         updateStatus(); if (visible && !repeatArmed) refresh(false);
@@ -2949,6 +2999,7 @@ public final class MainActivity extends Activity {
     }
     private void cancelSession(String reason) {
         pendingCommutePlan = null;
+        cancelAvatarStopCheck();
         if (modeCuePlayer != null) modeCuePlayer.stop();
         callStartPending = false;
         audioPermissionGeneration = -1;
@@ -2963,7 +3014,7 @@ public final class MainActivity extends Activity {
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         if (voiceButton != null) voiceButtonText(InteractionCopy.start(listenMode));
         if (cancelButton != null) cancelButton.setVisibility(View.GONE);
-        if (orb != null) orb.level = 0;
+        setAvatarPhase(CompanionPhase.IDLE);
         lastNotice = reason;
         diagnosticStage = "已取消"; renderDiagnostics(); updateStatus();
     }
@@ -3015,7 +3066,7 @@ public final class MainActivity extends Activity {
         prepareVoice();
         if (taskBoard != null) taskBoard.refreshReminders();
         if (!pendingHeadsetNotice.isEmpty()) { String notice = pendingHeadsetNotice; pendingHeadsetNotice = ""; headsetNotice(notice); }
-        if (orb != null) orb.invalidate();
+        renderAvatars();
         if (tab == 2) { handler.removeCallbacks(workMeetingPoll); handler.post(workMeetingPoll); }
     }
     private void stopRepeat() { repeatArmed = false; continuingCall = false; handler.removeCallbacks(repeatTick); if (session == null) getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON); }
@@ -3027,12 +3078,12 @@ public final class MainActivity extends Activity {
         handler.removeCallbacks(startupLocationTick);
         handler.removeCallbacks(workMeetingPoll);
         clearVoicePreparation();
-        visible = false; if (quickFeedback != null) quickFeedback.stop(); if (meetingPlayback != null) meetingPlayback.stop(); if (!lockScreenEnabled()) { if (modeCuePlayer != null) modeCuePlayer.stop(); pauseModeChange(); } clearHeadsetGesture(); syncHeadsetControls();
+        visible = false; hideAvatars(); if (quickFeedback != null) quickFeedback.stop(); if (meetingPlayback != null) meetingPlayback.stop(); if (!lockScreenEnabled()) { if (modeCuePlayer != null) modeCuePlayer.stop(); pauseModeChange(); } clearHeadsetGesture(); syncHeadsetControls();
         if ((session != null || repeatArmed) && !lockScreenEnabled()) endVoice();
         else if (listenMode != VoiceInteraction.CALL && session != null && sessionUsesCapture && !session.recordsWorkCalls()) endVoice();
         stopLocation(); super.onPause();
     }
-    @Override protected void onDestroy() { if (lifeCallSettingsDialog != null) lifeCallSettingsDialog.dismiss(); if (commutePanel != null) commutePanel.close(); if (meetingDeleteDialog != null) meetingDeleteDialog.dismiss(); if (workOptionsDialog != null) workOptionsDialog.dismiss(); if (taskBoard != null) taskBoard.close(); if (locationMonitor != null) locationMonitor.close(); if (statusPopup != null) statusPopup.dismiss(); handler.removeCallbacks(automaticHeadsetTick); if (quickFeedback != null) quickFeedback.close(); if (modeCuePlayer != null) modeCuePlayer.close(); if (meetingPlayback != null) meetingPlayback.close(); handler.removeCallbacks(workMeetingPlaybackTick); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } if (meetingPage != null) meetingPage.dismiss(); stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } operations.shutdownNow(); ioPool.shutdownNow(); super.onDestroy(); }
+    @Override protected void onDestroy() { visible = false; hideAvatars(); if (lifeCallSettingsDialog != null) lifeCallSettingsDialog.dismiss(); if (commutePanel != null) commutePanel.close(); if (meetingDeleteDialog != null) meetingDeleteDialog.dismiss(); if (workOptionsDialog != null) workOptionsDialog.dismiss(); if (taskBoard != null) taskBoard.close(); if (locationMonitor != null) locationMonitor.close(); if (statusPopup != null) statusPopup.dismiss(); handler.removeCallbacks(automaticHeadsetTick); if (quickFeedback != null) quickFeedback.close(); if (modeCuePlayer != null) modeCuePlayer.close(); if (meetingPlayback != null) meetingPlayback.close(); handler.removeCallbacks(workMeetingPlaybackTick); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } if (meetingPage != null) meetingPage.dismiss(); stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } operations.shutdownNow(); ioPool.shutdownNow(); super.onDestroy(); }
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent); setIntent(intent);
         if (intent.getBooleanExtra("open_commute", false) && api != null && !api.vault.token().isEmpty()) switchTab(3);
@@ -3131,9 +3182,106 @@ public final class MainActivity extends Activity {
         return "work".equals(mode()) ? "专注当下。" : "commute".equals(mode()) ? "一路，有我。" : "我在，听你说。";
     }
 
+    private CompanionAvatarView addAvatar(LinearLayout parent) {
+        return addAvatar(parent, 148, 164);
+    }
+    private CompanionAvatarView addAvatar(LinearLayout parent, int width, int height) {
+        CompanionAvatarView avatar = new CompanionAvatarView(this);
+        LinearLayout.LayoutParams size = new LinearLayout.LayoutParams(dp(width), dp(height));
+        size.gravity = Gravity.CENTER_HORIZONTAL;
+        parent.addView(avatar, size);
+        return avatar;
+    }
+
+    /** Visual state survives view rebuilds; it never opens a microphone or starts playback. */
+    private void syncAvatarMode() {
+        String current = mode();
+        if (current.equals(avatarMode)) return;
+        cancelAvatarStopCheck();
+        avatarMode = current; avatarMeetingId = "";
+        avatarPhase = CompanionPhase.IDLE;
+        avatarPhaseStartedAt = android.os.SystemClock.uptimeMillis();
+    }
+    private void setAvatarPhase(CompanionPhase phase) {
+        syncAvatarMode();
+        if (avatarPhase != phase) {
+            avatarPhase = phase;
+            avatarPhaseStartedAt = android.os.SystemClock.uptimeMillis();
+        }
+        renderAvatars();
+        if (callCaption != null && session != null) {
+            if (lifeConversationLayout)
+                callCaption.setVisibility(sessionUsesCapture && orb != null && orb.getVisibility() == View.VISIBLE ? View.VISIBLE : View.GONE);
+            if (sessionUsesCapture && !"work".equals(mode()))
+                callCaption.setText(phase == CompanionPhase.CONNECTING ? "正在接通 AI…"
+                    : phase == CompanionPhase.ERROR ? "请查看状态提示"
+                    : "说“小万”可打断 · 单击结束");
+            else if ("work".equals(mode()) && sessionUsesCapture)
+                callCaption.setText(phase == CompanionPhase.PAUSED ? "暂停期间不记录、不上传"
+                    : phase == CompanionPhase.SAVING ? "正在保存工作记录" : "只记录，不生成聊天回复");
+        }
+    }
+    private void renderAvatars() {
+        syncAvatarMode();
+        boolean uncovered = (meetingPage == null || !meetingPage.isShowing())
+            && (lifeCallSettingsDialog == null || !lifeCallSettingsDialog.isShowing());
+        if (orb != null) {
+            orb.show(avatarMode, avatarPhase, avatarPhaseStartedAt);
+            orb.setHostVisible(visible && tab == 0 && uncovered);
+        }
+        if (workAvatar != null) {
+            workAvatar.show("work", "work".equals(avatarMode) ? avatarPhase : CompanionPhase.IDLE, avatarPhaseStartedAt);
+            workAvatar.setHostVisible(visible && tab == 2 && uncovered);
+        }
+    }
+    private void hideAvatars() {
+        if (orb != null) orb.setHostVisible(false);
+        if (workAvatar != null) workAvatar.setHostVisible(false);
+    }
+    private void updateWorkAvatar() {
+        if (session != null || !"work".equals(mode()) || avatarMeetingId.isEmpty()) return;
+        JSONArray meetings = array(state, "work_meetings");
+        for (int i = 0; i < meetings.length(); i++) {
+            JSONObject meeting = meetings.optJSONObject(i);
+            if (meeting == null || !avatarMeetingId.equals(meeting.optString("id"))) continue;
+            CompanionPhase phase = WorkVisualPhase.afterRecording(meeting.optString("status"),
+                meeting.optString("transcription_status"), meeting.optString("summary_status"));
+            if (phase != null) setAvatarPhase(phase);
+            return;
+        }
+    }
+    private void cancelAvatarStopCheck() {
+        if (avatarStopCheck != null) handler.removeCallbacks(avatarStopCheck);
+        avatarStopCheck = null;
+    }
+    /** Cancellation is asynchronous in Rise. Rest only after its capture lease has actually ended. */
+    private void awaitAvatarRest() {
+        cancelAvatarStopCheck();
+        final long generation = sessionGeneration;
+        final String stoppedMode = mode();
+        final long deadline = android.os.SystemClock.uptimeMillis() + 4000;
+        setAvatarPhase(CompanionPhase.STOPPING);
+        avatarStopCheck = () -> {
+            if (isDestroyed() || generation != sessionGeneration || session != null || !stoppedMode.equals(mode())) {
+                cancelAvatarStopCheck(); return;
+            }
+            if (headset != null && headset.isCaptureReleased()) {
+                cancelAvatarStopCheck(); setAvatarPhase(CompanionPhase.RESTING);
+            } else if (headset == null || !headset.snapshot().ready() || android.os.SystemClock.uptimeMillis() >= deadline) {
+                cancelAvatarStopCheck();
+                lastNotice = "耳机停止尚未确认，请检查连接后再开始";
+                diagnosticError = lastNotice;
+                setAvatarPhase(CompanionPhase.ERROR); renderDiagnostics(); updateStatus();
+            } else handler.postDelayed(avatarStopCheck, 120);
+        };
+        // Run after the queued SDK cancellation, rather than racing its main-thread message.
+        handler.post(avatarStopCheck);
+    }
+
     private void renderModeSelection() {
+        renderAvatars();
         if (tab != 0) { tabDirty[0] = true; return; }
-        if (tab == 0 && modeChoices != null && lifeConversationLayout != "life".equals(mode())) {
+        if (modeChoices != null && lifeConversationLayout != !"work".equals(mode())) {
             tabDirty[0] = true; renderTab(); return;
         }
         if (tab != 0 || modeChoices == null) return;
@@ -3153,6 +3301,7 @@ public final class MainActivity extends Activity {
         status.setVisibility(text.isEmpty() ? View.GONE : View.VISIBLE);
     }
     private void updateStatus() {
+        renderAvatars();
         setStatusText(busy && modeChange == null ? "正在同步…" : lastNotice);
         if (status != null) status.setTextColor(busy && modeChange == null ? MUTED : ACCENT);
         if (activeCallRow != null) activeCallRow.setVisibility(
@@ -3161,7 +3310,10 @@ public final class MainActivity extends Activity {
         if (lockScreenButton != null) lockScreenButton.setText(lockScreenEnabled() ? "停止锁屏耳机会话" : "开启本次锁屏耳机会话");
         if (voiceButton != null && session == null) voiceButtonText(callStartPending ? "正在接通…" : repeatArmed ? "通话中 · 我在听" : InteractionCopy.start(listenMode));
         if (cancelButton != null) { cancelButton.setVisibility(session != null || repeatArmed || callStartPending ? View.VISIBLE : View.GONE); cancelButton.setText(InteractionCopy.stop(listenMode)); }
-        if (callCaption != null && session == null) callCaption.setText(lifeConversationLayout ? "随时可以开始聊天" : InteractionCopy.ready(listenMode));
+        if (callCaption != null && session == null) {
+            callCaption.setText(lifeConversationLayout ? "随时可以开始聊天" : InteractionCopy.ready(listenMode));
+            if (lifeConversationLayout) callCaption.setVisibility(View.GONE);
+        }
     }
     private void connectBackend() {
         if (modeCuePlayer != null) modeCuePlayer.stop();
