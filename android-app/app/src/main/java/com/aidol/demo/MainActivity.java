@@ -93,6 +93,8 @@ public final class MainActivity extends Activity {
     private boolean sessionUsesCapture;
     private ModeChangeRetry modeChange;
     private String modeFailureNotice = "";
+    /** errorNotice colours a failure red; pageNotice only explains the page it was raised on. */
+    private String errorNotice = "", pageNotice = "";
     private Runnable modeChangeDelay;
     private boolean sessionIsReplay;
     private String deferredMode;
@@ -401,6 +403,15 @@ public final class MainActivity extends Activity {
         consent.setText("我已了解：录音和文字会发送到服务器及 AI 服务处理；账号数据可导出、清空或删除。");
         if (mode == 1) body.addView(consent);
         authError = label(body, "", 13, RED); authError.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        // A validation message must not outlive the input it describes.
+        TextView shownError = authError;
+        consent.setOnCheckedChangeListener((box, checked) -> { if (checked && !busy) shownError.setText(""); });
+        android.text.TextWatcher clearError = new android.text.TextWatcher() {
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            public void onTextChanged(CharSequence s, int start, int before, int count) { if (!busy) shownError.setText(""); }
+            public void afterTextChanged(android.text.Editable e) {}
+        };
+        for (EditText edited : new EditText[]{username, password, confirm, recovery}) if (edited != null) edited.addTextChangedListener(clearError);
         Button submit = button(body, mode == 1 ? "创建账号" : mode == 2 ? "重设密码并登录" : "登录", true, () -> {
             if (busy) return;
             String name = value(username), pass = password.getText().toString();
@@ -577,7 +588,9 @@ public final class MainActivity extends Activity {
         if (commutePanel != null) commutePanel.pauseMap();
         // A page change does not cancel an in-flight answer, playback, or recording.
         boolean keepCall = session != null || repeatArmed;
-        if (!keepCall) stopRepeat(); tab = next; if (next == 0) followingConversation = true; hideKeyboard(); renderTab();
+        if (!keepCall) stopRepeat(); tab = next; if (next == 0) followingConversation = true; hideKeyboard();
+        if (!pageNotice.isEmpty() && lastNotice.equals(pageNotice)) lastNotice = "";
+        pageNotice = ""; renderTab(); updateStatus();
         enterMaintenance("page_return");
     }
 
@@ -618,7 +631,7 @@ public final class MainActivity extends Activity {
         cancelButton.setTextColor(RED); cancelButton.setBackground(ripple(CARD, 24, CARD));
         cancelButton.setVisibility(session == null && !repeatArmed ? View.GONE : View.VISIBLE);
         callCaption = label(hero, InteractionCopy.ready(listenMode), 12, MUTED); callCaption.setGravity(Gravity.CENTER);
-        liveWords = label(hero, "试着说：上次答应客户的事是什么？", 13, MUTED);
+        liveWords = label(hero, "开始后，会议内容会实时转成文字", 13, MUTED);
         liveWords.setGravity(Gravity.CENTER); liveWords.setMinHeight(dp(48)); liveWords.setSingleLine(true); liveWords.setEllipsize(TextUtils.TruncateAt.END);
         if (session != null) {
             liveWords.setText(recording ? liveTranscript : liveReplyText);
@@ -791,7 +804,7 @@ public final class MainActivity extends Activity {
         if (lifeCallSettingsDialog != null && lifeCallSettingsDialog.isShowing()) return;
         LinearLayout body = dialogBody();
         button(body, "耳机详情", false, this::showDeviceDetails);
-        label(body, "接通后持续聆听，停顿后自动回答。说“小万”可打断当前回复；点黑色结束按钮挂断。", 14, MUTED);
+        label(body, "接通后持续聆听，停顿后自动回答。说“小万”可打断当前回复；点“挂断”按钮结束通话。", 14, MUTED);
         voiceHint = label(body, voiceHintText(), 12, MUTED);
         lockScreenButton = button(body, lockScreenEnabled() ? "停止锁屏耳机会话" : "开启本次锁屏耳机会话", false, () -> {
             if (lockScreenEnabled()) { stopLockScreenSession(); updateStatus(); }
@@ -2507,8 +2520,13 @@ public final class MainActivity extends Activity {
         LinearLayout settings = disclosure(page, "陪伴偏好", "日常习惯与聆听方式", false);
         EditText preferences = field(settings, "关于你的偏好", "喜欢什么、如何与你交流…", false, 2000); preferences.setMinLines(2); preferences.setText(settings().optString("preferences"));
         CheckBox retain = new CheckBox(this); retain.setText("保存转写与对话历史"); retain.setTextColor(INK); retain.setTextSize(13); retain.setButtonTintList(android.content.res.ColorStateList.valueOf(ACCENT)); retain.setChecked(settings().optBoolean("retain_transcripts", true)); settings.addView(retain);
-        label(settings, "关闭后不新增聊天转写历史；明确开始的工作记录仍保存转写。仍可能自动提取记忆并保存请求结果，已有数据也会保留。需要移除账号业务数据请使用清空数据。", 11, MUTED);
-        LinearLayout hours = row(); settings.addView(hours); EditText start = input("上班小时", false, 2), end = input("下班小时", false, 2); start.setInputType(InputType.TYPE_CLASS_NUMBER); end.setInputType(InputType.TYPE_CLASS_NUMBER); start.setText(String.valueOf(settings().optInt("work_start", 9))); end.setText(String.valueOf(settings().optInt("work_end", 18))); hours.addView(start, new LinearLayout.LayoutParams(0, -2, 1)); hours.addView(end, new LinearLayout.LayoutParams(0, -2, 1));
+        label(settings, "· 关闭后，新的聊天不再保存文字记录\n· 工作会议记录不受影响，仍会保存转写\n· 已有数据会保留，删除请用「账号与隐私」中的清空数据", 11, MUTED);
+        LinearLayout hours = row(); settings.addView(hours);
+        LinearLayout startColumn = column(), endColumn = column();
+        hours.addView(startColumn, new LinearLayout.LayoutParams(0, -2, 1));
+        LinearLayout.LayoutParams endSize = new LinearLayout.LayoutParams(0, -2, 1); endSize.leftMargin = dp(12); hours.addView(endColumn, endSize);
+        EditText start = field(startColumn, "上班时间（时）", "0–23", false, 2), end = field(endColumn, "下班时间（时）", "1–24", false, 2);
+        start.setInputType(InputType.TYPE_CLASS_NUMBER); end.setInputType(InputType.TYPE_CLASS_NUMBER); start.setText(String.valueOf(settings().optInt("work_start", 9))); end.setText(String.valueOf(settings().optInt("work_end", 18)));
         EditText zone = field(settings, "时区", "例如 Asia/Shanghai", false, 80); zone.setText(settings().optString("timezone", "Asia/Shanghai"));
         label(settings, "前台聆听设置", 15, INK);
         EditText interval = field(settings, "定时聆听间隔（秒）", "60–3600，默认 300", false, 4); interval.setInputType(InputType.TYPE_CLASS_NUMBER); interval.setText(String.valueOf(settings().optInt("life_poll_seconds", 300)));
@@ -2618,7 +2636,7 @@ public final class MainActivity extends Activity {
     }
 
     private void privacyInfo() {
-        new AlertDialog.Builder(this).setTitle("数据处理说明").setMessage("Aidol 测试版由测试负责人运营。\n\n账号使用唯一用户名和密码登录，无需邮箱或手机号。忘记密码时需使用注册时保存的恢复码。\n\n在你点击或通过耳机接通 AI 后采集麦克风，每句最多 60 秒；AI 通话会在回复后继续听，挂断即可停止。录音上传服务器用于语音识别；文字发送 AI 服务生成回复与记忆；回复可转换为语音播放。工作会议录音按账号保存在服务器，到期（默认30天，可设为不保存）自动删除；其他对话的原始录音不保存。\n\n对话、偏好、记忆和会议待办按账号存储在服务器。你可以关闭新的转写保存、导出、清空数据或注销账号。测试负责人可管理服务器及备份。\n\n录制他人讲话前，请先征得对方同意。AI 回复与纪要需要自行核对。\n\n账号密钥保存在设备加密存储中；服务商 API Key 不下发到手机。").setPositiveButton("了解", null).show();
+        new AlertDialog.Builder(this).setTitle("数据处理说明").setMessage("Aidol 测试版由测试负责人运营。\n\n账号使用唯一用户名和密码登录，无需邮箱或手机号。忘记密码时需使用注册时保存的恢复码。\n\n在你点击或通过耳机接通 AI 后采集麦克风，每句最多 60 秒；AI 通话会在回复后继续听，挂断即可停止。录音上传服务器用于语音识别；文字发送 AI 服务生成回复与记忆；回复可转换为语音播放。工作会议录音按账号保存在服务器，到期（默认30天，可设为不保存）自动删除；其他对话的原始录音不保存。\n\n对话、偏好、记忆和会议待办按账号存储在服务器。你可以关闭新的转写保存、导出、清空数据或注销账号。测试负责人可管理服务器及备份。\n\n录制他人讲话前，请先征得对方同意。AI 回复与纪要需要自行核对。\n\n登录凭据保存在本机加密存储中；第三方 AI 服务的密钥只保存在服务器，不会存到你的手机上。").setPositiveButton("了解", null).show();
     }
 
     private void showSources(JSONArray sources) {
@@ -2798,7 +2816,7 @@ public final class MainActivity extends Activity {
                 if (error == null && value != null) {
                     try { result.accept(value); } catch (Exception e) { showError("操作未完成，请稍后重试"); }
                 } else if (error != null) {
-                    lastNotice = fallback(error.getMessage(), "无法连接服务器，请检查网络后重试");
+                    lastNotice = errorNotice = fallback(error.getMessage(), "无法连接服务器，请检查网络后重试");
                     diagnosticError = lastNotice; renderDiagnostics(); updateStatus();
                     showError(lastNotice);
                 }
@@ -2831,7 +2849,7 @@ public final class MainActivity extends Activity {
         if (audio.getMode() == android.media.AudioManager.MODE_IN_CALL || audio.getMode() == android.media.AudioManager.MODE_IN_COMMUNICATION
             || headset.snapshot().inCall) { feedback("通话期间不能开启锁屏耳机会话", LocalCue.CALL); return; }
         if (development.audioMode() == AudioMode.RISE_SDK && !headset.snapshot().ready()) {
-            feedback("请先连接耳机，显示就绪后再开启", LocalCue.CONNECT); return;
+            pageFeedback("需要先连接 Rise 耳机，连好后再开启", LocalCue.CONNECT); return;
         }
         stopRepeat();
         Intent service = new Intent(this, VoiceSessionService.class);
@@ -2920,7 +2938,7 @@ public final class MainActivity extends Activity {
             requestPermissions(missing.toArray(new String[0]), 1); return;
         }
         if (development.audioMode() == AudioMode.RISE_SDK && !headset.snapshot().ready()) {
-            stopRepeat(); showDeviceDetails(); feedback("请先连接耳机，显示就绪后再点击开始", LocalCue.CONNECT); return;
+            stopRepeat(); showDeviceDetails(); pageFeedback("需要先连接 Rise 耳机，连好后再开始", LocalCue.CONNECT); return;
         }
         if (listenMode == VoiceInteraction.NOTES && !getSystemService(android.app.NotificationManager.class).areNotificationsEnabled()) {
             headsetNotice("请开启通知权限，以便切到音乐或接听电话时继续记录，并随时从通知停止"); return;
@@ -2963,7 +2981,7 @@ public final class MainActivity extends Activity {
                 qwen || state.optJSONObject("capabilities") != null && state.optJSONObject("capabilities").optBoolean("voice_reply_stream")); session.start();
     } else { lastUser = text; conversationFeed.transcript(text); renderLiveTurn();
         session.streaming(false, state.optJSONObject("capabilities") != null && state.optJSONObject("capabilities").optBoolean("speech_stream"));
-        session.startText(text); } }
+        session.startText(text, headset != null && headset.snapshot().ready()); } }
     private void newSession() {
         if (modeCuePlayer != null) modeCuePlayer.stop();
         if (quickFeedback != null) quickFeedback.stop();
@@ -2988,7 +3006,7 @@ public final class MainActivity extends Activity {
             @Override public void failure(String text) {
                 if (!currentSession(generation)) return;
                 if (!turnHasResult && session != null && session.requestId().equals(lastBusinessRequestId)) uncertainTurnId = lastBusinessRequestId;
-                turnSucceeded = false; stopRepeat(); lastNotice = text;
+                turnSucceeded = false; stopRepeat(); lastNotice = errorNotice = text;
                 setAvatarPhase(CompanionPhase.ERROR);
                 clearLiveTurn(); diagnosticError = text; renderDiagnostics(); renderTurnDetails(); updateStatus();
             }
@@ -3431,7 +3449,8 @@ public final class MainActivity extends Activity {
     private void updateStatus() {
         renderAvatars();
         setStatusText(busy && modeChange == null ? "正在同步…" : lastNotice);
-        if (status != null) status.setTextColor(busy && modeChange == null ? MUTED : ACCENT);
+        if (status != null) status.setTextColor(busy && modeChange == null ? MUTED
+            : !errorNotice.isEmpty() && lastNotice.equals(errorNotice) ? RED : ACCENT);
         if (activeCallRow != null) activeCallRow.setVisibility(
             tab != 0 && (session != null || repeatArmed) && listenMode == VoiceInteraction.CALL ? View.VISIBLE : View.GONE);
         // The toggle's label is baked at build time; keep it in step when the service state flips.
@@ -3479,7 +3498,9 @@ public final class MainActivity extends Activity {
                 availability = caps != null && caps.optBoolean("voice_realtime")
                     ? "千问实时语音已配置（实际通话仍需验证）" : "千问实时语音未配置，请检查电脑后端";
             }
-            new AlertDialog.Builder(this).setTitle("后端可达").setMessage(api.serverUrl + "\n" + availability).setPositiveButton("完成", null).show();
+            // Endpoint and provider details are developer diagnostics; a release build only confirms the connection.
+            new AlertDialog.Builder(this).setTitle(BuildConfig.DEBUG ? "后端可达" : "服务连接正常")
+                .setMessage(BuildConfig.DEBUG ? api.serverUrl + "\n" + availability : "账号与服务都可以正常使用。").setPositiveButton("完成", null).show();
         }); });
     }
     private RadioGroup choices(LinearLayout parent, String[] options, int selected) {
@@ -3597,7 +3618,7 @@ public final class MainActivity extends Activity {
     }
     private void showError(String message) {
         if (authError != null) { authError.setText(message); return; }
-        if (message.contains("登录已失效")) { new AlertDialog.Builder(this).setTitle("请重新登录").setMessage(message).setCancelable(false).setPositiveButton("去登录", (d, w) -> signOut()).show(); return; }
+        if (message.contains("登录已失效")) { new AlertDialog.Builder(this).setTitle("登录已过期").setMessage("为保护账号安全，请重新登录。你的数据不会丢失。").setCancelable(false).setPositiveButton("去登录", (d, w) -> signOut()).show(); return; }
         new AlertDialog.Builder(this).setTitle("暂时未能完成").setMessage(message).setPositiveButton("知道了", null).show();
     }
     private void confirm(String title, String message, Runnable action) { if (!canAct()) return; new AlertDialog.Builder(this).setTitle(title).setMessage(message).setNegativeButton("取消", null).setPositiveButton("确认", (d, w) -> action.run()).show(); }
@@ -3608,6 +3629,7 @@ public final class MainActivity extends Activity {
         sourceDialog.show();
     }
     private void copy(String label, String text) { ((ClipboardManager) getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText(label, text)); feedback("已复制", LocalCue.COPIED); }
+    private void pageFeedback(String text, LocalCue cue) { feedback(text, cue); pageNotice = text; }
     private void feedback(String text, LocalCue cue) {
         if (isDestroyed()) return;
         lastNotice = text;
@@ -3744,7 +3766,10 @@ public final class MainActivity extends Activity {
         view.setMinHeight(dp(52)); view.setPadding(dp(16), dp(14), dp(16), dp(14)); view.setBackground(shape(BG, 14, LINE));
         view.setOnFocusChangeListener((v, focused) -> v.setBackground(shape(BG, 14, focused ? ACCENT : LINE)));
         view.setInputType(InputType.TYPE_CLASS_TEXT | (password ? InputType.TYPE_TEXT_VARIATION_PASSWORD : InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES));
-        view.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(max)}); view.setSingleLine(password); return view;
+        view.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(max)}); view.setSingleLine(password);
+        // setSingleLine installs SingleLineTransformationMethod, which would replace the password mask.
+        if (password) view.setTransformationMethod(android.text.method.PasswordTransformationMethod.getInstance());
+        return view;
     }
     private EditText field(LinearLayout parent, String title, String hint, boolean password, int max) {
         TextView caption = label(parent, title, 12, MUTED); EditText input = input(hint, password, max);

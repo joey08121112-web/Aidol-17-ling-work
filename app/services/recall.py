@@ -96,7 +96,7 @@ class RecallService:
     def _render(evidence, extraction, question):
         if not evidence:
             answer = ("没有找到相关且明确标记为未完成的待办。旧记忆没有完成状态，不能据此判断是否做完。"
-                      if _PENDING.search(question) else "本地资料中没有找到足够依据。请换个关键词，或先记录相关对话。")
+                      if _PENDING.search(question) else "没找到相关的记忆。换个说法试试，或者先在对话里说“记住……”。")
             return {"answer": answer,
                     "citations": [], "extraction": extraction, "insufficient": True}
         lead = "根据本地记录，找到以下原文依据："

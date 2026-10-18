@@ -656,7 +656,7 @@ public final class HeadsetController implements FusionDevice, AutoCloseable {
             if (diagnostics != null) lastCode = diagnostics;
             if (!cleanupConfirmed) {
                 // Do not make another input source appear safe while native transport cleanup is unknown.
-                publish(State.ERROR, "耳机连接释放未确认，请重启应用后重新连接"); return;
+                publish(State.ERROR, "耳机暂时没有响应。请在系统蓝牙中确认 Rise 已连接，再点“连接”重试；仍不行时重启应用"); return;
             }
             initialized = false; releasing = false; inCall = false;
             releaseSdkOwner(); publish(terminalState, message); afterTransportRelease();

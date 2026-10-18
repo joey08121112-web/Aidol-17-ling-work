@@ -206,7 +206,7 @@ final class ActionTaskBoard implements AutoCloseable {
         });
         body.addView(EditorUi.text(activity, "提前提醒", 12, EditorUi.MUTED));
         RadioGroup options = new RadioGroup(activity); options.setOrientation(LinearLayout.HORIZONTAL); int[] hours = {0, 1, 6, 24}; int[] choice = {editing ? existing.optInt("reminder_hours") : 1};
-        for (int hour : hours) { RadioButton option = new RadioButton(activity); option.setText(hour == 0 ? "不提醒" : hour == 24 ? "1天" : hour + "h"); option.setId(View.generateViewId()); option.setTextSize(13);
+        for (int hour : hours) { RadioButton option = new RadioButton(activity); option.setText(hour == 0 ? "不提醒" : hour == 24 ? "1 天" : hour + " 小时"); option.setId(View.generateViewId()); option.setTextSize(13);
             option.setPadding(0, dp(8), 0, dp(8)); options.addView(option, new RadioGroup.LayoutParams(0, -2, 1)); if (hour == choice[0]) option.setChecked(true);
             option.setOnClickListener(v -> choice[0] = hour); }
         options.setBackground(EditorUi.shape(activity, -1, 14, EditorUi.LINE)); body.addView(options);

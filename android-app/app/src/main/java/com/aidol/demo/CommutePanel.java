@@ -219,7 +219,7 @@ final class CommutePanel implements AutoCloseable {
         navigationPrimary = null;
         endButton = button(plan, "结束通勤", false, this::stop);
         status = text(plan, "", 12, EditorUi.MUTED);
-        text(plan, "开始后每 3 分钟更新定位与路线，锁屏也继续；可从通知结束。固定起点保留原地址，仅更新路线耗时估算。", 12, EditorUi.MUTED);
+        text(plan, "开始后每 3 分钟更新路线，锁屏也会继续。随时可以在本页结束通勤；部分手机需要长按通知才会出现操作按钮。", 12, EditorUi.MUTED);
         LinearLayout stations = card(parent);
         text(stations, "站点提醒", 18, EditorUi.INK);
         stationStatus = text(stations, CommuteService.reminderStatus(client.get()), 13, EditorUi.MUTED);
@@ -561,15 +561,20 @@ final class CommutePanel implements AutoCloseable {
             public void afterTextChanged(Editable e) {}
         };
         city.addTextChangedListener(changed); query.addTextChangedListener(changed);
-        TextView progress = text(body, "常用地址直接复用已保存坐标。", 12, EditorUi.MUTED);
+        TextView progress = text(body, addresses.length() > 0 ? "点上方常用地址可直接选择" : "", 12, EditorUi.MUTED);
         button(body, "查找地址", false, () -> {
             String value = query.getText().toString().trim(), cityValue = city.getText().toString().trim();
-            if (value.isEmpty() || cityValue.isEmpty()) { progress.setText("请填写城市和地址"); return; }
+            city.setBackground(EditorUi.shape(activity, 0xffffffff, 14, cityValue.isEmpty() ? EditorUi.RED : EditorUi.LINE));
+            query.setBackground(EditorUi.shape(activity, 0xffffffff, 14, value.isEmpty() ? EditorUi.RED : EditorUi.LINE));
+            if (value.isEmpty() || cityValue.isEmpty()) {
+                progress.setTextColor(EditorUi.RED); progress.setText(cityValue.isEmpty() && value.isEmpty() ? "请填写城市和地址" : cityValue.isEmpty() ? "请填写城市" : "请填写地址或地点名称"); return;
+            }
+            progress.setTextColor(EditorUi.MUTED);
             long request = ++searchVersion[0];
             BooleanSupplier relevant = () -> editorCurrent.getAsBoolean() && request == searchVersion[0];
             query(api -> api.json("GET", "/v1/maps/geocode?address=" + Uri.encode(value) + "&city=" + Uri.encode(cityValue), null), data -> {
                 JSONArray results = data.optJSONArray("places");
-                if (results == null || results.length() == 0) { progress.setText(data.optString("reason", "未找到地址")); return; }
+                if (results == null || results.length() == 0) { progress.setTextColor(EditorUi.RED); progress.setText(data.optString("reason", "未找到地址，换个说法试试")); return; }
                 pointResults("选择地址", results, point -> { if (relevant.getAsBoolean()) { put(point, "name", value); select.accept(copy(point)); } });
             }, progress, relevant);
         });

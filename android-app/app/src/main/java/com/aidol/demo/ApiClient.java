@@ -122,9 +122,9 @@ public final class ApiClient {
         diagnostics.accept(operation + " · HTTP " + response.code());
         if (response.isSuccessful() && response.body() != null) return response;
         try (Response failed = response) {
-            String detail = "服务暂不可用（" + failed.code() + "）";
-            try { detail = new JSONObject(failed.body().string()).optString("detail", detail); } catch (Exception ignored) {}
-            throw new ApiException(failed.code(), detail);
+            String body = null;
+            try { body = failed.body() == null ? null : failed.body().string(); } catch (IOException ignored) {}
+            throw new ApiException(failed.code(), errorMessage(failed.code(), body));
         }
     }
     public byte[] bytes(String method, String path, byte[] body, String contentType) throws Exception {
@@ -142,15 +142,23 @@ public final class ApiClient {
             if (response.body() == null) throw new IOException("服务器返回为空，请重试");
             byte[] bytes = response.body().bytes();
             if (!response.isSuccessful()) {
-                String detail = "服务暂不可用（" + response.code() + "）";
-                try { detail = new JSONObject(new String(bytes, StandardCharsets.UTF_8)).optString("detail", detail); } catch (Exception ignored) {}
-                throw new ApiException(response.code(), detail);
+                throw new ApiException(response.code(), errorMessage(response.code(), new String(bytes, StandardCharsets.UTF_8)));
             }
             return bytes;
         } catch (IOException e) {
             if (!(e instanceof ApiException)) diagnostics.accept(operation + " · " + (call.isCanceled() ? "已取消" : "网络失败：" + e.getClass().getSimpleName()));
             throw transportFailure(call, e);
         }
+    }
+    /** User-facing text for a failed response. Our routes raise Chinese details; framework
+     *  defaults ("Not Found", "Method Not Allowed", validation lists) mean a client/server mismatch. */
+    static String errorMessage(int status, String body) {
+        String detail = "";
+        try { Object value = new JSONObject(body).opt("detail"); if (value instanceof String) detail = ((String) value).trim(); }
+        catch (Exception ignored) { /* Non-JSON bodies (proxies, HTML error pages) use the fallback. */ }
+        if (!detail.isEmpty() && detail.codePoints().anyMatch(c -> Character.UnicodeScript.of(c) == Character.UnicodeScript.HAN)) return detail;
+        if (status == 404 || status == 405 || status == 501) return "服务版本暂不匹配，请更新 App 或稍后再试（错误 " + status + "）";
+        return "服务暂不可用，请稍后再试（错误 " + status + "）";
     }
     private static String operation(Call call) {
         // Only method/path/status: never log credentials, query strings or bodies.
