@@ -670,11 +670,38 @@ def test_meeting_people_events_and_conflicts_require_evidence():
         _validate_minutes(report, rows)
 
 
+def test_generated_minutes_wait_out_a_call_and_save_without_regenerating(work, monkeypatch):
+    import asyncio
+    from app import main as main_module
+    client, runtime, words, calls = work
+    monkeypatch.setattr(main_module, 'WORK_SUMMARY_SAVE_LOCK_WAIT', .05)
+    monkeypatch.setattr(main_module, 'WORK_SUMMARY_SAVE_RETRY_DELAY', .01)
+    meeting_id = start(client)
+    upload(client, meeting_id)
+    attempts = []
+
+    async def contended(self, rows, progress):
+        attempts.append(rows)
+        # The user leaves the page and starts a call that outlasts one lock wait.
+        await runtime.lock.acquire()
+        asyncio.get_running_loop().call_later(.3, runtime.lock.release)
+        return {'title': '设计稿讨论', 'summary': '采用蓝色方案，周五交设计稿。', 'topics': [],
+                'decisions': [], 'tasks': [], 'open_questions': [],
+                'source_ids': [row['id'] for row in rows], 'extraction': 'llm'}
+
+    monkeypatch.setattr(WorkMeetingMinutes, 'generate', contended)
+    finish(client, meeting_id)
+    meeting = runtime.store.work_meeting(meeting_id)
+    assert len(attempts) == 1 and meeting['summary_status'] == 'ready'
+    assert meeting['report']['title'] == '设计稿讨论'
+
+
 def test_locked_save_defers_generated_minutes_instead_of_failing(work, monkeypatch):
     from app import main as main_module
     client, runtime, words, calls = work
     monkeypatch.setattr(main_module, 'WORK_SUMMARY_SAVE_LOCK_WAIT', .05)
     monkeypatch.setattr(main_module, 'WORK_SUMMARY_SAVE_RETRY_DELAY', .01)
+    monkeypatch.setattr(main_module, 'WORK_SUMMARY_SAVE_PATIENCE', .2)
     meeting_id = start(client)
     upload(client, meeting_id)
     attempts = []
@@ -697,8 +724,120 @@ def test_locked_save_defers_generated_minutes_instead_of_failing(work, monkeypat
     client.portal.call(runtime.lock.release)
     client.get('/v1/work-meetings/' + meeting_id)  # the next page read resumes and saves it
     meeting = runtime.store.work_meeting(meeting_id)
-    assert len(attempts) == 2 and meeting['summary_status'] == 'ready'
+    # The resumed job saves the checkpointed minutes instead of calling the model again.
+    assert len(attempts) == 1 and meeting['summary_status'] == 'ready'
     assert meeting['report']['title'] == '设计稿讨论'
+
+
+def raw_checkpoint(store, meeting_id):
+    with store.connect() as db:
+        return db.execute('SELECT summary_checkpoint FROM work_meetings WHERE id=?', (meeting_id,)).fetchone()[0]
+
+
+def test_restart_after_generation_saves_checkpoint_without_calling_the_model_again(work, config, tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import main as main_module
+    from app.main import create_hosted_app
+    client, runtime, words, calls = work
+    monkeypatch.setattr(main_module, 'WORK_SUMMARY_SAVE_LOCK_WAIT', .05)
+    monkeypatch.setattr(main_module, 'WORK_SUMMARY_SAVE_RETRY_DELAY', .01)
+    monkeypatch.setattr(main_module, 'WORK_SUMMARY_SAVE_PATIENCE', .2)
+    meeting_id = start(client)
+    upload(client, meeting_id)
+    attempts = []
+
+    async def generated_then_blocked(self, rows, progress):
+        attempts.append(rows)
+        # A call holds the account until the process is restarted (deploy, crash).
+        await runtime.lock.acquire()
+        return {'title': '设计稿讨论', 'summary': '采用蓝色方案，周五交设计稿。', 'topics': [],
+                'decisions': [], 'tasks': [], 'open_questions': [],
+                'source_ids': [row['id'] for row in rows], 'extraction': 'llm'}
+
+    monkeypatch.setattr(WorkMeetingMinutes, 'generate', generated_then_blocked)
+    finish(client, meeting_id)
+    assert len(attempts) == 1
+    assert runtime.store.work_meeting(meeting_id)['summary_status'] == 'pending'
+    assert json.loads(raw_checkpoint(runtime.store, meeting_id))['report']['title'] == '设计稿讨论'
+    try:
+        # A fresh process on the same data directory: no in-memory job, report or lock survives.
+        with TestClient(create_hosted_app(config, tmp_path / 'hosted')) as restarted:
+            restarted.headers['Authorization'] = client.headers['Authorization']
+            detail = restarted.get('/v1/work-meetings/' + meeting_id)
+            assert detail.status_code == 200 and 'summary_checkpoint' not in detail.json()
+            detail = restarted.get('/v1/work-meetings/' + meeting_id).json()
+    finally:
+        client.portal.call(runtime.lock.release)
+    assert len(attempts) == 1, 'the resumed job must not call the model again'
+    assert detail['summary_status'] == 'ready' and detail['report']['title'] == '设计稿讨论'
+    assert raw_checkpoint(runtime.store, meeting_id) is None
+
+
+def test_summary_checkpoint_is_scoped_to_its_job_and_sources(work):
+    client, runtime, words, calls = work
+    store = runtime.store
+    meeting_id = start(client)
+    upload(client, meeting_id)
+    finish(client, meeting_id)
+    source_ids = [row['id'] for row in store.work_meeting(meeting_id)['sources']]
+    report = {'title': 'checkpoint', 'extraction': 'llm'}
+    # Only a pending job may be checkpointed.
+    assert not store.checkpoint_work_summary(meeting_id, report, source_ids)
+    assert store.retry_work_summary(meeting_id)  # Pending without scheduling a job.
+    assert not store.checkpoint_work_summary(meeting_id, report, source_ids, 'revision-1')
+    assert not store.checkpoint_work_summary(meeting_id, report, source_ids + ['gone'])
+    assert store.checkpoint_work_summary(meeting_id, report, source_ids)
+    assert store.work_summary_checkpoint(meeting_id, source_ids) == report
+    assert store.work_summary_checkpoint(meeting_id, source_ids, 'revision-1') is None
+    assert store.work_summary_checkpoint(meeting_id, source_ids[:-1]) is None
+    assert 'summary_checkpoint' not in store.work_meeting(meeting_id)
+    assert all('summary_checkpoint' not in row for row in store.work_meetings())
+    # A failed job and a queued retry both start over from the sources.
+    store.fail_work_summary(meeting_id)
+    assert raw_checkpoint(store, meeting_id) is None
+    assert store.retry_work_summary(meeting_id)
+    assert store.work_summary_checkpoint(meeting_id, source_ids) is None
+    # Forgetting a cited source withdraws the unsaved minutes that quote it.
+    assert store.checkpoint_work_summary(meeting_id, report, source_ids)
+    memory = store.remember_transcript(store.work_meeting(meeting_id)['sources'][0]['id'])
+    store.forget_memory(memory['id'])
+    assert raw_checkpoint(store, meeting_id) is None
+
+
+def test_restarted_job_regenerates_when_sources_changed_after_checkpoint(work):
+    client, runtime, words, calls = work
+    store = runtime.store
+    meeting_id = start(client)
+    upload(client, meeting_id)
+    upload(client, meeting_id, 1)
+    finish(client, meeting_id, 2)
+    assert len(calls) == 1
+    old_ids = [row['id'] for row in store.work_meeting(meeting_id)['sources']]
+    store.forget_memory(store.remember_transcript(old_ids[0])['id'])
+    assert store.retry_work_summary(meeting_id)
+    # A checkpoint left over from before the change, over sources that no longer all exist.
+    stale = {'title': 'stale', 'summary': 'stale', 'source_ids': old_ids, 'extraction': 'llm'}
+    with store.connect() as db:
+        db.execute('UPDATE work_meetings SET summary_checkpoint=? WHERE id=?', (json.dumps(
+            {'revision_id': None, 'source_ids': old_ids, 'report': stale}), meeting_id))
+    client.get('/v1/work-meetings/' + meeting_id)
+    meeting = store.work_meeting(meeting_id)
+    assert len(calls) == 2 and meeting['summary_status'] == 'ready'
+    assert meeting['report']['title'] == '设计稿讨论'
+    assert calls[-1][0]['id'].split('.')[0] == old_ids[1].split('.')[0]
+
+
+def test_background_summary_writes_never_recreate_a_deleted_account(tmp_path):
+    from pathlib import Path
+    from app.storage import Store
+    path = tmp_path / 'users' / 'deleted.sqlite3'
+    store = Store(str(path))
+    for suffix in ('', '-wal', '-shm'):
+        Path(str(path) + suffix).unlink(missing_ok=True)
+    assert not store.checkpoint_work_summary('meeting', {'title': 'x'}, [])
+    assert store.work_summary_checkpoint('meeting', []) is None
+    store.work_summary_progress('meeting', 'analyzing', 0, 1)
+    assert not path.exists()
 
 
 def test_transcription_polling_does_not_hold_summary_slots(work, monkeypatch):

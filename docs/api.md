@@ -23,7 +23,7 @@
 
 删除事务清理本场原文、句子、事件、上传记录、纪要和引用本场原文的关联行动项（含已编辑行动项），随后清理本场录音目录；引用被删原文的历史整理快照失效，其未引用被删来源的行动项独立保留。单独保存的记忆、独立对话及其他会议保留；曾返回原文的请求缓存失效，防止迟到重放旧原文。Android取消被删行动项提醒、清理该会议本地编辑稿/详情缓存并更新历史整理结果。删除回执只保存会议ID与关联任务ID，防止迟到建场重建；迟到ASR/AI/地址结果无法恢复已删会议。全量清空同时清除此回执表。正在录音的会议先结束；录音已中断时可从原详情入口结束已上传部分再删除。
 
-`status` 是原文保存状态：`recording/saved/partial/empty`；`summary_status` 为 `waiting/pending/ready/fallback/failed/unavailable`。`summary_stage` 为 `waiting/queued/analyzing/synthesizing/done`，`processed_sections/total_sections` 是实际完成的分析组数，不伪造百分比。Android 在本机停止至上传排空间显示“正在转写并保存”。网络失败保留上次确认状态并提示同步重试；后端重启后，读取列表／详情／state 会恢复持久化的 pending 任务。
+`status` 是原文保存状态：`recording/saved/partial/empty`；`summary_status` 为 `waiting/pending/ready/fallback/failed/unavailable`。`summary_stage` 为 `waiting/queued/analyzing/synthesizing/done`，`processed_sections/total_sections` 是实际完成的分析组数，不伪造百分比。Android 在本机停止至上传排空间显示“正在转写并保存”。网络失败保留上次确认状态并提示同步重试；后端重启后，读取列表／详情／state 会恢复持久化的 pending 任务；已生成但尚未写入的纪要先在服务端保存检查点（不出现在接口响应中），恢复时直接写入而不再调用模型，重试、修正、遗忘或删除原文都会作废该检查点。
 
 `report` 含 `title/summary/topics/decisions/tasks/open_questions/chapters/highlights/source_ids/extraction/notice/capture_status`。`chapters` 最多12条 `{title, summary, source_ids, start_ms}`，按时间排序；`highlights` 最多8条 `{text, source_ids, start_ms}`，`text` 必须逐字出现在所引句子中，否则丢弃。`start_ms` 由服务端按所引句子计算，不由模型给出；格式不合格的章节或金句被丢弃，不导致整份纪要回退。旧纪要没有这两个字段，重试整理后补上。原文不经 AI 改写；长会议先按有界片段分析，再分层汇总，覆盖所有已保存文字。每条要点、决策、待办、待确认项引用本场句子 id（`<原文 id>.<序号>`，旧会议仍为原文 id）；负责人和截止日期必须能在来源中核对，身份不明时留空。模型不可用、结构不合法或额度不足返回明确的原文摘录 fallback，不宣称 AI 整理成功。原文保存不受聊天保留开关影响；新协议的录音不逐段进入个人记忆提取。ASR 和每次实际文字模型调用分别计入账号额度。
 

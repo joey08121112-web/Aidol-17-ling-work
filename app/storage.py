@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import json
 import os
+from urllib.parse import quote
 from pathlib import Path
 import shutil
 import sqlite3
@@ -93,6 +94,11 @@ def _utterance_rows(transcript_id, offset_ms, duration_ms, text, utterances):
     rows.sort(key=lambda row: row[0])
     return [(f'{transcript_id}.{ordinal}', ordinal, offset_ms + start, offset_ms + end, body, speaker)
             for ordinal, (start, end, body, speaker) in enumerate(rows)]
+
+
+def _public_meeting(row):
+    # The summary checkpoint is internal job state, not part of the meeting contract.
+    return {key: value for key, value in dict(row).items() if key != 'summary_checkpoint'}
 
 
 def _wall_clock(anchor, events):
@@ -197,7 +203,9 @@ class Store(CommuteStorage):
                                      ('address_attempts', 'INTEGER NOT NULL DEFAULT 0'),
                                      ('address_retry_at', 'REAL'),
                                      ('revision_request', "TEXT NOT NULL DEFAULT '{}'"),
-                                     ('pinned', 'INTEGER NOT NULL DEFAULT 0')):
+                                     ('pinned', 'INTEGER NOT NULL DEFAULT 0'),
+                                     # Generated minutes awaiting the account lock; survives a restart.
+                                     ('summary_checkpoint', 'TEXT')):
                 if name not in meeting_columns:
                     db.execute(f'ALTER TABLE work_meetings ADD COLUMN {name} {definition}')
             db.execute('CREATE TABLE IF NOT EXISTS work_audio_uploads (meeting_id TEXT NOT NULL, '
@@ -270,8 +278,13 @@ class Store(CommuteStorage):
                                                      len(upload['pcm']) // PCM_BYTES_PER_MS, len(upload['pcm']), upload['digest']))
 
     @contextmanager
-    def connect(self):
-        db = sqlite3.connect(self.path, timeout=10)
+    def connect(self, must_exist=False):
+        # must_exist: background writes outside the account lock must never recreate
+        # a deleted account's database; opening a missing file raises OperationalError.
+        if must_exist:
+            db = sqlite3.connect('file:' + quote(os.path.abspath(self.path)) + '?mode=rw', timeout=10, uri=True)
+        else:
+            db = sqlite3.connect(self.path, timeout=10)
         # WAL keeps durability across app crashes; NORMAL avoids one fsync per
         # write transaction, which matters for the per-turn mobile_turn updates.
         db.execute("PRAGMA synchronous=NORMAL")
@@ -631,7 +644,7 @@ class Store(CommuteStorage):
 
     def work_meetings(self, limit=100):
         with self.connect() as db:
-            return [{**dict(row), 'pinned': bool(row['pinned']), 'whole_audio': bool(row['whole_audio']), 'location': json.loads(row['location']), 'revision_request': {k: v for k, v in json.loads(row['revision_request']).items() if k != 'document'}} for row in db.execute(
+            return [{**_public_meeting(row), 'pinned': bool(row['pinned']), 'whole_audio': bool(row['whole_audio']), 'location': json.loads(row['location']), 'revision_request': {k: v for k, v in json.loads(row['revision_request']).items() if k != 'document'}} for row in db.execute(
                 "SELECT m.*,json_extract(r.payload,'$.title') AS title,json_extract(r.payload,'$.summary') AS summary, "
                 "(SELECT count(*) FROM work_meeting_segments s JOIN transcripts t ON t.id=s.transcript_id "
                 "WHERE s.meeting_id=m.id) + (SELECT count(DISTINCT u.transcript_id) FROM work_utterances u JOIN transcripts t ON t.id=u.transcript_id WHERE u.meeting_id=m.id AND u.segment_index=-1) AS transcript_count, "
@@ -755,13 +768,7 @@ class Store(CommuteStorage):
             row = db.execute("SELECT * FROM work_meetings WHERE id=?", (meeting_id,)).fetchone()
             if row is None:
                 return None
-            # Segment-recognised text plus live-caption sentences (segment_index -1), in timeline order.
-            sources = [dict(item) for item in db.execute(
-                "SELECT t.*,s.segment_index,COALESCE(s.offset_ms,s.segment_index*?) AS offset_ms,s.duration_ms,s.utterances AS segment_utterances "
-                "FROM work_meeting_segments s JOIN transcripts t ON t.id=s.transcript_id WHERE s.meeting_id=? "
-                "UNION ALL SELECT t.*,NULL,min(u.start_ms),max(u.end_ms)-min(u.start_ms),'[]' FROM work_utterances u "
-                "JOIN transcripts t ON t.id=u.transcript_id WHERE u.meeting_id=? AND u.segment_index=-1 GROUP BY t.id "
-                "ORDER BY offset_ms", (WORK_SEGMENT_MS, meeting_id, meeting_id))]
+            sources = self._work_sources(db, meeting_id)
             utterances = [dict(item) for item in db.execute(
                 "SELECT u.id,u.transcript_id,u.segment_index,u.start_ms,u.end_ms,u.text,u.speaker FROM work_utterances u "
                 "JOIN transcripts t ON t.id=u.transcript_id WHERE u.meeting_id=? ORDER BY u.start_ms,u.ordinal", (meeting_id,))]
@@ -785,7 +792,7 @@ class Store(CommuteStorage):
         expires = None
         if status in ('saved', 'partial') and row['ended_at']:
             expires = (datetime.fromisoformat(row['ended_at']) + timedelta(days=retention)).isoformat()
-        return {**dict(row), 'pinned': bool(row['pinned']), 'whole_audio': bool(row['whole_audio']), 'location': json.loads(row['location'] or '{}'),
+        return {**_public_meeting(row), 'pinned': bool(row['pinned']), 'whole_audio': bool(row['whole_audio']), 'location': json.loads(row['location'] or '{}'),
                 'revision_request': json.loads(row['revision_request']),
                 'sources': sources, 'transcript_count': len(sources),
                 'received_segments': audio['total'], 'utterances': utterances, 'events': events,
@@ -795,6 +802,16 @@ class Store(CommuteStorage):
                 'audio': {'status': status, 'bytes': audio['bytes'], 'segments_with_audio': audio['kept'],
                           'retention_days': retention, 'expires_at': expires},
                 'report': json.loads(report['payload']) if report else None}
+
+    @staticmethod
+    def _work_sources(db, meeting_id):
+        # Segment-recognised text plus live-caption sentences (segment_index -1), in timeline order.
+        return [dict(item) for item in db.execute(
+            "SELECT t.*,s.segment_index,COALESCE(s.offset_ms,s.segment_index*?) AS offset_ms,s.duration_ms,s.utterances AS segment_utterances "
+            "FROM work_meeting_segments s JOIN transcripts t ON t.id=s.transcript_id WHERE s.meeting_id=? "
+            "UNION ALL SELECT t.*,NULL,min(u.start_ms),max(u.end_ms)-min(u.start_ms),'[]' FROM work_utterances u "
+            "JOIN transcripts t ON t.id=u.transcript_id WHERE u.meeting_id=? AND u.segment_index=-1 GROUP BY t.id "
+            "ORDER BY offset_ms", (WORK_SEGMENT_MS, meeting_id, meeting_id))]
 
     @staticmethod
     def work_meeting_evidence(meeting):
@@ -1102,7 +1119,7 @@ class Store(CommuteStorage):
 
     def fail_work_transcription(self, meeting_id, reset_task=False):
         with self.connect() as db:
-            db.execute("UPDATE work_meetings SET transcription_status='failed',summary_status='failed',"
+            db.execute("UPDATE work_meetings SET transcription_status='failed',summary_status='failed',summary_checkpoint=NULL,"
                        "asr_task_id=CASE WHEN ? THEN '' ELSE asr_task_id END WHERE id=? AND transcription_status='pending'",
                        (reset_task, meeting_id))
 
@@ -1119,7 +1136,7 @@ class Store(CommuteStorage):
                 # Keep whatever the live captions saved rather than erasing text on an empty result.
                 kept = db.execute("SELECT count(*) FROM work_utterances WHERE meeting_id=?", (meeting_id,)).fetchone()[0]
                 db.execute("UPDATE work_meetings SET transcription_status='empty',summary_stage='queued',summary_status=?,"
-                           "status=CASE WHEN ?=0 THEN 'empty' ELSE status END WHERE id=?",
+                           "summary_checkpoint=NULL,status=CASE WHEN ?=0 THEN 'empty' ELSE status END WHERE id=?",
                            ('pending' if kept else 'unavailable', kept, meeting_id))
                 return True
             old = {row[0] for row in db.execute("SELECT transcript_id FROM work_utterances WHERE meeting_id=?", (meeting_id,))}
@@ -1138,7 +1155,8 @@ class Store(CommuteStorage):
                 db.execute("INSERT INTO work_utterances(id,meeting_id,transcript_id,segment_index,ordinal,start_ms,end_ms,text,speaker) "
                            "VALUES(?,?,?,-1,0,?,?,?,?)", (transcript_id + '.0', meeting_id, transcript_id,
                                                           turn['begin_time'], turn['end_time'], turn['text'], label))
-            db.execute("UPDATE work_meetings SET transcription_status='ready',summary_stage='queued',summary_status='pending' WHERE id=?",
+            db.execute("UPDATE work_meetings SET transcription_status='ready',summary_stage='queued',summary_status='pending',"
+                       "summary_checkpoint=NULL WHERE id=?",
                        (meeting_id,))
             db.execute('DELETE FROM work_audio_uploads WHERE meeting_id=?', (meeting_id,))  # Pre-merge uploads only.
         if self.settings().work_audio_retention_days == 0:
@@ -1178,26 +1196,73 @@ class Store(CommuteStorage):
                 db.execute('INSERT INTO action_tasks(id,report_id,content,owner,due,source_ids,status,created_at) VALUES(?,?,?,?,?,?,?,?)',
                            (old_task.get('id', uuid4().hex), report_id, task['content'], task['owner'], task['due'],
                             json.dumps(task['source_ids']), old_task.get('status', 'open'), old_task.get('created_at', created)))
-            db.execute("UPDATE work_meetings SET report_id=?,summary_status=?,summary_stage='done',revision_request=? WHERE id=?",
+            db.execute("UPDATE work_meetings SET report_id=?,summary_status=?,summary_stage='done',revision_request=?,"
+                       "summary_checkpoint=NULL WHERE id=?",
                        (report_id, 'ready' if payload['extraction'] == 'llm' else 'fallback',
                         json.dumps(revision, ensure_ascii=False) if revision is not None else fresh['revision_request'], meeting_id))
         return True
 
     def work_summary_progress(self, meeting_id, stage, processed=0, total=0):
-        with self.connect() as db:
-            db.execute("UPDATE work_meetings SET summary_stage=?,processed_sections=?,total_sections=? "
-                       "WHERE id=? AND summary_status='pending'", (stage, processed, total, meeting_id))
+        # Written by background jobs outside the account lock.
+        try:
+            with self.connect(must_exist=True) as db:
+                db.execute("UPDATE work_meetings SET summary_stage=?,processed_sections=?,total_sections=? "
+                           "WHERE id=? AND summary_status='pending'", (stage, processed, total, meeting_id))
+        except sqlite3.OperationalError:
+            pass  # The account was deleted while the job ran.
+
+    def checkpoint_work_summary(self, meeting_id, payload, source_ids, revision_id=None):
+        """Persist generated minutes before waiting for the account lock, so a restart
+        saves them instead of calling the model again. Runs outside that lock: it never
+        recreates a deleted account and only records a report for the still-pending job
+        over unchanged sources."""
+        try:
+            with self.connect(must_exist=True) as db:
+                db.execute('BEGIN IMMEDIATE')
+                row = db.execute('SELECT summary_status,revision_request FROM work_meetings WHERE id=?', (meeting_id,)).fetchone()
+                if row is None or row['summary_status'] != 'pending' or self._summary_job(row) != revision_id:
+                    return False
+                if [source['id'] for source in self._work_sources(db, meeting_id)] != source_ids:
+                    return False
+                db.execute('UPDATE work_meetings SET summary_checkpoint=? WHERE id=?', (json.dumps(
+                    {'revision_id': revision_id, 'source_ids': source_ids, 'report': payload}, ensure_ascii=False), meeting_id))
+                return True
+        except sqlite3.OperationalError:
+            return False
+
+    def work_summary_checkpoint(self, meeting_id, source_ids, revision_id=None):
+        """The checkpointed report for this pending job and these exact sources, else None."""
+        try:
+            with self.connect(must_exist=True) as db:
+                row = db.execute('SELECT summary_status,revision_request,summary_checkpoint FROM work_meetings WHERE id=?',
+                                 (meeting_id,)).fetchone()
+        except sqlite3.OperationalError:
+            return None
+        if row is None or not row['summary_checkpoint'] or row['summary_status'] != 'pending':
+            return None
+        checkpoint = json.loads(row['summary_checkpoint'])
+        if (checkpoint.get('revision_id') != revision_id or self._summary_job(row) != revision_id
+                or checkpoint.get('source_ids') != source_ids):
+            return None
+        return checkpoint['report']
+
+    @staticmethod
+    def _summary_job(row):
+        # A pending revision id, or None for a plain summary job.
+        revision = json.loads(row['revision_request'])
+        return revision.get('id') if revision.get('status') == 'pending' else None
 
     def retry_work_summary(self, meeting_id):
         with self.connect() as db:
             return db.execute("UPDATE work_meetings SET summary_status='pending',summary_stage='queued',processed_sections=0,total_sections=0,"
+                              "summary_checkpoint=NULL,"
                               "transcription_status=CASE WHEN transcription_status='failed' THEN 'pending' ELSE transcription_status END "
                               "WHERE id=? AND status!='recording' "
                               "AND summary_status IN ('fallback','failed','ready')", (meeting_id,)).rowcount > 0
 
     def queue_work_revision(self, meeting_id, base_report_id, revision):
         with self.connect() as db:
-            return db.execute("UPDATE work_meetings SET revision_request=?,summary_status='pending',summary_stage='queued' "
+            return db.execute("UPDATE work_meetings SET revision_request=?,summary_status='pending',summary_stage='queued',summary_checkpoint=NULL "
                               "WHERE id=? AND report_id=? AND summary_status!='pending' AND status!='recording'",
                               (json.dumps(revision, ensure_ascii=False), meeting_id, base_report_id)).rowcount > 0
 
@@ -1217,7 +1282,7 @@ class Store(CommuteStorage):
         revision.update(status='failed', error=reason)
         status = 'ready' if (meeting['report'] or {}).get('extraction') == 'llm' else 'fallback'
         with self.connect() as db:
-            db.execute("UPDATE work_meetings SET revision_request=?,summary_status=?,summary_stage='done' WHERE id=?",
+            db.execute("UPDATE work_meetings SET revision_request=?,summary_status=?,summary_stage='done',summary_checkpoint=NULL WHERE id=?",
                        (json.dumps(revision, ensure_ascii=False), status, meeting_id))
 
     def fail_work_summary(self, meeting_id):
@@ -1226,7 +1291,8 @@ class Store(CommuteStorage):
             self.fail_work_revision(meeting_id, 'provider_error')
             return
         with self.connect() as db:
-            db.execute("UPDATE work_meetings SET summary_status='failed' WHERE id=? AND summary_status='pending'", (meeting_id,))
+            db.execute("UPDATE work_meetings SET summary_status='failed',summary_checkpoint=NULL WHERE id=? AND summary_status='pending'",
+                       (meeting_id,))
 
     def get_memory(self, memory_id):
         with self.connect() as db:
@@ -1270,6 +1336,9 @@ class Store(CommuteStorage):
                 removed_memories += db.execute('DELETE FROM memories WHERE source=?', (row['source'],)).rowcount
                 removed_transcripts = db.execute('DELETE FROM transcripts WHERE id=?', (source_id,)).rowcount
                 db.execute("UPDATE work_meeting_segments SET utterances='[]' WHERE transcript_id=?", (source_id,))
+                # Generated-but-unsaved minutes quote this source too.
+                db.execute("UPDATE work_meetings SET summary_checkpoint=NULL WHERE id IN (SELECT meeting_id FROM work_meeting_segments "
+                           "WHERE transcript_id=? UNION SELECT meeting_id FROM work_utterances WHERE transcript_id=?)", (source_id, source_id))
                 db.execute('DELETE FROM recall_exclusions WHERE transcript_id=?', (source_id,))
                 # Work minutes cite sentences "<transcript id>.<n>"; they belong to the same source.
                 cites = lambda ids: any(item == source_id or item.startswith(source_id + '.') for item in ids)
