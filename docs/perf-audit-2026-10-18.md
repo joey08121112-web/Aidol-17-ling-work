@@ -15,6 +15,20 @@
 
 验证状态：后端 pytest 507 通过（含新守卫）、compileall 通过；Android 205 单测通过、lintDebug 0 错误。
 
+## 集成落地状态（W7 汇总，2026-10-18）
+
+五个代码窗口已全部合入 `perf/integration`（合并顺序 ui → android-system → net-infra → agent-tokens → locks-background，实际按落地时序滚动执行），每次合并后双端全量回归通过；期间主线（origin/main）晨批新功能经语义合并共存（maps/work_meetings/main.py 三处冲突按"连接池改造+新功能逻辑都保留"解决）。当前集成分支验证：后端 pytest **623 通过**、compileall 通过；Android **283 单测** 0 失败、lintDebug 0 错误。
+
+| 窗口 | 状态 | 集成分支落点 |
+| --- | --- | --- |
+| W1 UI 增量渲染 | 全部合入（5 提交：字幕增量/tab 缓存/ioPool/Dialog/回归修复） | eb36196…c40c466 |
+| W2 Android 系统层 | 全部合入（7 修复+工作日志，窗口完成） | eb36196…72fd179 |
+| W3 网络基础设施 | 合入（共享 http 连接池；含与主线同步） | 4d1bdcb、4d17430 |
+| W4 Agent 智能层 | 合入（TOP-K/意图捷径/events 停写） | 244d6c4 |
+| W5 锁与后台任务 | 合入（锁语义+后台任务修复；其分支已自同步主线故零冲突） | 07ce91a |
+| W6 真机测量 | 基线数字已采集（见下表与 docs/acceptance.md），分支待提交 | — |
+| W7 集成与清理 | 本状态列、architecture.md 天花板节、残壳目录删除、work log | 3310c68…ddf8843 |
+
 ## 实测数字（2026-10-18，本机 macOS 临时库，可重复）
 
 | 测量 | 结果 |
@@ -25,6 +39,18 @@
 | /v1/state 载荷（按 API 上限） | ~118 KB/次刷新 |
 | 每次 Store 操作固定成本 | ~0.5ms（一操作一连接的连接建立为主体） |
 | 供应商首 token（历史实测，docs/acceptance.md） | 千问 1547/3235ms；账号链 2922/2187ms；火山 TTS 首块 734ms、ASR 首字 1750ms |
+
+W6 真机基线数字（K70 4fb3c538 / Android 16，**性能修复合入前的基线构建**，详见 docs/acceptance.md 的 W6 节）：
+
+| 测量 | 结果 |
+| --- | --- |
+| 冷启动（5 次 force-stop 后 am start -W） | 390–433ms，**中位 406ms** |
+| 热启动（5 次） | 49–68ms，**中位 55ms** |
+| gfxinfo 静置 30s（对话页前台） | 1204 帧 ≈ 40fps 常驻渲染（orb 动画动态证据）；Janky 0.50%，P95 12ms |
+| gfxinfo 快速切 tab（30s 87 次） | Janky **0.00%**，P95 7ms——整屏重建在该机型未见掉帧，卡顿结论需重新归因 |
+| 会议字幕滚动帧统计 | **未采集**：无已连接 Rise 耳机，录音入口被拦截，待耳机就绪复测 |
+| 语音首响分段（合成 5.71s 输入，measured 日志） | asr 1775 / business 2069 / turn 3851 / tts 1767ms；其中**约 1.1s 为上传节流纯等待**（合入修复后应消失） |
+| Qwen 实时账号链（--live --account 成功轮） | 发送 end 后首包 **1652ms**；另有两轮 502 复现未定位（脱敏无日志） |
 
 ## 问题清单（按窗口分组，file:line 为审计时行号，可能有 ±10 行漂移）
 
