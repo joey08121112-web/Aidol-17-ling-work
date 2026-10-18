@@ -839,3 +839,16 @@ Android `testDebugUnitTest lintDebug assembleDebug` 成功：159项单测，零�
 - 软件验证：JBR 21.0.11／SDK 35 执行 Android `testDebugUnitTest lintDebug assembleDebug` 成功，283 项单测通过，Lint 0 errors／28 warnings；Python 离线 623 passed／1 warning，compileall 通过。证据及候选 APK 在忽略目录 `artifacts/life-settings-fix/`：`baseline-regression.log`、`fixed-regression-final.log`、`android-checks.log`、`pytest.log` 与 `screenshots/`。
 - 合并前同步 `origin/main` 的工作／通勤更新 `9b4cc80`，保留双方交接文档后在组合版本复验：Android 296 项单测、Lint 0 errors／31 warnings、debug 构建通过；Python 641 passed／1 warning、compileall 通过；同一生活原生 UI 回归再次通过（`merged-regression.log`、`merged-screenshots/`）。本次修复相对于该主分支仍仅改两个 Android 文件及两份文档。
 - 本轮仅离线结果注入及模拟器 UI；没有模型、录音或供应商 API 请求，没有安装至 USB 真机、更新公网 APK 或部署服务，Rise 听音／锁屏等硬件验收仍待实机完成。
+
+
+## 2026-10-18 独立操作并行、保留原任务（本地）
+
+- MainActivity 普通请求改为按资源排队、跨资源并行；查询/纪要整理不再占用全页 busy。切换页面保留正在处理的会话；真正占用麦克风或音频输出的操作仍互斥。后台完成不把用户切回旧页，同一会议/行动项防重复提交，清空/注销前保护尚未保存的写入。
+- 行动清单支持不同任务独立保存；地址查询与通勤启停分开调度，同一次通勤的开始、结束依次完成。补充账号、请求版本、输入和弹窗存活检查，旧查询/状态快照不能覆盖新修改；密码更新时清理旧请求状态，避免刷新标志残留。
+- 后端地图、搜索、历史纪要与回忆的网络等待移出账号语音锁，任务 CRUD 使用短事务。相同来源的历史整理共享模型生成；落库前原子校验原文，清空、删除、修正、注销之后迟到结果不能恢复旧数据。保留鉴权、配额、并发上限和语音会话锁。
+- 新增设置 PATCH 只合并修改字段，保留 PUT。Android 仅在旧服务明确返回404/405时，固定同一凭据读取最新设置、合并后PUT；401/409/500和不确定的网络失败不重放写请求，设置队列不锁住其他功能。
+- 验证：Python完整测试673 passed（含26项新增HTTP并发回归），compileall通过；Android310项单测零失败，lint 0 errors／32 warnings，debug及测试APK构建成功。新模拟服务测试未调用模型或地图供应商。
+- 荣耀 ANN-AN00 / Android15 真机隔离夹具通过：慢纪要期间任务PATCH/刷新/导航继续，原任务随后成功；同资源FIFO及跨资源并行；旧快照、旧账号回调被忽略；未启动的真实HostedSession切页后保留；现代设置PATCH与旧服务405回退走真实HTTP并保留其他设置。没有测试真实收音/来电。
+- 工作/通勤原生UI回归通过：勾选与迟到回包不移动滚动位置，工作分区缓存、会议地址重试显示、地图预览和目的地天气正常。真机测试使用隔离数据；最终卸载测试包、恢复本地端口映射并打开App。已核对安装包与构建SHA-256一致：`7de5774fcd20282a2e3d0ee5ccc4b1133710d6ac8cd55a3addd86e0db0a50062`。
+- 当前手机使用USB_LOCAL（无线ADB反向端口到本机8109），本地后端已平滑重启并健康检查200/ready。远端服务尚未部署本次并发修改，仍待服务器SSH管理访问；本次没有GitHub推送或云数据迁移。保留工作区原有viaim字标修改，本提交不包含该独立改动。
+- 日志保存在workspace的work目录：`operation-concurrency-backend-check.log`、`operation-concurrency-android-final.log`、`operation-concurrency-device-final.log`、`operation-concurrency-work-ui-check.log`；可安装APK同步至outputs/aidol-latest.apk。

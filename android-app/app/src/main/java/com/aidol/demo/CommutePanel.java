@@ -25,13 +25,20 @@ final class CommutePanel implements AutoCloseable {
     private final Permission permission;
     private final Runnable started, runningChanged;
     private final Handler ui = new Handler(Looper.getMainLooper());
-    private final ExecutorService network = Executors.newSingleThreadExecutor();
+    private final KeyedExecutor network = new KeyedExecutor(3);
+    // Slow map searches have separate workers so they cannot occupy commute-control slots.
+    private final ExecutorService queries = Executors.newFixedThreadPool(3);
     private final ArrayList<Dialog> dialogs = new ArrayList<>();
     private JSONArray addresses = new JSONArray();
     private JSONObject journey = new JSONObject(), origin, destination;
     private String originMode = "gps", transport = "driving", account = "", notice = "";
-    private boolean loading, loaded, closed, mutating, lastRunning;
-    private long generation;
+    private boolean loading, loaded, mutating, stopping, lastRunning;
+    private volatile boolean closed;
+    private volatile long generation;
+    private long addressesVersion, journeyVersion;
+    private int addressWrites;
+    private boolean addressesNeedReload, addressRefreshInFlight;
+    private String pendingJourneyId = "";
     private Runnable permissionAction;
     private LinearLayout summary, addressRows;
     private TextView originButton, destinationButton, transportButton, startButton, endButton, navigationButton, navigationHint, status;
@@ -95,19 +102,31 @@ final class CommutePanel implements AutoCloseable {
         Dialog dialog = sheet(title, body, footer); button(footer, "知道了", true, dialog::dismiss);
     }
     private void execute(Job job, Result result, TextView progress) {
-        ApiClient api = client.get(); String token = api.vault.token(); long current = generation;
+        execute(null, job, result, progress, () -> {}, () -> true);
+    }
+    private void query(Job job, Result result, TextView progress, BooleanSupplier relevant) {
+        execute(null, job, result, progress, () -> {}, relevant);
+    }
+    private void execute(String key, Job job, Result result, TextView progress, Runnable failed) {
+        execute(key, job, result, progress, failed, () -> true);
+    }
+    private void execute(String key, Job job, Result result, TextView progress, Runnable failed, BooleanSupplier relevant) {
+        ApiClient api = client.get(); if (api == null) return;
+        String token = api.vault.token(); long current = generation;
         if (token.isEmpty() || closed) return;
         if (progress != null) progress.setText("正在处理…");
-        network.execute(() -> {
+        Runnable work = () -> {
+            if (!current(api, token, current)) return;
             try {
                 JSONObject value = job.run(api);
-                ui.post(() -> { if (!current(api, token, current)) return; try { result.accept(value); } catch (Exception e) { fail("操作未完成，请重试", progress); } });
+                ui.post(() -> { if (!current(api, token, current) || !relevant.getAsBoolean()) return; try { result.accept(value); } catch (Exception e) { failed.run(); fail("操作未完成，请重试", progress); } });
             } catch (Exception e) { String message = e instanceof ApiClient.ApiException ? e.getMessage() : "连接失败，请检查网络后重试";
-                ui.post(() -> { if (current(api, token, current)) fail(message, progress); }); }
-        });
+                ui.post(() -> { if (current(api, token, current) && relevant.getAsBoolean()) { failed.run(); fail(message, progress); } }); }
+        };
+        if (key == null) queries.execute(work); else network.execute(CommuteService.owner(api) + ":" + key, work);
     }
     private boolean current(ApiClient api, String token, long current) { return !closed && generation == current && api == client.get() && token.equals(api.vault.token()); }
-    private void fail(String message, TextView progress) { mutating = false; loading = false; notice = message; if (progress != null) progress.setText(message); update(); }
+    private void fail(String message, TextView progress) { if (progress == null || progress == status) notice = message; if (progress != null) progress.setText(message); update(); }
     void resume() {
         if (closed || client.get() == null) return;
         String owner = CommuteService.owner(client.get());
@@ -117,9 +136,11 @@ final class CommutePanel implements AutoCloseable {
     }
     void pause() { ui.removeCallbacks(tick); mapPanel.pause(); }
     void pauseMap() { mapPanel.pause(); }
+    boolean hasPendingMutations() { return mutating || addressWrites > 0; }
     private void load() {
         loading = true;
-        execute(api -> {
+        long addressRead = addressesVersion, journeyRead = journeyVersion;
+        execute("commute", api -> {
             String pending = CommuteService.pendingStop(activity, api);
             if (!pending.isEmpty()) {
                 try { api.json("DELETE", "/v1/commute/" + pending, null); }
@@ -129,12 +150,15 @@ final class CommutePanel implements AutoCloseable {
             JSONObject data = api.json("GET", "/v1/saved-addresses", null);
             data.put("journey", api.json("GET", "/v1/commute", null)); return data;
         }, data -> {
-            loading = false; loaded = true; addresses = data.getJSONArray("addresses"); journey = data.optJSONObject("journey");
+            loading = false; loaded = true;
+            if (addressRead == addressesVersion && addressWrites == 0) addresses = data.getJSONArray("addresses");
+            else addressesNeedReload = true;
+            if (journeyRead == journeyVersion) journey = data.optJSONObject("journey");
             if (journey == null) journey = new JSONObject();
-            if (journey.optBoolean("active")) {
+            if (journeyRead == journeyVersion && journey.optBoolean("active")) {
                 originMode = journey.optString("origin_mode", "gps"); origin = journey.optJSONObject("origin");
                 destination = journey.optJSONObject("destination"); transport = journey.optString("transport", "driving");
-            } else if (destination == null) {
+            } else if (journeyRead == journeyVersion && destination == null) {
                 JSONObject settings = appState.get().optJSONObject("settings");
                 if (settings != null && !settings.isNull("destination_lon") && settings.has("destination_lon")) {
                     destination = new JSONObject().put("name", settings.optString("destination_name", "目的地")).put("address", settings.optString("destination_name", "目的地"))
@@ -142,8 +166,19 @@ final class CommutePanel implements AutoCloseable {
                     transport = settings.optString("transport", "driving");
                 }
             }
-            update(); renderAddressRows();
-        }, status);
+            update(); renderAddressRows(); refreshAddressesIfIdle();
+        }, status, () -> loading = false);
+    }
+    private void refreshAddressesIfIdle() {
+        if (!addressesNeedReload || addressRefreshInFlight || addressWrites > 0 || closed) return;
+        addressRefreshInFlight = true; long version = addressesVersion;
+        execute("addresses-read", api -> api.json("GET", "/v1/saved-addresses", null), data -> {
+            addressRefreshInFlight = false;
+            if (version == addressesVersion && addressWrites == 0) {
+                addresses = data.getJSONArray("addresses"); addressesNeedReload = false; renderAddressRows();
+            }
+            refreshAddressesIfIdle();
+        }, null, () -> addressRefreshInFlight = false);
     }
     private final Runnable tick = new Runnable() { public void run() {
         if (closed || !visible.getAsBoolean()) return;
@@ -157,12 +192,13 @@ final class CommutePanel implements AutoCloseable {
         pageScroll = scroll; resume();
         mapPanel.renderMap(parent);
         LinearLayout plan = card(parent);
-        originButton = compactButton(plan, "", () -> { if (editable()) choosePlace(true, p -> { origin = p; originMode = p == null ? "gps" : "fixed"; update(); }); });
-        destinationButton = compactButton(plan, "", () -> { if (editable()) choosePlace(false, p -> { destination = p; update(); }); });
+        originButton = compactButton(plan, "", () -> { if (editable()) choosePlace(true, p -> { journeyVersion++; origin = p; originMode = p == null ? "gps" : "fixed"; update(); }); });
+        destinationButton = compactButton(plan, "", () -> { if (editable()) choosePlace(false, p -> { journeyVersion++; destination = p; update(); }); });
         transportButton = compactButton(plan, "", () -> {
             if (!editable()) return;
             String[] keys = {"driving", "walking", "transit", "bicycling"};
-            RoundedChoiceDialog dialog = new RoundedChoiceDialog(activity, "出行方式", "选择此次路线的计算方式。", new String[]{"驾车", "步行", "公共交通", "骑行"}, Arrays.asList(keys).indexOf(transport), "确定", at -> { transport = keys[at]; update(); }); track(dialog); dialog.show();
+            long editorGeneration = generation;
+            RoundedChoiceDialog dialog = new RoundedChoiceDialog(activity, "出行方式", "选择此次路线的计算方式。", new String[]{"驾车", "步行", "公共交通", "骑行"}, Arrays.asList(keys).indexOf(transport), "确定", at -> { if (editorGeneration == generation && editable()) { journeyVersion++; transport = keys[at]; update(); } }); track(dialog); dialog.show();
         });
         navigationButton = button(plan, "打开高德导航", true, this::openNavigation);
         navigationHint = text(plan, "", 12, EditorUi.MUTED);
@@ -191,7 +227,8 @@ final class CommutePanel implements AutoCloseable {
         transportButton.setText("出行方式  ·  " + methodName(transport));
         boolean running = CommuteService.running(client.get()), active = journey.optBoolean("active");
         startButton.setText(running ? "立即更新路线" : active ? "继续通勤" : "开始通勤"); startButton.setEnabled(!mutating);
-        endButton.setVisibility(active || running ? View.VISIBLE : View.GONE);
+        endButton.setVisibility(active || running || !pendingJourneyId.isEmpty() ? View.VISIBLE : View.GONE);
+        endButton.setEnabled(!stopping);
         updateNavigation(active, running);
         status.setText(!notice.isEmpty() ? notice : running ? CommuteService.status(client.get()) : active ? "后台定位已暂停，请点继续通勤" : "选择起终点后开始通勤");
         mapPanel.update(originMode, origin, destination, transport, journey);
@@ -283,10 +320,12 @@ final class CommutePanel implements AutoCloseable {
         withPermission(true, () -> {
             if (!visible.getAsBoolean()) return;
             if (journey.optBoolean("active")) { launch(journey); return; }
-            mutating = true;
-            JSONObject body = new JSONObject(); put(body, "journey_id", UUID.randomUUID().toString()); put(body, "origin_mode", originMode);
-            put(body, "origin", "fixed".equals(originMode) ? origin : JSONObject.NULL); put(body, "destination", destination); put(body, "transport", transport);
-            execute(api -> {
+            if (mutating) return;
+            mutating = true; long version = ++journeyVersion;
+            pendingJourneyId = UUID.randomUUID().toString();
+            JSONObject body = new JSONObject(); put(body, "journey_id", pendingJourneyId); put(body, "origin_mode", originMode);
+            put(body, "origin", "fixed".equals(originMode) ? copy(origin) : JSONObject.NULL); put(body, "destination", copy(destination)); put(body, "transport", transport); update();
+            execute("commute", api -> {
                 String pending = CommuteService.pendingStop(activity, api);
                 if (!pending.isEmpty()) {
                     try { api.json("DELETE", "/v1/commute/" + pending, null); }
@@ -294,31 +333,37 @@ final class CommutePanel implements AutoCloseable {
                     CommuteService.clearPendingStop(activity, api, pending);
                 }
                 return api.json("POST", "/v1/commute", body);
-            }, value -> { mutating = false; journey = value; started.run(); launch(value); }, status);
+            }, value -> { mutating = false; pendingJourneyId = ""; journeyVersion++; journey = value; started.run(); launch(value); }, status,
+                () -> { mutating = false; pendingJourneyId = ""; journeyVersion++; }, () -> version == journeyVersion);
         });
     }
     private void launch(JSONObject value) {
         if (!visible.getAsBoolean()) { notice = "请回到 App 后点击继续通勤"; update(); return; }
-        try { CommuteService.start(activity, value); notice = "正在开启通勤服务…"; ui.postDelayed(() -> { notice = CommuteService.running(client.get()) ? "" : "请检查系统定位开关和权限，再继续通勤"; update(); runningChanged.run(); }, 1000); }
+        ApiClient api = client.get(); String token = api.vault.token(); long current = generation, version = journeyVersion;
+        try { CommuteService.start(activity, value); notice = "正在开启通勤服务…"; ui.postDelayed(() -> { if (!current(api, token, current) || version != journeyVersion) return; notice = CommuteService.running(client.get()) ? "" : "请检查系统定位开关和权限，再继续通勤"; update(); runningChanged.run(); }, 1000); }
         catch (RuntimeException error) { notice = "通勤服务未能启动，请检查定位权限后重试"; update(); }
     }
     void stop() {
+        if (stopping || closed || client.get() == null) return;
         if (navigationFallback != null) navigationFallback.dismiss();
         notice = "通勤已结束";
         if (CommuteService.running(client.get())) CommuteService.stop(activity);
-        String id = journey.optString("id"); put(journey, "active", false); update();
+        String id = pendingJourneyId.isEmpty() ? journey.optString("id") : pendingJourneyId;
+        long version = ++journeyVersion; pendingJourneyId = ""; stopping = mutating = !id.isEmpty();
+        put(journey, "active", false); update();
         if (!id.isEmpty()) {
             CommuteService.queueStop(activity, client.get(), id);
-            execute(api -> {
+            execute("commute", api -> {
                 JSONObject value;
                 try { value = api.json("DELETE", "/v1/commute/" + id, null); }
                 catch (ApiClient.ApiException missing) { if (missing.status != 404) throw missing; value = new JSONObject(); }
                 CommuteService.clearPendingStop(activity, api, id); return value;
-            }, value -> { journey = value; notice = "通勤已结束"; update(); }, status);
+            }, value -> { stopping = mutating = false; journeyVersion++; journey = value; notice = "通勤已结束"; update(); }, status,
+                () -> { stopping = mutating = false; journeyVersion++; }, () -> version == journeyVersion);
         }
         runningChanged.run();
     }
-    void modeChanged(String mode) { if (!"commute".equals(mode) && (journey.optBoolean("active") || CommuteService.running(client.get()))) stop(); }
+    void modeChanged(String mode) { if (!"commute".equals(mode) && (journey.optBoolean("active") || !pendingJourneyId.isEmpty() || CommuteService.running(client.get()))) stop(); }
     void addressBook() {
         resume(); LinearLayout body = EditorUi.column(activity), footer = EditorUi.column(activity);
         text(body, "家、公司、学校和自定义地点。地址定位一次后保存坐标，下次直接选用。", 13, EditorUi.MUTED);
@@ -337,7 +382,11 @@ final class CommutePanel implements AutoCloseable {
     }
     private void editAddress(JSONObject existing) {
         if (!allowed.getAsBoolean()) return;
+        ApiClient editorApi = client.get(); String editorToken = editorApi.vault.token(); long editorGeneration = generation;
+        BooleanSupplier editorCurrent = () -> current(editorApi, editorToken, editorGeneration);
         LinearLayout body = EditorUi.column(activity), footer = EditorUi.column(activity);
+        Dialog[] editorRef = new Dialog[1]; long[] searchVersion = {0};
+        String addressId = existing == null ? UUID.randomUUID().toString() : existing.optString("id");
         String[] tag = {existing == null ? "home" : existing.optString("tag", "custom")};
         if (existing == null) { for (int i = 0; i < addresses.length(); i++) if ("home".equals(addresses.optJSONObject(i).optString("tag"))) tag[0] = "custom"; }
         EditText name = EditorUi.input(activity, body, "名称", existing == null ? tagName(tag[0]) : existing.optString("name"), false);
@@ -352,67 +401,94 @@ final class CommutePanel implements AutoCloseable {
         JSONObject[] resolved = {existing == null ? null : copy(existing)};
         TextView progress = text(body, existing == null ? "填写后点击定位地址，再确认保存。" : "已保存坐标；不修改地址即可直接保存。", 12, EditorUi.MUTED);
         TextWatcher changed = new TextWatcher() {
-            public void beforeTextChanged(CharSequence s, int start, int count, int after) {} public void onTextChanged(CharSequence s, int start, int before, int count) { resolved[0] = null; progress.setText("地址已修改，请重新定位后保存"); } public void afterTextChanged(Editable e) {}
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {} public void onTextChanged(CharSequence s, int start, int before, int count) { searchVersion[0]++; resolved[0] = null; progress.setText("地址已修改，请重新定位后保存"); } public void afterTextChanged(Editable e) {}
         }; city.addTextChangedListener(changed); address.addTextChangedListener(changed);
         Consumer<JSONObject> selected = point -> { city.setText(point.optString("city")); address.setText(point.optString("address")); resolved[0] = copy(point); progress.setText("已定位：" + point.optString("address") + "\n确认无误后保存。"); };
         button(body, "定位地址", false, () -> {
             String cityValue = city.getText().toString().trim(), value = address.getText().toString().trim();
             if (value.isEmpty() || cityValue.isEmpty()) { progress.setText("请填写城市和详细地址"); return; }
-            execute(api -> api.json("GET", "/v1/maps/geocode?address=" + Uri.encode(value) + "&city=" + Uri.encode(cityValue), null), data -> {
-                if (!value.equals(address.getText().toString().trim()) || !cityValue.equals(city.getText().toString().trim())) return;
+            long request = ++searchVersion[0];
+            BooleanSupplier relevant = () -> editorRef[0] != null && editorRef[0].isShowing() && request == searchVersion[0];
+            query(api -> api.json("GET", "/v1/maps/geocode?address=" + Uri.encode(value) + "&city=" + Uri.encode(cityValue), null), data -> {
                 JSONArray values = data.optJSONArray("places"); if (values == null || values.length() == 0) { progress.setText(data.optString("reason", "未找到地址，请补充具体位置")); return; }
-                if (values.length() == 1) selected.accept(values.getJSONObject(0)); else pointResults("确认地址", values, selected);
-            }, progress);
+                if (values.length() == 1) selected.accept(values.getJSONObject(0)); else pointResults("确认地址", values, p -> { if (relevant.getAsBoolean()) selected.accept(p); });
+            }, progress, relevant);
         });
-        button(body, "使用当前位置", false, () -> withPermission(false, () -> execute(api -> {
-            JSONObject fix = MeetingStartLocation.capture(activity, api, visible);
-            LocationSnapshot snap = fix == null ? null : LocationSnapshot.parse(fix.toString());
-            if (snap == null || !snap.usable(System.currentTimeMillis(), 120_000)) throw new ApiClient.ApiException(422, "暂未获得近期定位，请检查系统定位开关后重试");
-            return api.json("POST", "/v1/maps/reverse", fix);
-        }, data -> { if (data.optBoolean("available")) selected.accept(data); else progress.setText(data.optString("reason", "未能识别当前位置")); }, progress)));
+        button(body, "使用当前位置", false, () -> withPermission(false, () -> {
+            if (editorRef[0] == null || !editorRef[0].isShowing()) return;
+            long request = ++searchVersion[0];
+            query(api -> {
+                JSONObject fix = MeetingStartLocation.capture(activity, api, visible);
+                LocationSnapshot snap = fix == null ? null : LocationSnapshot.parse(fix.toString());
+                if (snap == null || !snap.usable(System.currentTimeMillis(), 120_000)) throw new ApiClient.ApiException(422, "暂未获得近期定位，请检查系统定位开关后重试");
+                return api.json("POST", "/v1/maps/reverse", fix);
+            }, data -> { if (data.optBoolean("available")) selected.accept(data); else progress.setText(data.optString("reason", "未能识别当前位置")); }, progress,
+                () -> editorRef[0].isShowing() && request == searchVersion[0]);
+        }));
         Dialog editor = sheet(existing == null ? "添加常用地址" : "编辑常用地址", body, footer);
-        button(footer, "保存地址", true, () -> {
-            if (mutating || resolved[0] == null) { progress.setText("请先定位地址并确认位置"); return; }
+        editorRef[0] = editor;
+        TextView saveAddress = button(footer, "保存地址", true, () -> {});
+        saveAddress.setOnClickListener(v -> {
+            if (!saveAddress.isEnabled() || !editorCurrent.getAsBoolean()) return;
+            if (resolved[0] == null) { progress.setText("请先定位地址并确认位置"); return; }
             String title = name.getText().toString().trim(); if (title.isEmpty()) { name.setError("请输入名称"); return; }
             JSONObject payload = copy(resolved[0]); put(payload, "name", title); put(payload, "tag", tag[0]);
-            String id = existing == null ? UUID.randomUUID().toString() : existing.optString("id"); mutating = true;
-            execute(api -> api.json("PUT", "/v1/saved-addresses/" + id, payload), saved -> {
-                mutating = false; JSONArray next = new JSONArray(); boolean replaced = false;
-                for (int i = 0; i < addresses.length(); i++) { JSONObject old = addresses.getJSONObject(i); boolean match = id.equals(old.optString("id")); next.put(match ? saved : old); replaced |= match; }
-                if (!replaced) next.put(saved); addresses = next; editor.dismiss(); renderAddressRows();
-            }, progress);
+            saveAddress.setEnabled(false); addressesVersion++; addressWrites++;
+            execute("address:" + addressId, api -> api.json("PUT", "/v1/saved-addresses/" + addressId, payload), saved -> {
+                addressesVersion++; JSONArray next = new JSONArray(); boolean replaced = false;
+                for (int i = 0; i < addresses.length(); i++) { JSONObject old = addresses.getJSONObject(i); boolean match = addressId.equals(old.optString("id")); next.put(match ? saved : old); replaced |= match; }
+                if (!replaced) next.put(saved); addresses = next; editor.dismiss(); renderAddressRows(); addressWrites--; refreshAddressesIfIdle();
+            }, progress, () -> { addressesVersion++; addressWrites--; saveAddress.setEnabled(true); refreshAddressesIfIdle(); });
         });
         if (existing != null) button(footer, "删除地址", false, () -> {
             LinearLayout confirmBody = EditorUi.column(activity), confirmFooter = EditorUi.column(activity); text(confirmBody, "删除“" + existing.optString("name") + "”？已开始的通勤会保留本次地址。", 14, EditorUi.INK);
             Dialog confirm = sheet("删除常用地址", confirmBody, confirmFooter);
-            button(confirmFooter, "删除", true, () -> execute(api -> api.json("DELETE", "/v1/saved-addresses/" + existing.optString("id"), null), saved -> {
+            TextView deleteAddress = button(confirmFooter, "删除", true, () -> {});
+            deleteAddress.setOnClickListener(v -> {
+                if (!deleteAddress.isEnabled() || !editorCurrent.getAsBoolean()) return;
+                deleteAddress.setEnabled(false); addressesVersion++; addressWrites++;
+                execute("address:" + addressId, api -> api.json("DELETE", "/v1/saved-addresses/" + addressId, null), saved -> {
+                addressesVersion++;
                 JSONArray next = new JSONArray(); for (int i = 0; i < addresses.length(); i++) if (!existing.optString("id").equals(addresses.getJSONObject(i).optString("id"))) next.put(addresses.getJSONObject(i));
-                addresses = next; confirm.dismiss(); editor.dismiss(); renderAddressRows();
-            }, progress)); button(confirmFooter, "取消", false, confirm::dismiss);
+                addresses = next; confirm.dismiss(); editor.dismiss(); renderAddressRows(); addressWrites--; refreshAddressesIfIdle();
+                }, progress, () -> { addressesVersion++; addressWrites--; deleteAddress.setEnabled(true); refreshAddressesIfIdle(); });
+            }); button(confirmFooter, "取消", false, confirm::dismiss);
         });
         button(footer, "取消", false, editor::dismiss);
     }
     private void choosePlace(boolean start, Consumer<JSONObject> chosen) {
         LinearLayout body = EditorUi.column(activity), footer = EditorUi.column(activity);
         Dialog dialog = sheet(start ? "选择起点" : "选择目的地", body, footer);
-        if (start) option(body, "当前位置", "随手机位置自动更新", "gps".equals(originMode), () -> { chosen.accept(null); dialog.dismiss(); });
+        ApiClient editorApi = client.get(); String editorToken = editorApi.vault.token(); long editorGeneration = generation;
+        BooleanSupplier editorCurrent = () -> dialog.isShowing() && current(editorApi, editorToken, editorGeneration);
+        Consumer<JSONObject> select = point -> { if (editorCurrent.getAsBoolean() && editable()) { chosen.accept(point); dialog.dismiss(); } };
+        if (start) option(body, "当前位置", "随手机位置自动更新", "gps".equals(originMode), () -> select.accept(null));
         JSONObject current = start ? origin : destination;
         for (int i = 0; i < addresses.length(); i++) {
             JSONObject p = addresses.optJSONObject(i); if (p == null) continue;
-            option(body, tagName(p.optString("tag")) + " · " + p.optString("name"), p.optString("address"), samePoint(current, p), () -> { chosen.accept(copy(p)); dialog.dismiss(); });
+            option(body, tagName(p.optString("tag")) + " · " + p.optString("name"), p.optString("address"), samePoint(current, p), () -> select.accept(copy(p)));
         }
         text(body, "搜索其他地址", 16, EditorUi.INK);
         EditText city = EditorUi.input(activity, body, "城市", current == null ? "" : current.optString("city"), false);
         EditText query = EditorUi.input(activity, body, "地址或地点名称", "", false);
+        long[] searchVersion = {0};
+        TextWatcher changed = new TextWatcher() {
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            public void onTextChanged(CharSequence s, int start, int before, int count) { searchVersion[0]++; }
+            public void afterTextChanged(Editable e) {}
+        };
+        city.addTextChangedListener(changed); query.addTextChangedListener(changed);
         TextView progress = text(body, "常用地址直接复用已保存坐标。", 12, EditorUi.MUTED);
         button(body, "查找地址", false, () -> {
             String value = query.getText().toString().trim(), cityValue = city.getText().toString().trim();
             if (value.isEmpty() || cityValue.isEmpty()) { progress.setText("请填写城市和地址"); return; }
-            execute(api -> api.json("GET", "/v1/maps/geocode?address=" + Uri.encode(value) + "&city=" + Uri.encode(cityValue), null), data -> {
+            long request = ++searchVersion[0];
+            BooleanSupplier relevant = () -> editorCurrent.getAsBoolean() && request == searchVersion[0];
+            query(api -> api.json("GET", "/v1/maps/geocode?address=" + Uri.encode(value) + "&city=" + Uri.encode(cityValue), null), data -> {
                 JSONArray results = data.optJSONArray("places");
                 if (results == null || results.length() == 0) { progress.setText(data.optString("reason", "未找到地址")); return; }
-                pointResults("选择地址", results, point -> { put(point, "name", value); chosen.accept(copy(point)); dialog.dismiss(); });
-            }, progress);
+                pointResults("选择地址", results, point -> { if (relevant.getAsBoolean()) { put(point, "name", value); select.accept(copy(point)); } });
+            }, progress, relevant);
         });
         button(footer, "取消", false, dialog::dismiss);
     }
@@ -474,25 +550,29 @@ final class CommutePanel implements AutoCloseable {
         renderDrafts(rows, appState.get().optJSONArray("drafts"), progress);
         execute(api -> api.json("GET", "/v1/drafts", null), value -> { JSONArray drafts = value.optJSONArray("drafts"); put(appState.get(), "drafts", drafts); renderDrafts(rows, drafts, progress); }, null);
         Dialog dialog = sheet("到达提醒与草稿", body, footer);
-        button(footer, "保存偏好", true, () -> {
+        TextView save = button(footer, "保存偏好", true, () -> {});
+        save.setOnClickListener(view -> {
+            if (!save.isEnabled()) return;
             int m; try { m = Integer.parseInt(minutes.getText().toString()); if (m < 1 || m > 60) throw new NumberFormatException(); } catch (Exception e) { minutes.setError("请输入1–60"); return; }
-            JSONObject payload = copy(appState.get().optJSONObject("settings")); put(payload, "contact", contact.getText().toString().trim()); put(payload, "arrival_notice_minutes", m);
-            execute(api -> api.json("PUT", "/v1/settings", payload), value -> { put(appState.get(), "settings", value); dialog.dismiss(); }, progress);
+            JSONObject payload = new JSONObject(); put(payload, "contact", contact.getText().toString().trim()); put(payload, "arrival_notice_minutes", m);
+            save.setEnabled(false);
+            execute("settings", api -> api.patchSettings(payload), value -> { put(appState.get(), "settings", value); dialog.dismiss(); }, progress, () -> save.setEnabled(true));
         }); button(footer, "取消", false, dialog::dismiss);
     }
     private void renderDrafts(LinearLayout rows, JSONArray drafts, TextView progress) {
         rows.removeAllViews();
         if (drafts != null) for (int i = 0; i < drafts.length(); i++) { JSONObject draft = drafts.optJSONObject(i); if (draft == null || !"pending".equals(draft.optString("status"))) continue;
             LinearLayout row = card(rows); text(row, "给 " + draft.optString("contact"), 15, EditorUi.INK); text(row, draft.optString("text"), 14, EditorUi.INK);
-            button(row, "复制草稿", false, () -> { ((android.content.ClipboardManager)activity.getSystemService(Context.CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("到达提醒", draft.optString("text"))); execute(api -> api.json("POST", "/v1/drafts/" + draft.optString("id") + "/copied", new JSONObject()), v -> { row.setVisibility(View.GONE); put(draft, "status", "copied"); }, progress); });
-            button(row, "忽略", false, () -> execute(api -> api.json("POST", "/v1/drafts/" + draft.optString("id") + "/dismissed", new JSONObject()), v -> { row.setVisibility(View.GONE); put(draft, "status", "dismissed"); }, progress));
+            boolean[] pending = {false};
+            button(row, "复制草稿", false, () -> { if (pending[0]) return; pending[0] = true; ((android.content.ClipboardManager)activity.getSystemService(Context.CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("到达提醒", draft.optString("text"))); execute("draft:" + draft.optString("id"), api -> api.json("POST", "/v1/drafts/" + draft.optString("id") + "/copied", new JSONObject()), v -> { row.setVisibility(View.GONE); put(draft, "status", "copied"); }, progress, () -> pending[0] = false); });
+            button(row, "忽略", false, () -> { if (pending[0]) return; pending[0] = true; execute("draft:" + draft.optString("id"), api -> api.json("POST", "/v1/drafts/" + draft.optString("id") + "/dismissed", new JSONObject()), v -> { row.setVisibility(View.GONE); put(draft, "status", "dismissed"); }, progress, () -> pending[0] = false); });
         }
     }
     private void resetViews() {
         mapPanel.reset(); navigationOpenedAt = -2000;
-        generation++; loaded = loading = mutating = false; addresses = new JSONArray(); journey = new JSONObject(); origin = destination = null; originMode = "gps"; transport = "driving"; notice = ""; permissionAction = null; lastRender = "";
+        generation++; addressesVersion++; journeyVersion++; addressWrites = 0; addressesNeedReload = addressRefreshInFlight = false; pendingJourneyId = ""; loaded = loading = mutating = stopping = false; addresses = new JSONArray(); journey = new JSONObject(); origin = destination = null; originMode = "gps"; transport = "driving"; notice = ""; permissionAction = null; lastRender = "";
         for (Dialog dialog : new ArrayList<>(dialogs)) dialog.dismiss(); addressRows = null;
     }
     void reset() { CommuteService.stop(activity); resetViews(); account = ""; }
-    @Override public void close() { closed = true; pause(); mapPanel.close(); for (Dialog dialog : new ArrayList<>(dialogs)) dialog.dismiss(); network.shutdownNow(); }
+    @Override public void close() { closed = true; pause(); mapPanel.close(); for (Dialog dialog : new ArrayList<>(dialogs)) dialog.dismiss(); network.shutdownNow(); queries.shutdownNow(); }
 }

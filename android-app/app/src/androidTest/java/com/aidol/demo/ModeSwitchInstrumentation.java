@@ -59,7 +59,7 @@ public final class ModeSwitchInstrumentation extends Instrumentation {
             server = new MockWebServer(); server.setDispatcher(new Dispatcher() {
                 @Override public MockResponse dispatch(RecordedRequest request) {
                     try {
-                        if ("PUT".equals(request.getMethod()) && "/v1/settings".equals(request.getPath())) {
+                        if ("PATCH".equals(request.getMethod()) && "/v1/settings".equals(request.getPath())) {
                             puts.incrementAndGet(); int code = failureCode.getAndSet(0);
                             if (code != 0) return json(new JSONObject().put("detail", code==409?ModeChangeRetry.BUSY_DETAIL:"fixture failure")).setResponseCode(code);
                             return json(new JSONObject(request.getBody().readUtf8())).setBodyDelay(300, TimeUnit.MILLISECONDS);
@@ -106,7 +106,7 @@ public final class ModeSwitchInstrumentation extends Instrumentation {
             main(() -> { invoke(activity,"newSession"); check(((View)field(activity,"cancelButton")).getVisibility()==View.VISIBLE,"Real session lost its end control"); invoke(activity,"cancelSession", ""); });
             check(unexpected.get()==0,"Unexpected API request (capture/reply/location): " + unexpected.get());
             check(getTargetContext().getSystemService(AudioManager.class).getActiveRecordingConfigurations().isEmpty(),"Unexpected microphone recording");
-            result.putString("stream", "PASS: mounted root/page/history/input retained; draft, selection, focus and scroll stable; no playback/progress/hangup UI; seven full cues verified on Rise output; rapid replacement, 409 retry, 500 failure and real-session end control passed. Settings PUTs="+puts.get()+", verified_routes="+verifiedRoutes+", unexpected_requests="+unexpected.get());
+            result.putString("stream", "PASS: mounted root/page/history/input retained; draft, selection, focus and scroll stable; no playback/progress/hangup UI; seven full cues verified on Rise output; rapid replacement, 409 retry, 500 failure and real-session end control passed. Settings PATCHes="+puts.get()+", verified_routes="+verifiedRoutes+", unexpected_requests="+unexpected.get());
             outcome=Activity.RESULT_OK;
         } catch(Throwable error) { result.putString("stream","FAIL: "+android.util.Log.getStackTraceString(error)); }
         finally {
@@ -121,7 +121,7 @@ public final class ModeSwitchInstrumentation extends Instrumentation {
     }
     private void switchAndCheck(String mode, boolean screenshot) throws Exception {
         begin(mode); main(() -> stable(true));
-        // Repeated taps while PUT is pending remain quiet and do not create duplicate requests.
+        // Repeated taps while PATCH is pending remain quiet and do not create duplicate requests.
         begin(mode); main(() -> stable(true));
         long deadline=SystemClock.elapsedRealtime()+12000; boolean seen=false;
         while(SystemClock.elapsedRealtime()<deadline) {

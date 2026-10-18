@@ -297,6 +297,31 @@ def create_hosted_app(config=None, data_directory=None):
         return {'token': raw, 'expires_in': 30 * 86400,
                 'user': {key: found[key] for key in ('id', 'username', 'created_at')}}
 
+    def authorize_operation(current, request, billable=False):
+        found = accounts.authenticate(digest(token(request)))
+        if found is None or found['id'] != current['id']:
+            raise HTTPException(401, '登录已失效')
+        if billable and not accounts.consume('usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400):
+            raise HTTPException(429, '今日体验额度已用完，请明天再试')
+
+    @asynccontextmanager
+    async def independent_operation(current, request, billable=True):
+        """Bound provider work without taking ownership of the voice session.
+
+        Callers capture their input before awaiting, then validate private data
+        again before returning or committing. No agent mode/route is changed.
+        """
+        nonlocal active
+        if active >= 8:
+            raise HTTPException(503, '服务器正在处理较多请求，请稍后再试')
+        active += 1
+        try:
+            authorize_operation(current, request, billable)
+            yield
+            authorize_operation(current, request)
+        finally:
+            active -= 1
+
     @asynccontextmanager
     async def runtime(current, request, billable=False, wait_seconds=0):
         nonlocal active
@@ -425,21 +450,35 @@ def create_hosted_app(config=None, data_directory=None):
     @api.put('/v1/settings')
     async def mobile_settings(value: Settings, request: Request, current=Depends(user)):
         async with runtime(current, request) as rt:
-            # Android v1 is foreground-only; do not advertise background listening.
-            value.auto_mode = False
-            value.life_poll_enabled = False
-            value.provider = 'cascade'
-            old = rt.store.settings()
-            if any(getattr(old, key) != getattr(value, key) for key in ROUTE_FIELDS):
-                rt.agent.route, rt.agent.commute, rt.agent.last_route, rt.agent.last_notice = None, None, 0, 0
-            rt.store.save_settings(value)
-            if value.mode != 'commute':
-                journey = rt.store.commute_journey()
-                if journey.get('active'):
-                    rt.store.stop_commute(journey['id'])
-            rt.store.purge_work_audio()
-            await rt.agent.decide()
-            return value
+            return await apply_settings(rt, value)
+
+    @api.patch('/v1/settings')
+    async def patch_settings(value: dict, request: Request, current=Depends(user)):
+        # Validate after merging: a partial coordinate/time pair must be checked
+        # against the stored companion field, never the model's default value.
+        async with runtime(current, request, wait_seconds=2) as rt:
+            try:
+                merged = Settings.model_validate({**rt.store.settings().model_dump(), **value})
+            except ValueError:
+                raise HTTPException(422, '设置无效，请检查时间范围、坐标和填写内容') from None
+            return await apply_settings(rt, merged)
+
+    async def apply_settings(rt, value):
+        # Android v1 is foreground-only; do not advertise background listening.
+        value.auto_mode = False
+        value.life_poll_enabled = False
+        value.provider = 'cascade'
+        old = rt.store.settings()
+        if any(getattr(old, key) != getattr(value, key) for key in ROUTE_FIELDS):
+            rt.agent.route, rt.agent.commute, rt.agent.last_route, rt.agent.last_notice = None, None, 0, 0
+        rt.store.save_settings(value)
+        if value.mode != 'commute':
+            journey = rt.store.commute_journey()
+            if journey.get('active'):
+                rt.store.stop_commute(journey['id'])
+        rt.store.purge_work_audio()
+        await rt.agent.decide()
+        return value
 
     async def process(rt, current, request_id, fingerprint, text=None, pcm=None, interaction_source='ambient_capture', meeting_id=None, segment_index=None, offset_ms=None, recognize=True):
         with measured(request_id, 'turn'):
@@ -845,7 +884,7 @@ def create_hosted_app(config=None, data_directory=None):
     @api.get('/v1/search')
     async def mobile_search(request: Request, q: str = Query(min_length=1, max_length=500),
                             freshness: str = Query(default='noLimit', max_length=24), current=Depends(user)):
-        async with runtime(current, request, True):
+        async with independent_operation(current, request):
             try:
                 return await BochaSearch(config).search(q, freshness)
             except ValueError as error:
@@ -854,17 +893,17 @@ def create_hosted_app(config=None, data_directory=None):
     @api.get('/v1/maps/geocode')
     async def mobile_geocode(request: Request, address: str = Query(min_length=1, max_length=100),
                              city: str = Query(default='', max_length=80), current=Depends(user)):
-        async with runtime(current, request, True) as rt:
+        async with independent_operation(current, request):
             try:
-                return await rt.agent.maps.geocode(address, city)
+                return await MapService(config).geocode(address, city)
             except ValueError as error:
                 raise HTTPException(502, str(error))
 
     @api.post('/v1/maps/reverse')
     async def mobile_reverse(value: LocationInput, request: Request, current=Depends(user)):
-        async with runtime(current, request, True) as rt:
+        async with independent_operation(current, request):
             try:
-                return await rt.agent.maps.reverse(value)
+                return await MapService(config).reverse(value)
             except ValueError as error:
                 raise HTTPException(502, str(error))
 
@@ -914,15 +953,29 @@ def create_hosted_app(config=None, data_directory=None):
     async def mobile_recall(value: RecallRequest, request: Request, current=Depends(user)):
         if not value.question.strip():
             raise HTTPException(422, '请输入你想回忆的问题')
-        async with runtime(current, request, True) as rt:
-            memories, transcripts = rt.store.recall_records(value.question)
-            return await RecallService(config).answer(value.question, memories, transcripts)
+        async with independent_operation(current, request):
+            store = commute_store(current)
+            memories, transcripts = store.recall_records(value.question)
+            result = await RecallService(config).answer(value.question, memories, transcripts)
+            # Reauthenticate before touching a possibly deleted account file.
+            authorize_operation(current, request)
+            if not Path(store.path).exists():
+                raise HTTPException(409, '资料已更新，请重新查询')
+            fresh_memories, fresh_transcripts = store.recall_records(value.question)
+            before = {(kind, row['id']): row for kind, rows in
+                      (('memory', memories), ('transcript', transcripts)) for row in rows}
+            after = {(kind, row['id']): row for kind, rows in
+                     (('memory', fresh_memories), ('transcript', fresh_transcripts)) for row in rows}
+            if any(before.get((citation['kind'], citation['id'])) != after.get((citation['kind'], citation['id']))
+                   for citation in result['citations']):
+                raise HTTPException(409, '引用资料已变更，请重新查询')
+            return result
 
     @api.get('/v1/maps/search')
     async def mobile_places(request: Request, q: str = Query(min_length=1, max_length=100), city: str = Query(default='', max_length=80), current=Depends(user)):
-        async with runtime(current, request, True) as rt:
+        async with independent_operation(current, request):
             try:
-                return await rt.agent.maps.search(q, city)
+                return await MapService(config).search(q, city)
             except ValueError:
                 raise HTTPException(422, '地点关键词无效')
             except Exception:
@@ -1038,9 +1091,9 @@ def create_hosted_app(config=None, data_directory=None):
 
     @api.post('/v1/maps/nearby')
     async def mobile_nearby(value: NearbyInput, request: Request, current=Depends(user)):
-        async with runtime(current, request, True) as rt:
+        async with independent_operation(current, request):
             try:
-                return await rt.agent.maps.nearby(value, value.keyword, value.radius, value.metro_only)
+                return await MapService(config).nearby(value, value.keyword, value.radius, value.metro_only)
             except Exception:
                 raise HTTPException(502, '周边查询暂不可用，请稍后再试')
 
@@ -1057,16 +1110,17 @@ def create_hosted_app(config=None, data_directory=None):
 
     @api.get('/v1/maps/weather')
     async def mobile_weather(request: Request, city: str = Query(default='', pattern=r'^([0-9]{6})?$'), forecast: bool = False, current=Depends(user)):
-        async with runtime(current, request, True) as rt:
-            fix = rt.agent.location
+        async with independent_operation(current, request):
+            rt = runtimes.obtain(current['id'])
+            fix = dict(rt.agent.location) if rt.agent.location else None
             destination = None if city else commute_destination(
                 rt.store.settings(), (fix['longitude'], fix['latitude']) if fix else None)
             if destination is not None and not destination['target']:
                 raise HTTPException(422, destination['reason'] + '，再查询当地天气')
             try:
                 if city:
-                    return await rt.agent.maps.weather(city, forecast)
-                return await rt.agent.maps.weather_at(destination['longitude'], destination['latitude'], forecast)
+                    return await MapService(config).weather(city, forecast)
+                return await MapService(config).weather_at(destination['longitude'], destination['latitude'], forecast)
             except Exception:
                 raise HTTPException(502, '天气查询暂不可用，请稍后再试')
 
@@ -1437,22 +1491,53 @@ def create_hosted_app(config=None, data_directory=None):
             resume_work_summaries(background, current, [meeting])
             return meeting
 
+    history_jobs = {}
+
+    def release_history_job(key, job):
+        if job['waiters'] == 0 and job['task'].done() and history_jobs.get(key) is job:
+            history_jobs.pop(key, None)
+
     @api.post('/v1/meetings')
     async def mobile_meeting(value: MeetingRequest, request: Request, current=Depends(user)):
-        async with runtime(current, request, True) as rt:
+        async with independent_operation(current, request):
+            store = commute_store(current)
             cutoff = (datetime.now(timezone.utc) - timedelta(hours=value.hours)).isoformat()
-            rows = rt.store.meeting_records(cutoff)
+            rows = store.meeting_records(cutoff)
             if not rows:
                 raise HTTPException(422, '请先在工作模式记录会议，再生成纪要')
             signature = digest(json.dumps(rows, sort_keys=True, ensure_ascii=False))
-            old = rt.store.meeting_report(signature)
+            old = store.meeting_report(signature)
             if old:
                 return old
-            report = await MeetingInsights(config).generate(rows)
-            selected = set(report.get('source_ids', []))
-            report.update(sources=[row for row in reversed(rows) if row['id'] in selected],
-                          coverage=meeting_coverage(rows, report.get('source_ids', [])), hours=value.hours, includes_demo=False)
-            return rt.store.save_meeting_report(signature, report)
+            key = (current['id'], signature)
+            job = history_jobs.get(key)
+            if job is None:
+                if len(history_jobs) >= 8:
+                    raise HTTPException(503, '正在整理较多纪要，请稍后重试')
+                job = history_jobs[key] = {'task': asyncio.create_task(MeetingInsights(config).generate(rows)), 'waiters': 0}
+
+                def finished(task, key=key, job=job):
+                    if not task.cancelled():
+                        task.exception()  # Retrieve failures if every HTTP waiter disconnected.
+                    release_history_job(key, job)
+
+                job['task'].add_done_callback(finished)
+            job['waiters'] += 1
+            try:
+                # Duplicate requests share the model call; cancelling one waiter
+                # never cancels another operation or its pending result.
+                report = dict(await asyncio.shield(job['task']))
+                authorize_operation(current, request)
+                selected = set(report.get('source_ids', []))
+                report.update(sources=[row for row in reversed(rows) if row['id'] in selected],
+                              coverage=meeting_coverage(rows, report.get('source_ids', [])), hours=value.hours, includes_demo=False)
+                saved = store.save_meeting_report(signature, report, expected_sources=rows)
+                if saved is None:
+                    raise HTTPException(409, '会议原文已删除或修正，请重新选择范围生成纪要')
+                return saved
+            finally:
+                job['waiters'] -= 1
+                release_history_job(key, job)
 
     @api.get('/v1/tasks')
     async def all_tasks(current=Depends(user)):
@@ -1461,35 +1546,35 @@ def create_hosted_app(config=None, data_directory=None):
 
     @api.post('/v1/tasks')
     async def create_task(value: CustomTask, request: Request, current=Depends(user)):
-        async with runtime(current, request) as rt:
-            try:
-                return rt.store.create_action_task(value.task_id, value.content, value.owner.strip(),
-                    value.due_at.astimezone(timezone.utc).isoformat(), value.reminder_hours)
-            except ValueError as exc:
-                raise HTTPException(409, str(exc)) from None
+        authorize_operation(current, request)
+        try:
+            return commute_store(current).create_action_task(value.task_id, value.content, value.owner.strip(),
+                value.due_at.astimezone(timezone.utc).isoformat(), value.reminder_hours)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
 
     @api.put('/v1/tasks/{task_id}')
     async def edit_task(task_id: str, value: TaskEdit, request: Request, current=Depends(user)):
-        async with runtime(current, request) as rt:
-            task = rt.store.edit_action_task(task_id, value.content, value.owner, value.due,
-                value.due_at.astimezone(timezone.utc).isoformat() if value.due_at is not None else '', value.reminder_hours)
-            if task is None:
-                raise HTTPException(404, '待办不存在')
-            return task
+        authorize_operation(current, request)
+        task = commute_store(current).edit_action_task(task_id, value.content, value.owner, value.due,
+            value.due_at.astimezone(timezone.utc).isoformat() if value.due_at is not None else '', value.reminder_hours)
+        if task is None:
+            raise HTTPException(404, '待办不存在')
+        return task
 
     @api.delete('/v1/tasks/{task_id}')
     async def delete_task(task_id: str, request: Request, current=Depends(user)):
-        async with runtime(current, request) as rt:
-            if not rt.store.delete_action_task(task_id):
-                raise HTTPException(404, '待办不存在')
-            return {'ok': True}
+        authorize_operation(current, request)
+        if not commute_store(current).delete_action_task(task_id):
+            raise HTTPException(404, '待办不存在')
+        return {'ok': True}
 
     @api.patch('/v1/tasks/{task_id}')
     async def mobile_task(task_id: str, value: TaskStatusInput, request: Request, current=Depends(user)):
-        async with runtime(current, request) as rt:
-            if not rt.store.action_task_status(task_id, value.status):
-                raise HTTPException(404, '待办不存在')
-            return {'ok': True}
+        authorize_operation(current, request)
+        if not commute_store(current).action_task_status(task_id, value.status):
+            raise HTTPException(404, '待办不存在')
+        return {'ok': True}
 
     @api.get('/v1/export')
     async def mobile_export(request: Request, current=Depends(user)):
