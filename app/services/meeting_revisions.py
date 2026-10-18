@@ -156,34 +156,34 @@ class MeetingRevisions:
         rows = rows + report.get('revision_sources', []) + added
         messages = [{'role': 'system', 'content': PROMPT}, {'role': 'user', 'content': json.dumps(
             {'original': original, 'edited': edited, 'evidence': rows}, ensure_ascii=False)}]
-        async with httpx.AsyncClient(timeout=120, proxy=self.config.proxy) as client:
-            for attempt in range(2):
-                if not self.charge():
-                    raise MinutesFailure('quota_exceeded')
-                try:
-                    response = await client.post(self.config.text_url.rstrip('/') + '/chat/completions',
-                        headers={'Authorization': 'Bearer ' + self.config.text_key}, json={'model': self.config.text_model,
-                        'temperature': 0.1, 'max_tokens': 16000, 'thinking': {'type': 'disabled'},
-                        'response_format': {'type': 'json_object'}, 'messages': messages})
-                    response.raise_for_status()
-                    choice = response.json()['choices'][0]
-                    if choice.get('finish_reason') in ('length', 'content_filter'):
-                        raise MinutesFailure('output_truncated' if choice['finish_reason'] == 'length' else 'content_filtered')
-                    raw = choice['message']['content']
-                    if not isinstance(raw, str) or len(raw) > 180000:
-                        raise ValueError('Invalid model result')
-                    return merge_revision(json.loads(raw), report, original, edited, protected, rows, revision_id)
-                except httpx.HTTPStatusError as error:
-                    raise MinutesFailure('authentication' if error.response.status_code in (401, 403) else
-                                         'rate_limited' if error.response.status_code == 429 else 'provider_error') from None
-                except httpx.TimeoutException:
-                    raise MinutesFailure('timeout') from None
-                except httpx.RequestError:
-                    raise MinutesFailure('network') from None
-                except MinutesFailure:
-                    raise
-                except (ValueError, KeyError, TypeError, IndexError, AttributeError):
-                    if attempt:
-                        raise MinutesFailure('invalid_output') from None
-                    messages.append({'role': 'user', 'content': '输出结构或依据不合格。返回edited相同id、顺序、数量和字段的完整JSON；引用仅用evidence已有id。'})
+        client = self.config.http_pool.client('text', timeout=120, proxy=self.config.proxy)
+        for attempt in range(2):
+            if not self.charge():
+                raise MinutesFailure('quota_exceeded')
+            try:
+                response = await client.post(self.config.text_url.rstrip('/') + '/chat/completions',
+                    headers={'Authorization': 'Bearer ' + self.config.text_key}, json={'model': self.config.text_model,
+                    'temperature': 0.1, 'max_tokens': 16000, 'thinking': {'type': 'disabled'},
+                    'response_format': {'type': 'json_object'}, 'messages': messages})
+                response.raise_for_status()
+                choice = response.json()['choices'][0]
+                if choice.get('finish_reason') in ('length', 'content_filter'):
+                    raise MinutesFailure('output_truncated' if choice['finish_reason'] == 'length' else 'content_filtered')
+                raw = choice['message']['content']
+                if not isinstance(raw, str) or len(raw) > 180000:
+                    raise ValueError('Invalid model result')
+                return merge_revision(json.loads(raw), report, original, edited, protected, rows, revision_id)
+            except httpx.HTTPStatusError as error:
+                raise MinutesFailure('authentication' if error.response.status_code in (401, 403) else
+                                     'rate_limited' if error.response.status_code == 429 else 'provider_error') from None
+            except httpx.TimeoutException:
+                raise MinutesFailure('timeout') from None
+            except httpx.RequestError:
+                raise MinutesFailure('network') from None
+            except MinutesFailure:
+                raise
+            except (ValueError, KeyError, TypeError, IndexError, AttributeError):
+                if attempt:
+                    raise MinutesFailure('invalid_output') from None
+                messages.append({'role': 'user', 'content': '输出结构或依据不合格。返回edited相同id、顺序、数量和字段的完整JSON；引用仅用evidence已有id。'})
         raise MinutesFailure('invalid_output')
