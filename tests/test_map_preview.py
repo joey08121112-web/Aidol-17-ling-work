@@ -109,7 +109,12 @@ def test_snapshot_fits_endpoints_and_geometry_without_explicit_zoom():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('content,status', [(b'{"key":"private","error":"bad"}', 200), (b'bad', 403), (b'\x89PNG\r\n\x1a\n' + b'x' * (4 * 1024 * 1024), 200)])
+@pytest.mark.parametrize('content,status', [
+    pytest.param(b'{"key":"private","error":"bad"}', 200, id='json-error'),
+    pytest.param(b'bad', 403, id='http-forbidden'),
+    # pytest exports node IDs in PYTEST_CURRENT_TEST, which is size-limited on Windows.
+    pytest.param(b'\x89PNG\r\n\x1a\n' + b'x' * (4 * 1024 * 1024), 200, id='oversize-png'),
+])
 async def test_image_proxy_rejects_errors_and_oversize_without_leaking_key(content, status):
     async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(status, content=content))) as client:
         with pytest.raises(ValueError) as error: await amap_image(client, 'private', {})
