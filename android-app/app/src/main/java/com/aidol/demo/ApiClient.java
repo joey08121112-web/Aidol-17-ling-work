@@ -80,15 +80,25 @@ public final class ApiClient {
         byte[] response = bytes(method, path, body == null ? null : body.toString().getBytes(StandardCharsets.UTF_8), "application/json; charset=utf-8");
         return new JSONObject(new String(response, StandardCharsets.UTF_8));
     }
+    /** Serialize only settings writes; old servers get a fresh read/merge without replaying uncertain writes. */
+    public synchronized JSONObject patchSettings(JSONObject changes) throws Exception {
+        return SettingsUpdates.apply(changes, vault::token, (method, path, body, token) -> {
+            byte[] payload = body == null ? null : body.toString().getBytes(StandardCharsets.UTF_8);
+            byte[] response = execute(callWithToken(method, path, payload, "application/json; charset=utf-8", null, token));
+            return new JSONObject(new String(response, StandardCharsets.UTF_8));
+        }, error -> error instanceof ApiException ? ((ApiException) error).status : 0);
+    }
     public Call call(String method, String path, byte[] body, String contentType) {
         return call(method, path, body, contentType, null);
     }
     public Call call(String method, String path, byte[] body, String contentType, String requestId) {
+        return callWithToken(method, path, body, contentType, requestId, vault.token());
+    }
+    private Call callWithToken(String method, String path, byte[] body, String contentType, String requestId, String token) {
         RequestBody payload = body == null && (method.equals("GET") || method.equals("HEAD")) ? null
             : RequestBody.create(body == null ? new byte[0] : body, MediaType.get(contentType));
         Request.Builder builder = new Request.Builder().url(serverUrl + path).method(method, payload);
         if (requestId != null && requestId.matches("[a-zA-Z0-9-]{16,64}")) builder.header("X-Aidol-Request-ID", requestId);
-        String token = vault.token();
         if (!token.isEmpty()) builder.header("Authorization", "Bearer " + token);
         return transport.call(builder.build());
     }

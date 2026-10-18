@@ -24,6 +24,8 @@ public final class WorkCommuteUiInstrumentation extends Instrumentation {
     private File output;
     private final AtomicInteger previews=new AtomicInteger(), maps=new AtomicInteger(), weather=new AtomicInteger(), writes=new AtomicInteger();
     private final AtomicReference<String> failure=new AtomicReference<>();
+    private final AtomicReference<String> meetingDetail=new AtomicReference<>();
+    private static final String ADDRESS_MEETING="fixture-address-meeting-001";
     private byte[] png;
     private static JSONObject point(String name)throws Exception{return new JSONObject().put("name",name).put("address","北京市公开测试路1号").put("city","北京").put("adcode","110101").put("longitude",116.4).put("latitude",39.9);}
     @Override public void onCreate(Bundle args){super.onCreate(args);start();}
@@ -84,6 +86,7 @@ public final class WorkCommuteUiInstrumentation extends Instrumentation {
             waitUntil(check::isEnabled,4000,"Delayed checkbox did not save");SystemClock.sleep(250);
             check(scroll.getScrollY()==meetingY,"Delayed checkbox reply moved another work section");
             main(()->scroll.scrollTo(0,0));capture("01-work-tabs");
+            checkMeetingAddressRefresh();
             main(panel::resume);waitUntil(()->(Boolean)field(panel,"loaded"),5000,"Commute preferences did not load");
             main(()->{set(panel,"originMode","fixed");set(panel,"origin",point("起点"));set(panel,"destination",point("终点"));invoke(activity,"switchTab",3);quiet();});
             waitUntil(()->map.route()!=null && map.route().optBoolean("available") && field(map,"bitmap")!=null && ((TextView)field(map,"weatherMain")).getText().toString().contains("23"),10000,"Map/preview/weather not rendered");
@@ -143,7 +146,7 @@ public final class WorkCommuteUiInstrumentation extends Instrumentation {
             check(!(Boolean)field(activity,"lifeConversationLayout"),"Returning conversation kept stale life mode layout");
             check(failure.get()==null,"Fixture error: "+failure.get());check(writes.get()==2,"Unexpected non-preview mutation: "+writes.get());
             check(getTargetContext().getSystemService(android.media.AudioManager.class).getActiveRecordingConfigurations().isEmpty(),"Unexpected recording");
-            result.putString("stream","PASS: three exclusive mounted work tabs; remembered scroll; checkbox stable; delayed checkbox reply preserves another section; compact selectors; map before controls; preview and auto destination weather; stale responses ignored; tab exit cancels requests; cached tab scroll/task notification/off-page task refresh; detached commute callback and queued work restore cannot move another tab; off-page mode change invalidates cached life layout; no recording/journey writes. previews="+previews+", maps="+maps+", weather="+weather);code=Activity.RESULT_OK;
+            result.putString("stream","PASS: three exclusive mounted work tabs; remembered scroll; checkbox stable; delayed checkbox reply preserves another section; background meeting-address retry/result refresh preserves detail views and scroll with/without report; compact selectors; map before controls; preview and auto destination weather; stale responses ignored; tab exit cancels requests; cached tab scroll/task notification/off-page task refresh; detached commute callback and queued work restore cannot move another tab; off-page mode change invalidates cached life layout; no recording/journey writes. previews="+previews+", maps="+maps+", weather="+weather);code=Activity.RESULT_OK;
         }catch(Throwable e){result.putString("stream","FAIL: "+android.util.Log.getStackTraceString(e));}
         finally{
             if(activity!=null)try{main(()->{if(panel!=null)panel.close();if(original!=null){set(activity,"api",original);set(activity,"state",originalState);}activity.finish();});}catch(Exception ignored){}
@@ -157,6 +160,7 @@ public final class WorkCommuteUiInstrumentation extends Instrumentation {
         if(path.equals("/v1/saved-addresses"))return json(new JSONObject().put("addresses",new JSONArray()));
         if(path.equals("/v1/commute")&&r.getMethod().equals("GET"))return json(new JSONObject());
         if(path.equals("/v1/work-meetings"))return json(new JSONObject().put("meetings",state.getJSONArray("work_meetings")));
+        if(path.equals("/v1/work-meetings/"+ADDRESS_MEETING)&&r.getMethod().equals("GET"))return json(new JSONObject(meetingDetail.get()));
         if(path.startsWith("/v1/tasks/")&&r.getMethod().equals("PATCH")){
             int write=writes.incrementAndGet();MockResponse response=json(new JSONObject());
             return write==2?response.setBodyDelay(2000,TimeUnit.MILLISECONDS):response;
@@ -174,6 +178,54 @@ public final class WorkCommuteUiInstrumentation extends Instrumentation {
         }
         if(!r.getMethod().equals("GET"))writes.incrementAndGet();failure.set("Unexpected "+r.getMethod()+" "+path);return new MockResponse().setResponseCode(500);
     }
+    private void checkMeetingAddressRefresh()throws Exception{
+        JSONArray sources=new JSONArray();
+        for(int i=0;i<36;i++)sources.put(new JSONObject().put("id","address-fixture-source-"+i).put("speaker","测试用户")
+            .put("text","公开测试文稿第"+(i+1)+"段：核对后台地址解析后的显示与页面位置，保留已经阅读的内容。")
+            .put("created_at","2026-10-18T01:00:00Z").put("offset_ms",i*20000).put("duration_ms",20000));
+        JSONObject unresolved=new JSONObject().put("id",ADDRESS_MEETING).put("status","saved").put("summary_status","failed")
+            .put("transcription_status","ready").put("started_at","2026-10-18T01:00:00Z").put("ended_at","2026-10-18T01:12:00Z")
+            .put("sources",sources).put("utterances",new JSONArray()).put("events",new JSONArray()).put("audio",new JSONObject().put("status","none"))
+            .put("location",new JSONObject().put("longitude",116.4).put("latitude",39.9).put("source","gps"))
+            .put("address_attempts",1).put("address_retry_at",2000000000);
+        meetingDetail.set(unresolved.toString());
+        main(()->{invoke(activity,"openWorkMeeting",ADDRESS_MEETING);quietMaintenance();});
+        waitUntil(()->field(activity,"workMeetingPlace")!=null&&((TextView)field(activity,"workMeetingPlace")).getText().toString().contains("地址暂未解析"),5000,"Initial unresolved meeting address missing");
+        ScrollView viewport=(ScrollView)field(activity,"meetingScroll");
+        LinearLayout body=(LinearLayout)field(activity,"workMeetingDetail");Object header=body.getChildAt(0);
+        TextView label=(TextView)field(activity,"workMeetingPlace");Object dialog=field(activity,"meetingPage");
+        main(()->viewport.scrollTo(0,500));SystemClock.sleep(200);int y=viewport.getScrollY();check(y>0,"Meeting fixture cannot scroll");
+        JSONObject exhausted=new JSONObject(unresolved.toString()).put("address_attempts",4).put("address_retry_at",JSONObject.NULL);
+        meetingDetail.set(exhausted.toString());
+        waitUntil(()->label.getText().toString().contains("已重试3次"),6000,"Background exhausted retries did not update detail");
+        SystemClock.sleep(150);check(viewport.getScrollY()==y,"Retry status update moved meeting scroll");
+        String resolvedAddress="北京市东城区公开测试路一号公园东门服务中心";
+        JSONObject resolved=new JSONObject(exhausted.toString());resolved.getJSONObject("location").put("address",resolvedAddress);meetingDetail.set(resolved.toString());
+        waitUntil(()->label.getText().toString().equals("开始地点："+resolvedAddress),6000,"Background resolved address did not update detail");
+        SystemClock.sleep(150);
+        check(field(activity,"meetingPage")==dialog&&field(activity,"meetingScroll")==viewport&&field(activity,"workMeetingDetail")==body
+            &&field(activity,"workMeetingPlace")==label&&body.getChildAt(0)==header,"Address-only refresh rebuilt meeting content");
+        check(viewport.getScrollY()==y,"Resolved address update moved meeting scroll");
+        check(((JSONObject)field(activity,"workMeetingOpen")).getJSONObject("location").optString("address").equals(resolvedAddress),"Export snapshot kept old meeting address");
+        capture("05-meeting-address-update");
+        // Successful resolution also changes report.location on the server; that remains address-only.
+        JSONObject reported=new JSONObject(resolved.toString()).put("summary_status","ready").put("report",new JSONObject()
+            .put("title","公开地址刷新测试").put("summary","公开测试摘要，正文无需随地址变化重建。")
+            .put("location",new JSONObject(resolved.getJSONObject("location").toString())));
+        meetingDetail.set(reported.toString());
+        waitUntil(()->((JSONObject)field(activity,"workMeetingOpen")).optJSONObject("report")!=null,6000,"Fixture report did not load");
+        main(()->viewport.scrollTo(0,500));SystemClock.sleep(200);int reportY=viewport.getScrollY();
+        TextView reportLabel=(TextView)field(activity,"workMeetingPlace");Object reportHeader=body.getChildAt(0);
+        String finalAddress="北京市东城区公开测试路二号公园南门";
+        JSONObject mirrored=new JSONObject(reported.toString());mirrored.getJSONObject("location").put("address",finalAddress);
+        mirrored.getJSONObject("report").getJSONObject("location").put("address",finalAddress);meetingDetail.set(mirrored.toString());
+        waitUntil(()->reportLabel.getText().toString().equals("开始地点："+finalAddress),6000,"Mirrored report address did not update in place");
+        SystemClock.sleep(150);
+        check(field(activity,"workMeetingPlace")==reportLabel&&body.getChildAt(0)==reportHeader&&field(activity,"meetingPage")==dialog,"Mirrored address rebuilt document");
+        check(viewport.getScrollY()==reportY,"Mirrored report address moved meeting scroll");
+        main(()->{((Dialog)field(activity,"meetingPage")).dismiss();quiet();});
+    }
+    private void quietMaintenance()throws Exception{((ForegroundLocationMonitor)field(activity,"locationMonitor")).close();Handler h=(Handler)field(activity,"handler");for(String name:new String[]{"automaticHeadsetTick","startupLocationTick"})h.removeCallbacks((Runnable)field(activity,name));}
     private void quiet()throws Exception{((ForegroundLocationMonitor)field(activity,"locationMonitor")).close();Handler h=(Handler)field(activity,"handler");for(String name:new String[]{"automaticHeadsetTick","startupLocationTick","workMeetingPoll"})h.removeCallbacks((Runnable)field(activity,name));}
     private void select(int i)throws Exception{((LinearLayout)field(activity,"workSectionTabs")).getChildAt(i).performClick();}
     private void onlySection(int selected)throws Exception{LinearLayout[] s=(LinearLayout[])field(activity,"workSections");for(int i=0;i<3;i++)check(s[i].getVisibility()==(i==selected?View.VISIBLE:View.GONE),"Wrong visible work section");check(((LinearLayout)field(activity,"workSectionTabs")).getChildAt(selected).isSelected(),"Selected tab not emphasized");}

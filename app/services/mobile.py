@@ -68,7 +68,7 @@ class MobileRuntime:
         answer = result.get('response', '')
         if answer and result.get('response_complete', True) and self.store.settings().retain_transcripts:
             self.store.add('transcripts', speaker='assistant', text=answer, mode=result['mode'], source=source)
-        return {'text': text, **result, 'speak': not silent and (result['mode'] != 'work' or result.get('explicit_reply', False)),
+        return {'text': text, **result, 'speak': not silent and result.get('speak', True) and (result['mode'] != 'work' or result.get('explicit_reply', False)),
                 'notice': '模型暂不可用，本次为基础规则回复' if result['interaction'] == 'rules'
                     and (result['mode'] != 'work' or result.get('explicit_reply', False)) else ''}
 

@@ -19,13 +19,14 @@ final class ActionTaskBoard implements AutoCloseable {
     private final Consumer<JSONArray> changed;
     private final Consumer<String> error;
     private final Runnable notificationPermission;
-    private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    private final KeyedExecutor worker = new KeyedExecutor(4);
+    private final Set<String> pendingTasks = new HashSet<>();
     private final Handler ui = new Handler(Looper.getMainLooper());
     private JSONArray tasks = new JSONArray();
     private LinearLayout rows;
     private TextView count;
     private ScrollView scroll;
-    private boolean closed;
+    private volatile boolean closed;
     private long mutationVersion;
     private int mutations;
     private TextView notificationHint;
@@ -35,7 +36,10 @@ final class ActionTaskBoard implements AutoCloseable {
     private BiConsumer<String, String> openMeeting = (meetingId, citation) -> {};
     private void observeSession() {
         ApiClient c = api.get(); String t = c == null ? "" : c.vault.token();
-        if (c != sessionClient || !t.equals(sessionToken)) { sessionClient = c; sessionToken = t; mutations = 0; mutationVersion++; }
+        if (c != sessionClient || !t.equals(sessionToken)) {
+            if (addDialog != null) addDialog.dismiss();
+            sessionClient = c; sessionToken = t; mutations = 0; mutationVersion++; pendingTasks.clear();
+        }
     }
     ActionTaskBoard(Activity a, Supplier<ApiClient> api, BooleanSupplier allowed, Consumer<JSONArray> changed, Consumer<String> error, Runnable permission) {
         this.activity = a; this.api = api; this.allowed = allowed; this.changed = changed; this.error = error; this.notificationPermission = permission;
@@ -44,8 +48,10 @@ final class ActionTaskBoard implements AutoCloseable {
     /** Opens a task's source meeting at the sentence it cites (meeting id, first source id or ""). */
     void onOpenMeeting(BiConsumer<String, String> open) { openMeeting = open; }
     static String account(ApiClient c) { return ServerEndpoint.sessionNamespace(c.serverUrl) + ":" + c.vault.username(); }
+    boolean hasPendingMutations() { observeSession(); return mutations > 0; }
+    JSONArray snapshot() { try { return new JSONArray(tasks.toString()); } catch (JSONException impossible) { return new JSONArray(); } }
     void render(LinearLayout parent, JSONArray value, ScrollView scroll) {
-        observeSession(); tasks = value; this.scroll = scroll;
+        observeSession(); if (mutations == 0) tasks = value; this.scroll = scroll;
         LinearLayout header = new LinearLayout(activity); header.setGravity(Gravity.CENTER_VERTICAL); header.setPadding(0, dp(20), 0, dp(8)); parent.addView(header);
         LinearLayout words = EditorUi.column(activity); header.addView(words, new LinearLayout.LayoutParams(0, -2, 1));
         TextView title = EditorUi.text(activity, "行动清单", 18, EditorUi.INK); title.setTypeface(null, android.graphics.Typeface.BOLD); words.addView(title);
@@ -57,7 +63,7 @@ final class ActionTaskBoard implements AutoCloseable {
         rows = EditorUi.column(activity); parent.addView(rows);
         for (int i = 0; i < tasks.length(); i++) { JSONObject task = tasks.optJSONObject(i); if (task != null) row(task, false); }
         emptyState();
-        sync(value, false);
+        sync(tasks, false);
     }
     Runnable preserveViewport() {
         if (scroll == null || rows == null || !rows.isAttachedToWindow() || !rows.isShown()) return () -> {};
@@ -96,22 +102,24 @@ final class ActionTaskBoard implements AutoCloseable {
     }
     private SwipeTaskRow row(JSONObject task, boolean first) {
         String id = task.optString("id"); boolean done = "done".equals(task.optString("status"));
+        ApiClient rowClient = api.get(); String rowToken = rowClient.vault.token();
         SwipeTaskRow shell = new SwipeTaskRow(activity); shell.setTag(id); shell.setClipToOutline(true);
         shell.setBackground(EditorUi.shape(activity, 0xfffff0f0, 20, 0xfff2d8dc));
         LinearLayout.LayoutParams outer = new LinearLayout.LayoutParams(-1, -2); outer.setMargins(0, dp(6), 0, dp(6)); rows.addView(shell, first ? 0 : rows.getChildCount(), outer);
         LinearLayout actions = new LinearLayout(activity); actions.setGravity(Gravity.CENTER_VERTICAL);
         shell.addView(actions, new android.widget.FrameLayout.LayoutParams(dp(176), -1, Gravity.END));
-        TextView edit = EditorUi.button(activity, "编辑", false, () -> { if (shell.isEnabled()) taskDialog(task); });
+        TextView edit = EditorUi.button(activity, "编辑", false, () -> { if (current(rowClient, rowToken) && shell.isEnabled()) taskDialog(task); });
         edit.setContentDescription("编辑待办：" + task.optString("content"));
         edit.setBackground(EditorUi.shape(activity, 0xffeaf1ff, 16, 0xffd0dfff));
         actions.addView(edit, new LinearLayout.LayoutParams(dp(88), -1));
-        TextView delete = EditorUi.button(activity, "删除", false, () -> remove(task, shell)); delete.setTextColor(0xffc34f5a); delete.setBackgroundColor(android.graphics.Color.TRANSPARENT);
+        TextView delete = EditorUi.button(activity, "删除", false, () -> { if (current(rowClient, rowToken)) remove(task, shell); }); delete.setTextColor(0xffc34f5a); delete.setBackgroundColor(android.graphics.Color.TRANSPARENT);
         delete.setContentDescription("删除待办：" + task.optString("content"));
         actions.addView(delete, new LinearLayout.LayoutParams(dp(88), -1));
         LinearLayout card = EditorUi.column(activity); card.setPadding(dp(14), dp(10), dp(14), dp(12)); card.setBackground(EditorUi.shape(activity, -1, 20, EditorUi.LINE));
         shell.addView(card, new android.widget.FrameLayout.LayoutParams(-1, -2)); shell.foreground(card);
         CheckBox check = new CheckBox(activity); check.setText(task.optString("content")); check.setTextSize(15); check.setMinHeight(dp(48)); check.setFocusable(false);
         check.setButtonTintList(android.content.res.ColorStateList.valueOf(EditorUi.ACCENT)); check.setChecked(done); paint(check, done); card.addView(check);
+        boolean pending = pendingTasks.contains(id); shell.setEnabled(!pending); check.setEnabled(!pending); card.setAlpha(pending ? .72f : 1f);
         String due = task.optString("due_at");
         String deadline = due.isEmpty() ? task.optString("due", "待确认") : TimeFormat.format(due);
         String detail = "负责人：" + (task.optString("owner").isEmpty() ? "待确认" : task.optString("owner")) + "\n截止：" + (deadline.isEmpty() ? "待确认" : deadline);
@@ -129,40 +137,57 @@ final class ActionTaskBoard implements AutoCloseable {
             card.addView(source);
         }
         check.setOnClickListener(v -> {
-            if (!allowed.getAsBoolean()) { check.setChecked("done".equals(task.optString("status"))); return; }
-            mutationVersion++; mutations++;
+            if (!current(rowClient, rowToken) || !beginMutation(id)) { check.setChecked("done".equals(task.optString("status"))); return; }
             final ScrollView viewport = scroll;
             final LinearLayout list = rows;
             boolean selected = check.isChecked(); int y = viewport == null ? 0 : viewport.getScrollY(); check.setEnabled(false);
             card.animate().alpha(.72f).setDuration(120).start();
-            execute(c -> c.json("PATCH", "/v1/tasks/" + id, new JSONObject().put("status", selected ? "done" : "open")), r -> {
-                mutations--;
+            execute("task:" + id, c -> c.json("PATCH", "/v1/tasks/" + id, new JSONObject().put("status", selected ? "done" : "open")), r -> {
+                finishMutation(id);
                 for (int i = 0; i < tasks.length(); i++) if (tasks.optJSONObject(i).optString("id").equals(id)) try { tasks.optJSONObject(i).put("status", selected ? "done" : "open"); } catch (JSONException ignored) {}
                 try { task.put("status", selected ? "done" : "open"); } catch (JSONException ignored) {}
                 paint(check, selected); check.setEnabled(true); card.animate().alpha(1).setDuration(180).start();
+                refreshRebuiltRow(id, shell);
                 updateCount(); publish();
                 // A delayed reply must not move another work section or a rebuilt page.
                 if (viewport != null && viewport == scroll && list != null && list == rows
                         && viewport.isAttachedToWindow() && list.isAttachedToWindow() && list.isShown())
                     viewport.scrollTo(0, y);
-            }, () -> { mutations--; check.setChecked(!selected); check.setEnabled(true); card.animate().alpha(1).setDuration(180).start(); });
+            }, () -> { finishMutation(id); check.setChecked(!selected); check.setEnabled(true); card.animate().alpha(1).setDuration(180).start(); refreshRebuiltRow(id, shell); });
         });
-        card.setOnLongClickListener(v -> { new AlertDialog.Builder(activity).setItems(new String[]{"编辑待办", "删除待办"}, (d, which) -> { if (which == 0) taskDialog(task); else remove(task, shell); }).show(); return true; });
+        card.setOnLongClickListener(v -> { if (!current(rowClient, rowToken)) return true; new AlertDialog.Builder(activity).setItems(new String[]{"编辑待办", "删除待办"}, (d, which) -> { if (!current(rowClient, rowToken)) return; if (which == 0) taskDialog(task); else remove(task, shell); }).show(); return true; });
         return shell;
+    }
+    private void refreshRebuiltRow(String id, View submittedRow) {
+        if (rows == null) return;
+        View current = rows.findViewWithTag(id);
+        if (current == null || current == submittedRow) return;
+        for (int i = 0; i < tasks.length(); i++) {
+            JSONObject task = tasks.optJSONObject(i);
+            if (task != null && id.equals(task.optString("id"))) {
+                Runnable restore = preserveViewport(); int index = rows.indexOfChild(current); rows.removeView(current);
+                View replacement = row(task, false); rows.removeView(replacement); rows.addView(replacement, index); restore.run(); return;
+            }
+        }
     }
     private void paint(CheckBox view, boolean done) { view.setTextColor(done ? EditorUi.MUTED : EditorUi.INK); view.setPaintFlags(done ? view.getPaintFlags() | Paint.STRIKE_THRU_TEXT_FLAG : view.getPaintFlags() & ~Paint.STRIKE_THRU_TEXT_FLAG); }
     private void remove(JSONObject task, View shell) {
-        if (!allowed.getAsBoolean() || !shell.isEnabled()) return;
-        mutationVersion++; mutations++; shell.setEnabled(false);
-        execute(c -> c.json("DELETE", "/v1/tasks/" + task.optString("id"), null), r -> {
-            mutations--; JSONArray next = new JSONArray(); for (int i = 0; i < tasks.length(); i++) if (!tasks.optJSONObject(i).optString("id").equals(task.optString("id"))) next.put(tasks.optJSONObject(i));
+        String id = task.optString("id");
+        if (!shell.isEnabled() || !beginMutation(id)) return;
+        shell.setEnabled(false);
+        execute("task:" + id, c -> c.json("DELETE", "/v1/tasks/" + id, null), r -> {
+            finishMutation(id); JSONArray next = new JSONArray(); for (int i = 0; i < tasks.length(); i++) if (!tasks.optJSONObject(i).optString("id").equals(id)) next.put(tasks.optJSONObject(i));
             tasks = next; TaskReminders.cancel(activity, task.optString("id")); publish(); updateCount();
-            shell.animate().alpha(0).translationX(-dp(24)).setDuration(180).withEndAction(() -> { if (shell.getParent() instanceof android.view.ViewGroup) ((android.view.ViewGroup) shell.getParent()).removeView(shell); emptyState(); }).start();
-        }, () -> { mutations--; shell.setEnabled(true); });
+            View visibleRow = rows == null ? null : rows.findViewWithTag(id);
+            View removed = visibleRow == null ? shell : visibleRow;
+            removed.animate().alpha(0).translationX(-dp(24)).setDuration(180).withEndAction(() -> { if (removed.getParent() instanceof android.view.ViewGroup) ((android.view.ViewGroup) removed.getParent()).removeView(removed); emptyState(); }).start();
+        }, () -> { finishMutation(id); shell.setEnabled(true); refreshRebuiltRow(id, shell); });
     }
     void addDialog() { taskDialog(null); }
     private void taskDialog(JSONObject existing) {
-        if (!allowed.getAsBoolean() || addDialog != null) return;
+        observeSession();
+        if (!allowed.getAsBoolean() || addDialog != null || existing != null && pendingTasks.contains(existing.optString("id"))) return;
+        ApiClient editorClient = api.get(); String editorToken = editorClient.vault.token();
         boolean editing = existing != null;
         LinearLayout body = EditorUi.column(activity), footer = EditorUi.column(activity);
         EditText content = EditorUi.input(activity, body, "内容", editing ? existing.optString("content") : "", true);
@@ -191,12 +216,13 @@ final class ActionTaskBoard implements AutoCloseable {
         notificationHint.setOnClickListener(v -> { if (!activity.getSystemService(android.app.NotificationManager.class).areNotificationsEnabled()) activity.startActivity(new android.content.Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, activity.getPackageName())); });
         TextView problem = EditorUi.text(activity, "", 12, 0xffc34f5a); body.addView(problem);
         Dialog dialog = EditorUi.dialog(activity, editing ? "编辑行动清单" : "添加行动清单", body, footer); addDialog = dialog;
-        dialog.setOnDismissListener(d -> { notificationHint = null; addDialog = null; });
+        dialog.setOnDismissListener(d -> { if (addDialog == dialog) { notificationHint = null; addDialog = null; } });
         String requestId = editing ? existing.optString("id") : UUID.randomUUID().toString();
         String saveLabel = editing ? "保存修改" : "添加";
         TextView save = EditorUi.button(activity, saveLabel, true, () -> {}); footer.addView(save);
         footer.addView(EditorUi.button(activity, "取消", false, dialog::dismiss));
         save.setOnClickListener(v -> {
+            if (!save.isEnabled() || !current(editorClient, editorToken)) return;
             String text = content.getText().toString().trim();
             if (text.isEmpty() || text.length() > 500) { problem.setText("请输入1–500字待办内容"); return; }
             if (owner.length() > 100) { problem.setText("负责人最多100字"); return; }
@@ -204,33 +230,40 @@ final class ActionTaskBoard implements AutoCloseable {
             if (!editing && (due[0] == null || !due[0].toInstant().isAfter(Instant.now()))) { problem.setText("请选择未来的截止时间"); return; }
             String ownerText = owner.getText().toString().trim(), deadline = due[0] == null ? null : due[0].toInstant().toString();
             int lead = choice[0];
-            mutationVersion++; mutations++; save.setEnabled(false); save.setText(editing ? "正在保存…" : "正在添加…");
-            execute(c -> c.json(editing ? "PUT" : "POST", editing ? "/v1/tasks/" + requestId : "/v1/tasks",
+            if (!beginMutation(requestId)) { problem.setText("这一项正在保存，请稍候；其他行动项仍可操作。"); return; }
+            save.setEnabled(false); save.setText(editing ? "正在保存…" : "正在添加…");
+            execute("task:" + requestId, c -> c.json(editing ? "PUT" : "POST", editing ? "/v1/tasks/" + requestId : "/v1/tasks",
                 new JSONObject().put("task_id", requestId).put("content", text).put("owner", ownerText)
                     .put("due", originalDue).put("due_at", deadline == null ? JSONObject.NULL : deadline).put("reminder_hours", lead)), result -> {
-                    mutations--;
+                    finishMutation(requestId);
                     Runnable restore = preserveViewport();
                     if (editing) {
                         for (int i = 0; i < tasks.length(); i++) if (requestId.equals(tasks.optJSONObject(i).optString("id"))) try { tasks.put(i, result); } catch (JSONException ignored) {}
-                        if (rows != null && rows.isAttachedToWindow()) {
+                        if (rows != null) {
                             View old = rows.findViewWithTag(requestId);
                             if (old != null) { int index = rows.indexOfChild(old); rows.removeView(old); View replacement = row(result, false); rows.removeView(replacement); rows.addView(replacement, index);
                                 replacement.setAlpha(.65f); replacement.animate().alpha(1).setDuration(180).start(); }
                         }
                     } else {
                         JSONArray next = new JSONArray().put(result); for (int i = 0; i < tasks.length(); i++) next.put(tasks.optJSONObject(i)); tasks = next;
-                        if (rows != null && rows.isAttachedToWindow()) { View empty = rows.findViewWithTag("empty"); if (empty != null) rows.removeView(empty); row(result, true); }
+                        if (rows != null) { View empty = rows.findViewWithTag("empty"); if (empty != null) rows.removeView(empty); row(result, true); }
                     }
                     publish(); updateCount(); dialog.dismiss(); restore.run();
-                }, () -> { mutations--; save.setEnabled(true); save.setText(saveLabel); problem.setText("保存未完成，请重试；已填写的内容会保留。"); });
+                }, () -> { finishMutation(requestId); if (editing) refreshRebuiltRow(requestId, null); save.setEnabled(true); save.setText(saveLabel); problem.setText("保存未完成，请重试；已填写的内容会保留。"); });
         });
         dialog.show(); dialog.getWindow().setLayout(activity.getResources().getDisplayMetrics().widthPixels - dp(28), Math.round(activity.getResources().getDisplayMetrics().heightPixels * .78f));
         notificationPermission.run();
     }
     private interface Job { JSONObject run(ApiClient client) throws Exception; }
-    private void execute(Job job, Consumer<JSONObject> success, Runnable failure) {
+    private boolean beginMutation(String id) {
+        observeSession();
+        if (closed || !allowed.getAsBoolean() || api.get() == null || api.get().vault.token().isEmpty() || !pendingTasks.add(id)) return false;
+        mutationVersion++; mutations++; return true;
+    }
+    private void finishMutation(String id) { if (pendingTasks.remove(id)) { mutations--; mutationVersion++; } }
+    private void execute(String key, Job job, Consumer<JSONObject> success, Runnable failure) {
         observeSession(); ApiClient client = api.get(); String token = client.vault.token();
-        worker.execute(() -> { try { JSONObject result = job.run(client); ui.post(() -> { if (current(client, token)) success.accept(result); }); }
+        worker.execute(account(client) + ":" + key, () -> { if (!current(client, token)) return; try { JSONObject result = job.run(client); ui.post(() -> { if (current(client, token)) success.accept(result); }); }
             catch (Exception e) { ui.post(() -> { if (current(client, token)) { failure.run(); error.accept(e.getMessage() == null ? "操作未完成，请重试" : e.getMessage()); } }); } });
     }
     private boolean current(ApiClient client, String token) { return !closed && !activity.isDestroyed() && api.get() == client && !token.isEmpty() && token.equals(client.vault.token()); }
@@ -244,7 +277,7 @@ final class ActionTaskBoard implements AutoCloseable {
     void refreshReminders() { refreshReminders(true); }
     void refreshReminders(boolean preserveTaskPosition) { observeSession(); notificationsChanged(); ApiClient c = api.get(); if (c == null || c.vault.token().isEmpty()) return;
         long version = mutationVersion;
-        execute(client -> client.json("GET", "/v1/tasks", null), result -> {
+        execute("task-list", client -> client.json("GET", "/v1/tasks", null), result -> {
             if (version != mutationVersion || mutations > 0) return;
             JSONArray latest = result.optJSONArray("tasks"); if (latest == null) latest = new JSONArray();
             sync(latest, true);

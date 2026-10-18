@@ -51,11 +51,14 @@ public final class MainActivity extends Activity {
     private static final int INK = 0xff202632, MUTED = 0xff697381, ACCENT = 0xff2468db, RED = 0xffb42318;
     private static final int SOFT = 0xffedf1f7;
     private static final int MEMORY = 0xff7356a6, WORK = 0xff305fb5, COMMUTE = 0xff24786d;
-    // User actions stay on one ordered queue; polling, lazy loads and exports share two IO
-    // threads so a request hitting the 100s read timeout cannot monopolise the action queue.
-    private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    // Independent requests run concurrently; writes to one resource retain submission order.
+    private final KeyedExecutor operations = new KeyedExecutor(4);
+    private long stateRevision, requestSequence;
+    private boolean stateRefreshing, stateRefreshAgain;
+    private final java.util.Map<String, Integer> pendingOperations = new java.util.HashMap<>();
+    private JSONObject recallResult;
     private final ExecutorService ioPool = Executors.newFixedThreadPool(2);
-    private ApiClient api;
+    private volatile ApiClient api;
     private DevelopmentSettings development;
     private HeadsetController headset;
     private QuickFeedback quickFeedback;
@@ -72,6 +75,8 @@ public final class MainActivity extends Activity {
     private String lastRenderedMeetingSnapshot = "";
     private ForegroundLocationMonitor locationMonitor;
     private CommutePanel commutePanel;
+    private JSONObject pendingCommutePlan;
+    private String pendingCommuteOwner = "";
     private TransientStatusPopup statusPopup;
     private TextView maintenanceStatus, meetingMaintenanceStatus;
     private String maintenanceLocationStatus = "定位：等待更新", maintenanceEntry = "app_open";
@@ -220,7 +225,7 @@ public final class MainActivity extends Activity {
     private LinearLayout workMeetingList, workMeetingDetail;
     private String openWorkMeetingId = "", workMeetingDetailSnapshot = "", workMeetingJumpId = "";
     private boolean workMeetingSyncError, workMeetingAudioPlayable, meetingSeeking;
-    private TextView workClock, workAudioLabel, meetingTitle, meetingMeta;
+    private TextView workClock, workAudioLabel, meetingTitle, meetingMeta, workMeetingPlace;
     private LinearLayout workCaptionBox, conversationCaptionBox;
     // Live captions of the meeting being recorded: final sentences in ink, the interim text in grey.
     // CaptionList keeps the sentence record once; the two boxes render it in different windows.
@@ -281,7 +286,7 @@ public final class MainActivity extends Activity {
             handler.postDelayed(this, listenMode == VoiceInteraction.SCHEDULED ? 1000 : 180);
         }
     };
-    private interface Job { JSONObject run() throws Exception; }
+    private interface Job { JSONObject run(ApiClient client) throws Exception; }
     private interface Result { void accept(JSONObject value) throws Exception; }
 
     @Override public void onCreate(Bundle saved) {
@@ -307,17 +312,17 @@ public final class MainActivity extends Activity {
         meetingPlayback = new MeetingPlayback(this, headset::matchesOutput, this::meetingPlaybackChanged);
         headset.addListener(headsetListener);
         headset.addControlListener(headsetControlListener);
-        taskBoard = new ActionTaskBoard(this, () -> api, () -> !busy && session == null,
-            tasks -> { put(state, "tasks", tasks); }, message -> { lastNotice = message; updateStatus(); }, () -> {
+        taskBoard = new ActionTaskBoard(this, () -> api, () -> !busy,
+            tasks -> { ++stateRevision; put(state, "tasks", tasks); }, message -> { lastNotice = message; updateStatus(); }, () -> {
                 if (Build.VERSION.SDK_INT >= 33 && !permissionPending && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                     permissionPending = true; requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 7);
                 }
             });
         taskBoard.onOpenMeeting(this::openWorkMeetingAt);
         connectBackend();
-        commutePanel = new CommutePanel(this, () -> api, () -> state, () -> !busy && session == null, () -> visible,
+        commutePanel = new CommutePanel(this, () -> api, () -> state, () -> !busy, () -> visible,
             this::commutePermissions, () -> {
-                boolean changed = !"commute".equals(mode());
+                ++stateRevision; boolean changed = !"commute".equals(mode());
                 put(settings(), "mode", "commute"); put(settings(), "auto_mode", false);
                 JSONObject agent = state.optJSONObject("agent"); if (agent != null) put(agent, "mode", "commute");
                 listenMode = VoiceInteraction.CALL; renderModeSelection(); updateStatus();
@@ -408,7 +413,7 @@ public final class MainActivity extends Activity {
             hideKeyboard(); authError.setText("正在连接…");
             JSONObject bodyJson = json("username", name, "password", pass);
             if (recovery != null) put(bodyJson, "recovery_code", value(recovery));
-            request(() -> api.json("POST", "/auth/" + (mode == 1 ? "register" : mode == 2 ? "recover" : "login"), bodyJson), result -> {
+            request("auth", client -> client.json("POST", "/auth/" + (mode == 1 ? "register" : mode == 2 ? "recover" : "login"), bodyJson), result -> {
                 api.vault.save(result.getString("token"), result.getJSONObject("user").getString("username"));
                 state = new JSONObject(); tab = 0; showApp();
                 String code = result.optString("recovery_code");
@@ -446,10 +451,10 @@ public final class MainActivity extends Activity {
         root.addView(head);
         LinearLayout wordmark = column(); head.addView(wordmark, new LinearLayout.LayoutParams(0, -2, 1));
         ImageView logo = new ImageView(this);
-        logo.setImageResource(R.drawable.aidol_wordmark_speed);
+        logo.setImageResource(R.drawable.viaim_wordmark_chrome);
         logo.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        logo.setContentDescription("Aidol");
-        wordmark.addView(logo, new LinearLayout.LayoutParams(dp(124), dp(32)));
+        logo.setContentDescription("viaim");
+        wordmark.addView(logo, new LinearLayout.LayoutParams(dp(128), dp(38)));
         TextView refresh = action(head, "↻", () -> { if (canAct()) { lastNotice = ""; refresh(); } }); refresh.setTextSize(25); refresh.setContentDescription("刷新服务器数据");
         TextView avatar = action(head, api.vault.username().isEmpty() ? "A" : api.vault.username().substring(0, 1).toUpperCase(Locale.ROOT), () -> switchTab(4));
         avatar.setBackground(ripple(SOFT, 24, LINE)); avatar.setTextColor(ACCENT); avatar.setContentDescription("打开我的空间");
@@ -570,8 +575,8 @@ public final class MainActivity extends Activity {
         if (tab == next) return;
         clearHeadsetGesture();
         if (commutePanel != null) commutePanel.pauseMap();
-        boolean keepCall = sessionUsesCapture && session != null || repeatArmed;
-        if (session != null && !keepCall) cancelSession("已结束当前操作");
+        // A page change does not cancel an in-flight answer, playback, or recording.
+        boolean keepCall = session != null || repeatArmed;
         if (!keepCall) stopRepeat(); tab = next; if (next == 0) followingConversation = true; hideKeyboard(); renderTab();
         enterMaintenance("page_return");
     }
@@ -675,7 +680,7 @@ public final class MainActivity extends Activity {
             if (session != null && session.isDuplexCall()) {
                 session.sendDuplexText(text); conversationFeed.transcript(text); renderLiveTurn(); hideKeyboard(); chatInput.setText(""); chatDraft = ""; return;
             }
-            if (!canAct()) return;
+            if (!canUseAudio()) return;
             hideKeyboard(); chatInput.setText(""); chatDraft = ""; startSession(text);
         }); send.setTextSize(25); send.setTextColor(BG); send.setBackground(ripple(ACCENT, 18, ACCENT)); send.setContentDescription("发送文字消息");
         if (session != null) followConversation();
@@ -739,7 +744,7 @@ public final class MainActivity extends Activity {
         String text = value(chatInput); if (text.isEmpty()) return;
         if (session != null && session.isDuplexCall()) {
             session.sendDuplexText(text); conversationFeed.transcript(text); renderLiveTurn();
-        } else { if (!canAct()) return; startSession(text); }
+        } else { if (!canUseAudio()) return; startSession(text); }
         hideKeyboard(); chatInput.setText(""); chatDraft = "";
     }
 
@@ -774,7 +779,7 @@ public final class MainActivity extends Activity {
                 : transcriptId.isEmpty() ? new String[]{"复制"} : new String[]{"复制", "存为记忆"};
             new AlertDialog.Builder(this).setItems(actions, (dialog, index) -> {
                 if (index == 0) copy("Aidol 对话", current);
-                else if (assistant) { if (canAct()) { newSession(); sessionIsReplay = true; session.speak(current); } }
+                else if (assistant) { if (canUseAudio()) { newSession(); sessionIsReplay = true; session.speak(current); } }
                 else if (canAct()) mutate("POST", "/v1/memories/from-transcript/" + transcriptId, json());
             }).show();
             return true;
@@ -905,7 +910,7 @@ public final class MainActivity extends Activity {
         TextView copyable = label(bubble, text, 15, INK); copyable.setTextIsSelectable(true);
         if (assistant && !text.isEmpty()) {
             LinearLayout actions = row(); bubble.addView(actions);
-            small(actions, "播放", () -> { if (canAct()) { newSession(); sessionIsReplay = true; session.speak(text); } });
+            small(actions, "播放", () -> { if (canUseAudio()) { newSession(); sessionIsReplay = true; session.speak(text); } });
             small(actions, "复制", () -> copy("Aidol 回复", text));
         }
         return copyable;
@@ -999,7 +1004,7 @@ public final class MainActivity extends Activity {
     private void recoverTurnResult() {
         if (!canAct() || uncertainTurnId.isEmpty()) return;
         final String requestId = uncertainTurnId;
-        request(() -> api.json("GET", "/v1/turns/" + Uri.encode(requestId), null), result -> {
+        request(client -> client.json("GET", "/v1/turns/" + Uri.encode(requestId), null), result -> {
             if (!requestId.equals(uncertainTurnId)) return;
             JSONObject completed = result.optJSONObject("result");
             if ("completed".equals(result.optString("status")) && completed != null) {
@@ -1061,10 +1066,21 @@ public final class MainActivity extends Activity {
         state = clean;
         conversationFeed.clear(); removeLiveTurn(); liveTranscript = ""; liveReplyText = "";
         lastTools = new JSONArray(); lastCitations = new JSONArray(); lastAnswer = ""; lastUser = ""; exportData = null;
-        uncertainTurnId = ""; lastBusinessRequestId = "";
+        uncertainTurnId = ""; lastBusinessRequestId = ""; recallResult = null;
         if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; }
         if (content != null) content.removeAllViews();
         renderTurnDetails();
+    }
+
+    private void showRecallResult(JSONObject reply) {
+        if (reply == null) return;
+        LinearLayout view = dialogBody(); TextView answer = label(view, reply.optString("answer"), 15, INK); answer.setTextIsSelectable(true);
+        JSONArray citations = array(reply, "citations");
+        for (int n = 0; n < citations.length(); n++) {
+            JSONObject citation = citations.optJSONObject(n);
+            if (citation != null) label(view, "[" + (n + 1) + "]  " + date(citation.optString("created_at")) + "\n" + citation.optString("text"), 12, MUTED);
+        }
+        scrollDialog("记忆检索", view);
     }
 
     private void memories() {
@@ -1078,15 +1094,13 @@ public final class MainActivity extends Activity {
         button(search, "查找记忆", true, () -> {
             if (!canAct() || value(question).isEmpty()) return;
             String q = value(question); hideKeyboard();
-            request(() -> api.json("POST", "/v1/recall", json("question", q)), reply -> {
-                LinearLayout view = dialogBody(); TextView answer = label(view, reply.optString("answer"), 15, INK); answer.setTextIsSelectable(true);
-                JSONArray citations = array(reply, "citations");
-                for (int n = 0; n < citations.length(); n++) {
-                    JSONObject citation = citations.optJSONObject(n); if (citation != null) label(view, "[" + (n + 1) + "]  " + date(citation.optString("created_at")) + "\n" + citation.optString("text"), 12, MUTED);
-                }
-                scrollDialog("记忆检索", view);
+            request("recall", client -> client.json("POST", "/v1/recall", json("question", q)), reply -> {
+                recallResult = reply; tabDirty[1] = true;
+                if (tab == 1) showRecallResult(reply);
+                else { lastNotice = "记忆检索已完成，可在记忆页查看"; updateStatus(); }
             });
         }).setBackground(ripple(MEMORY, 16, MEMORY));
+        if (recallResult != null) button(search, "查看上次检索结果", false, () -> showRecallResult(recallResult));
         JSONArray allMemories = array(state, "memories"); int pinnedCount = 0;
         for (int i = 0; i < allMemories.length(); i++) if (allMemories.optJSONObject(i) != null && pinned(allMemories.optJSONObject(i))) pinnedCount++;
         sectionHeader(page, "我的记忆", allMemories.length() + " 条 · " + pinnedCount + " 置顶", "＋ 新记忆", () -> { if (canAct()) editMemory(null); });
@@ -1121,7 +1135,7 @@ public final class MainActivity extends Activity {
             switch (item.getItemId()) {
                 case 0: editMemory(memory); break;
                 case 1: mutate("PUT", "/v1/memories/" + memory.optString("id"), json("content", memory.optString("content"), "kind", memory.optString("kind"), "pinned", !pinned(memory))); break;
-                case 2: request(() -> api.json("GET", "/v1/memories/" + memory.optString("id") + "/source", null), r -> { LinearLayout body = dialogBody(); label(body, r.optString("text", r.toString()), 15, INK); scrollDialog("记忆来源", body); }); break;
+                case 2: request(client -> client.json("GET", "/v1/memories/" + memory.optString("id") + "/source", null), r -> { if (tab != 1) return; LinearLayout body = dialogBody(); label(body, r.optString("text", r.toString()), 15, INK); scrollDialog("记忆来源", body); }); break;
                 case 3: confirm("删除这条记忆？", "删除后无法恢复。", () -> mutate("DELETE", "/v1/memories/" + memory.optString("id"), null)); break;
                 default: break;
             }
@@ -1142,9 +1156,11 @@ public final class MainActivity extends Activity {
         AlertDialog dialog = new AlertDialog.Builder(this).setTitle(memory == null ? "添加记忆" : "编辑记忆").setView(body).setNegativeButton("取消", null).setPositiveButton("保存", null).create();
         dialog.setOnShowListener(v -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(w -> {
             if (!canAct()) return; if (value(text).isEmpty()) { text.setError("记忆不能为空"); return; }
+            String memoryKey = "memory:" + (memory == null ? "new" : memory.optString("id"));
+            if (pendingOperations.containsKey(memoryKey)) return;
             JSONObject payload = json("content", value(text), "kind", kinds[picker.getSelectedItemPosition()], "pinned", memory != null && pinned(memory));
-            request(() -> api.json(memory == null ? "POST" : "PUT", "/v1/memories" + (memory == null ? "" : "/" + memory.optString("id")), payload), result -> {
-                dialog.dismiss(); if (memory != null) clearPrivateSnapshots(); refresh();
+            request("memory:" + (memory == null ? "new" : memory.optString("id")), client -> client.json(memory == null ? "POST" : "PUT", "/v1/memories" + (memory == null ? "" : "/" + memory.optString("id")), payload), result -> {
+                dialog.dismiss(); if (memory != null) clearPrivateSnapshots(); refresh(tab == 1);
             });
         })); dialog.show();
     }
@@ -1250,17 +1266,18 @@ public final class MainActivity extends Activity {
         dialog.show(); dialog.getWindow().setLayout(getResources().getDisplayMetrics().widthPixels - dp(28), dp(330));
     }
     private void changeWorkMeeting(String id, JSONObject pin, View control, TextView problem) {
-        if (!canAct() || !meetingChanges.add(id)) return;
-        ApiClient client = api; String token = client.vault.token(); ++workMeetingReadGeneration;
+        if (!canAct() || pendingOperations.containsKey("meeting:" + id) || !meetingChanges.add(id)) return;
+        ApiClient client = api; String token = client.vault.token(); ++workMeetingReadGeneration; ++stateRevision;
         android.app.Dialog pendingDialog = pin == null ? meetingDeleteDialog : null;
         control.setEnabled(false); control.setAlpha(.55f);
-        worker.execute(() -> {
+        operations.execute("meeting-list", () -> {
             try {
+                if (api != client || !token.equals(client.vault.token())) return;
                 JSONObject result = client.json(pin == null ? "DELETE" : "PATCH", "/v1/work-meetings/" + Uri.encode(id), pin);
                 runOnUiThread(() -> {
-                    meetingChanges.remove(id);
                     if (isDestroyed() || api != client || !token.equals(client.vault.token())) return;
-                    ++workMeetingReadGeneration;
+                    meetingChanges.remove(id);
+                    ++workMeetingReadGeneration; ++stateRevision;
                     if (pin == null) {
                         if (meetingDeleteDialog == pendingDialog && pendingDialog != null) pendingDialog.dismiss();
                         if (latestMeetingDetail != null && id.equals(latestMeetingDetail.optString("id"))) latestMeetingDetail = null;
@@ -1280,8 +1297,8 @@ public final class MainActivity extends Activity {
                     renderWorkMeetings(); lastNotice = ""; updateStatus();
                 });
             } catch (Exception e) { runOnUiThread(() -> {
-                meetingChanges.remove(id);
                 if (isDestroyed() || api != client || !token.equals(client.vault.token())) return;
+                meetingChanges.remove(id);
                 ++workMeetingReadGeneration; control.setEnabled(true); control.setAlpha(1);
                 String message = fallback(e.getMessage(), "操作未完成，请重试");
                 if (problem != null) problem.setText(message); else { lastNotice = message; updateStatus(); }
@@ -1362,7 +1379,7 @@ public final class MainActivity extends Activity {
         android.app.Dialog page = meetingPage;
         meetingPage.setOnDismissListener(d -> {
             if (meetingPage != page) return;
-            meetingPage = null; meetingScroll = null; meetingNav = null; meetingTitle = null; meetingMeta = null; meetingSeek = null;
+            meetingPage = null; meetingScroll = null; meetingNav = null; meetingTitle = null; meetingMeta = null; meetingSeek = null; workMeetingPlace = null;
             openWorkMeetingId = ""; workMeetingDetail = null; workMeetingAudioText = "";
             workMeetingPlayer = null; workMeetingPlayerStatus = null; workMeetingTimeline = null; workMeetingLines.clear(); workMeetingPlayingId = "";
             meetingSections.clear(); meetingPlayback.stop(); workMeetingOpen = null;
@@ -1381,6 +1398,8 @@ public final class MainActivity extends Activity {
             "summary_status", meeting.optString("summary_status"), "status", meeting.optString("status"),
             "error", meeting.optString("error"), "utterances", array(meeting, "utterances"),
             "events", array(meeting, "events"), "audio", meeting.optJSONObject("audio"),
+            "location", meeting.optJSONObject("location"), "address_attempts", meeting.optInt("address_attempts"),
+            "address_retry_at", meeting.opt("address_retry_at"),
             // Progress-line inputs (summary_stage/transcription_status drive the header text between
             // content changes) and detail fields the body branches on; ended_at backfills on finish.
             "transcription_status", meeting.optString("transcription_status"), "summary_stage", meeting.optString("summary_stage"),
@@ -1388,11 +1407,48 @@ public final class MainActivity extends Activity {
             "received_segments", meeting.optInt("received_segments"), "ended_at", meeting.optString("ended_at"),
             "action_tasks", array(meeting, "action_tasks")).toString();
     }
+    private static boolean onlyMeetingAddressChanged(String before, String after) {
+        if (before.isEmpty()) return false;
+        try {
+            JSONObject old = new JSONObject(before), next = new JSONObject(after);
+            for (JSONObject value : new JSONObject[]{old, next}) {
+                value.remove("location"); value.remove("address_attempts"); value.remove("address_retry_at");
+                JSONObject report = value.optJSONObject("report");
+                if (report != null) report.remove("location"); // The backend mirrors a resolved place into the report.
+            }
+            return old.toString().equals(next.toString());
+        } catch (org.json.JSONException invalid) { return false; }
+    }
+    private void updateMeetingPlace(JSONObject meeting) {
+        TextView label = workMeetingPlace;
+        if (label == null) return;
+        String value = meetingPlace(meeting);
+        if (value.contentEquals(label.getText())) return;
+        ScrollView viewport = meetingScroll;
+        int y = viewport == null ? 0 : viewport.getScrollY();
+        label.setText(value);
+        if (viewport == null || !viewport.isAttachedToWindow()) return;
+        // Address wrapping can change the header height; retain the user's current viewport.
+        viewport.getViewTreeObserver().addOnPreDrawListener(new android.view.ViewTreeObserver.OnPreDrawListener() {
+            public boolean onPreDraw() {
+                if (viewport.getViewTreeObserver().isAlive()) viewport.getViewTreeObserver().removeOnPreDrawListener(this);
+                if (meetingScroll == viewport && workMeetingPlace == label) viewport.scrollTo(0, y);
+                return true;
+            }
+        });
+        viewport.requestLayout();
+    }
     private void renderWorkMeetingDetail(JSONObject meeting, String snapshot) {
         if (workMeetingDetail == null || !meeting.optString("id").equals(openWorkMeetingId)) return;
         // While recording, the document is still small and the progress line tracks live session
         // state (workSaving flips) — keep rendering; long finished meetings take the cheap gate.
         if (snapshot.equals(workMeetingDetailSnapshot) && !"recording".equals(meeting.optString("status"))) return;
+        if (workMeetingPlace != null && !"recording".equals(meeting.optString("status"))
+                && onlyMeetingAddressChanged(workMeetingDetailSnapshot, snapshot)) {
+            workMeetingDetailSnapshot = snapshot; workMeetingOpen = meeting;
+            updateMeetingPlace(meeting);
+            return;
+        }
         workMeetingDetailSnapshot = snapshot;
         JSONObject report = meeting.optJSONObject("report");
         JSONArray sources = array(meeting, "sources");
@@ -1428,7 +1484,7 @@ public final class MainActivity extends Activity {
             + "（" + TimeFormat.gmt(zone) + "）", 14, MUTED);
         label(meta, "录音时长：" + TimeFormat.hms(timeline.audioEndMs()) + " · " + timeline.sentences().size() + " 句", 14, MUTED);
         label(meta, "说话人：" + (speakerNames.isEmpty() ? "未区分" : String.join("、", speakerNames)), 14, MUTED);
-        label(meta, meetingPlace(meeting), 14, MUTED);
+        workMeetingPlace = label(meta, meetingPlace(meeting), 14, MUTED);
         meetingSection("总结", "总结");
         if (report == null) label(workMeetingDetail, workMeetingProgress(meeting) + "。原文可先在下方查看，AI 整理完成后自动更新。", 14, MUTED);
         else {
@@ -1519,7 +1575,7 @@ public final class MainActivity extends Activity {
             label(workMeetingDetail, "若录音已经中断，可结束本场并整理已上传的片段；未上传的音频无法恢复。", 12, MUTED);
             button(workMeetingDetail, "结束本场，整理已保存片段", false, () -> {
                 if (!canAct()) return;
-                request(() -> api.json("POST", "/v1/work-meetings/" + Uri.encode(meeting.optString("id")) + "/finish",
+                request("meeting:" + meeting.optString("id"), client -> client.json("POST", "/v1/work-meetings/" + Uri.encode(meeting.optString("id")) + "/finish",
                     json("segment_count", meeting.optInt("received_segments"), "complete", false)), r -> {
                     workMeetingDetailSnapshot = ""; renderWorkMeetingDetail(r);
                     handler.removeCallbacks(workMeetingPoll); handler.post(workMeetingPoll);
@@ -1533,17 +1589,18 @@ public final class MainActivity extends Activity {
             if (report != null) button(workMeetingDetail, "修正并重新生成纪要", false, () -> {
                 if (!canAct()) return;
                 String id = meeting.optString("id");
-                request(() -> api.json("GET", "/v1/work-meetings/" + Uri.encode(id) + "/revision", null), draft ->
+                request(client -> client.json("GET", "/v1/work-meetings/" + Uri.encode(id) + "/revision", null), draft -> {
+                    if (!id.equals(openWorkMeetingId) || meetingPage == null || !meetingPage.isShowing()) return;
                     new MeetingRevisionEditor(this, api, id, draft, result -> {
                         workMeetingDetailSnapshot = ""; renderWorkMeetingDetail(result);
                         handler.removeCallbacks(workMeetingPoll); handler.post(workMeetingPoll);
                         taskBoard.refreshReminders();
-                    }).show());
+                    }).show(); });
             });
             else if (sources.length() > 0 || "pending".equals(meeting.optString("transcription_status")) || "failed".equals(meeting.optString("transcription_status")))
                 button(workMeetingDetail, "重试原文识别与整理", false, () -> {
                     if (!canAct()) return;
-                    request(() -> api.json("POST", "/v1/work-meetings/" + Uri.encode(meeting.optString("id")) + "/retry-summary", json()), result -> {
+                    request("meeting:" + meeting.optString("id"), client -> client.json("POST", "/v1/work-meetings/" + Uri.encode(meeting.optString("id")) + "/retry-summary", json()), result -> {
                         workMeetingDetailSnapshot = ""; renderWorkMeetingDetail(result); handler.post(workMeetingPoll);
                     });
                 });
@@ -1553,7 +1610,7 @@ public final class MainActivity extends Activity {
         if (("saved".equals(audioStatus) || "partial".equals(audioStatus)) && !"recording".equals(meeting.optString("status")))
             small(workMeetingDetail, "删除本场录音（保留文字）", () -> confirm("删除本场录音", "录音删除后无法恢复，文字原文与纪要会保留。", () -> {
                 if (meeting.optString("id").equals(meetingPlayback.meetingId())) meetingPlayback.stop();
-                request(() -> api.json("DELETE", "/v1/work-meetings/" + Uri.encode(meeting.optString("id")) + "/audio", null), r -> {
+                request("meeting:" + meeting.optString("id"), client -> client.json("DELETE", "/v1/work-meetings/" + Uri.encode(meeting.optString("id")) + "/audio", null), r -> {
                     workMeetingDetailSnapshot = ""; renderWorkMeetingDetail(r);
                 });
             }));
@@ -1677,12 +1734,13 @@ public final class MainActivity extends Activity {
         boolean selected = check.isChecked();
         if (!canAct()) { check.setChecked(!selected); return; }
         check.setEnabled(false);
-        ApiClient client = api;
-        worker.execute(() -> {
+        ApiClient client = api; String token = client.vault.token(), id = task.optString("id");
+        // One queue per task: repeated taps on this row apply in order.
+        operations.execute("task:" + id, () -> {
             try {
-                client.json("PATCH", "/v1/tasks/" + Uri.encode(task.optString("id")), json("status", selected ? "done" : "open"));
+                client.json("PATCH", "/v1/tasks/" + Uri.encode(id), json("status", selected ? "done" : "open"));
                 runOnUiThread(() -> {
-                    if (isDestroyed() || client != api) return;
+                    if (isDestroyed() || client != api || !token.equals(client.vault.token())) return;
                     put(task, "status", selected ? "done" : "open");
                     check.setEnabled(true); check.setTextColor(selected ? MUTED : INK);
                     check.setPaintFlags(selected ? check.getPaintFlags() | Paint.STRIKE_THRU_TEXT_FLAG : check.getPaintFlags() & ~Paint.STRIKE_THRU_TEXT_FLAG);
@@ -1772,7 +1830,7 @@ public final class MainActivity extends Activity {
     }
     private void playMeetingAudio(String meetingId, long startMs, MeetingTimeline timeline) {
         if (modeCuePlayer != null) modeCuePlayer.stop();
-        if (!canAct() || !canPlayMeetingAudio()) return;
+        if (!canUseAudio() || !canPlayMeetingAudio()) return;
         if (quickFeedback != null) quickFeedback.stop();
         meetingPlayback.play(api, meetingId, startMs, timeline.audioEndMs());
     }
@@ -1793,7 +1851,7 @@ public final class MainActivity extends Activity {
         toggle.setOnClickListener(v -> {
             MeetingPlayback.State now = meetingId.equals(meetingPlayback.meetingId()) ? meetingPlayback.state() : MeetingPlayback.State.IDLE;
             if (now == MeetingPlayback.State.PLAYING || now == MeetingPlayback.State.LOADING) meetingPlayback.pause();
-            else if (now == MeetingPlayback.State.PAUSED) { if (canAct() && canPlayMeetingAudio()) meetingPlayback.resume(api); }
+            else if (now == MeetingPlayback.State.PAUSED) { if (canUseAudio() && canPlayMeetingAudio()) meetingPlayback.resume(api); }
             else playMeetingAudio(meetingId, 0, timeline);
         });
         LinearLayout middle = column(); middle.setPadding(dp(10), 0, dp(6), 0); controls.addView(middle, new LinearLayout.LayoutParams(0, -2, 1));
@@ -2079,7 +2137,7 @@ public final class MainActivity extends Activity {
             retention == 0 ? "录音：不保存" : "录音保存 " + retention + " 天", this::showRecordingRetentionOptions);
         label(meetings, "录音按账号保存在服务器，到期自动删除；文字原文与纪要保留。", 11, MUTED);
         workMeetingList = column(); meetings.addView(workMeetingList); renderWorkMeetings();
-        historyRangeAction = sectionHeader(history, "历史记录整理", "按时间范围整理较早的工作记录", "选择范围", this::showHistoryRangeOptions);
+        historyRangeAction = sectionHeader(history, "历史记录整理", "按时间范围整理较早的工作记录", pendingOperations.containsKey("history") ? "后台整理中…" : "选择范围", this::showHistoryRangeOptions);
         historyReportBox = column(); history.addView(historyReportBox); renderHistoryReport();
         taskBoard.render(tasks, array(state, "tasks"), scroll);
         styleWorkSections();
@@ -2118,8 +2176,8 @@ public final class MainActivity extends Activity {
         workOptionsDialog = new RoundedChoiceDialog(this, "会议录音保存期限", "缩短期限会立即清理超期录音；文字和纪要保留。",
             labels, selected, "保存设置", index -> {
                 if (!canAct() || days[index] == settings().optInt("work_audio_retention_days", 30)) return;
-                JSONObject payload = cloneJson(settings()); put(payload, "work_audio_retention_days", days[index]);
-                request(() -> api.json("PUT", "/v1/settings", payload), this::applyRecordingRetentionResult);
+                JSONObject payload = json(); put(payload, "work_audio_retention_days", days[index]);
+                request("settings", client -> client.patchSettings(payload), this::applyRecordingRetentionResult);
             });
         workOptionsDialog.show();
     }
@@ -2140,7 +2198,7 @@ public final class MainActivity extends Activity {
             labels, selected, "开始整理", index -> {
                 if (!canAct()) return;
                 getPreferences(MODE_PRIVATE).edit().putInt(historyRangeKey(), hours[index]).apply();
-                request(() -> api.json("POST", "/v1/meetings", json("hours", hours[index])), this::applyHistoryMeetingReport);
+                request("history", client -> client.json("POST", "/v1/meetings", json("hours", hours[index])), this::applyHistoryMeetingReport);
             });
         workOptionsDialog.show();
     }
@@ -2207,8 +2265,8 @@ public final class MainActivity extends Activity {
             JSONObject poi = pois.optJSONObject(i); if (poi == null) continue;
             LinearLayout item = card(body); label(item, poi.optString("name"), 16, INK); label(item, poi.optString("city") + " · " + poi.optString("address"), 12, MUTED);
             button(item, "设为目的地", false, () -> {
-                if (!canAct()) return; JSONObject payload = cloneJson(settings()); put(payload, "destination_name", poi.optString("name")); put(payload, "destination_lon", poi.optDouble("longitude")); put(payload, "destination_lat", poi.optDouble("latitude")); put(payload, "transit_city", fallback(poi.optString("city"), settings().optString("transit_city", "上海")));
-                request(() -> api.json("PUT", "/v1/settings", payload), r -> { getPreferences(MODE_PRIVATE).edit().putString(weatherPreferenceKey(), poi.optString("adcode")).apply(); dialog.dismiss(); refresh(); });
+                if (!canAct()) return; JSONObject payload = json(); put(payload, "destination_name", poi.optString("name")); put(payload, "destination_lon", poi.optDouble("longitude")); put(payload, "destination_lat", poi.optDouble("latitude")); put(payload, "transit_city", fallback(poi.optString("city"), settings().optString("transit_city", "上海")));
+                request("settings", client -> client.patchSettings(payload), r -> { getPreferences(MODE_PRIVATE).edit().putString(weatherPreferenceKey(), poi.optString("adcode")).apply(); dialog.dismiss(); refresh(tab == 3); });
             });
         }
         dialog.show();
@@ -2295,7 +2353,7 @@ public final class MainActivity extends Activity {
     }
     private void locate() { locate(true); }
     private void locate(boolean updateRoute) {
-        if (!canAct()) return;
+        if (!canAct() || locationListener != null) return;
         if (!hasLocationPermission()) {
             getPreferences(MODE_PRIVATE).edit().putBoolean("startup_location_asked", true).apply();
             permissionPending = true;
@@ -2327,14 +2385,16 @@ public final class MainActivity extends Activity {
                 stopLocation(); if (!visible) return;
                 MeetingLocationCache.remember(MainActivity.this, locationApi, locationToken, location);
                 JSONObject point = json("longitude", location.getLongitude(), "latitude", location.getLatitude(), "accuracy", location.getAccuracy(), "source", "gps"); if (location.hasSpeed()) put(point, "speed", location.getSpeed());
-                JSONObject payload = cloneJson(settings()); put(payload, "mode", "commute"); put(payload, "auto_mode", false);
-                request(() -> {
-                    if (updateRoute) locationApi.json("PUT", "/v1/settings", payload);
+                JSONObject payload = json(); put(payload, "mode", "commute"); put(payload, "auto_mode", false);
+                request("location", client -> {
+                    if (api != locationApi || !locationToken.equals(locationApi.vault.token())) return json();
+                    if (updateRoute) locationApi.patchSettings(payload);
+                    if (api != locationApi || !locationToken.equals(locationApi.vault.token())) return json();
                     locationApi.json("POST", "/v1/location", point);
-                    return locationApi.json("GET", "/v1/state", null);
+                    return json();
                 }, r -> {
                     if (api != locationApi || !locationToken.equals(api.vault.token())) return;
-                    state = r; lastNotice = "定位已更新 · 可查询当地天气与附近地点"; markTabsDirty(); renderTab();
+                    refresh(false); updateStatus();
                 });
             }
             @Override public void onProviderEnabled(String p) {}
@@ -2393,7 +2453,7 @@ public final class MainActivity extends Activity {
         label(settings, "阈值越低越敏感。AI 通话始终自动停句；开启通知会话后可锁屏继续。定时和安静记录只在前台运行。", 11, MUTED);
         button(settings, "保存偏好", true, () -> {
             if (!canAct()) return;
-            JSONObject payload = cloneJson(settings()); put(payload, "preferences", value(preferences)); put(payload, "retain_transcripts", retain.isChecked());
+            JSONObject payload = json(); put(payload, "preferences", value(preferences)); put(payload, "retain_transcripts", retain.isChecked());
             int from, until; try { from = Integer.parseInt(value(start)); until = Integer.parseInt(value(end)); } catch (Exception e) { feedback("请输入有效的工作时间", LocalCue.SETTINGS); return; }
             if (from < 0 || until > 24 || until <= from) { feedback("工作时间需要在 0–24 时内，结束晚于开始", LocalCue.SETTINGS); return; }
             put(payload, "work_start", from); put(payload, "work_end", until); put(payload, "auto_mode", false); put(payload, "timezone", value(zone));
@@ -2401,7 +2461,7 @@ public final class MainActivity extends Activity {
                 if (every < 60 || every > 3600 || seconds < 5 || seconds > 60 || level < .005 || level > .2) throw new IllegalArgumentException();
                 put(payload, "life_poll_seconds", every); put(payload, "listen_seconds", seconds); put(payload, "vad_threshold", level);
             } catch (Exception e) { feedback("请检查聆听间隔、录音时长和检测阈值的范围", LocalCue.SETTINGS); return; }
-            mutate("PUT", "/v1/settings", payload);
+            mutate("PATCH", "/v1/settings", payload);
         });
         LinearLayout privacy = disclosure(page, "账号与隐私", "密码、数据导出与管理", false);
         button(privacy, "常用地址   ›", false, () -> { if (canAct()) commutePanel.addressBook(); });
@@ -2412,7 +2472,7 @@ public final class MainActivity extends Activity {
         button(privacy, "永久注销账号", false, () -> destructive(true)).setTextColor(RED);
         button(page, "退出登录", false, () -> {
             if (!canAct()) return;
-            confirm("退出当前账号？", "服务器数据会保留，下次登录后继续使用。", () -> request(() -> api.json("POST", "/auth/logout", json()), r -> signOut()));
+            confirm("退出当前账号？", "服务器数据会保留，下次登录后继续使用。", () -> request("auth", client -> client.json("POST", "/auth/logout", json()), r -> signOut()));
         });
         developmentEntry(page);
         TextView foot = label(page, "Aidol · " + BuildConfig.VERSION_NAME, 11, MUTED); foot.setGravity(Gravity.CENTER);
@@ -2426,10 +2486,22 @@ public final class MainActivity extends Activity {
             if (!canAct()) return;
             String pass = next.getText().toString(); if (pass.isEmpty()) { next.setError("请输入新密码"); return; }
             if (!pass.equals(confirm.getText().toString())) { confirm.setError("两次密码不一致"); return; }
-            request(() -> api.json("PUT", "/auth/password", json("old_password", old.getText().toString(), "new_password", pass)), r -> {
-                api.vault.save(r.getString("token"), api.vault.username()); dialog.dismiss(); feedback("密码已更新，其他登录已失效", LocalCue.PASSWORD);
+            JSONObject passwordChange = json("old_password", old.getText().toString(), "new_password", pass);
+            request("auth", client -> client.json("PUT", "/auth/password", passwordChange), r -> {
+                api.vault.save(r.getString("token"), api.vault.username()); pendingOperations.clear(); stateRefreshing = false; stateRefreshAgain = false; ++stateRevision; dialog.dismiss(); feedback("密码已更新，其他登录已失效", LocalCue.PASSWORD);
             });
         })); dialog.show();
+    }
+
+    private boolean hasPendingWrites() {
+        if (session != null || repeatArmed || callStartPending || pendingOperations.containsKey("history")) return true;
+        if (!meetingChanges.isEmpty() || (taskBoard != null && taskBoard.hasPendingMutations())
+                || (commutePanel != null && commutePanel.hasPendingMutations())) return true;
+        for (String key : pendingOperations.keySet()) {
+            if (key.startsWith("memory:") || key.startsWith("/v1/memories") || key.startsWith("meeting:")
+                    || key.equals("settings") || key.equals("location")) return true;
+        }
+        return false;
     }
 
     private void destructive(boolean account) {
@@ -2438,16 +2510,19 @@ public final class MainActivity extends Activity {
         EditText password = field(body, "输入登录密码确认", "当前密码", true, 128);
         AlertDialog dialog = new AlertDialog.Builder(this).setTitle(account ? "永久注销账号" : "清空我的数据").setView(body).setNegativeButton("取消", null).setPositiveButton(account ? "永久注销" : "确认清空", null).create();
         dialog.setOnShowListener(v -> { dialog.getButton(-1).setTextColor(RED); dialog.getButton(-1).setOnClickListener(w -> {
-            if (!canAct()) return; if (password.length() == 0) { password.setError("请输入密码"); return; }
-            request(() -> api.json("DELETE", account ? "/auth/account" : "/v1/data", json("password", password.getText().toString())), r -> {
+            if (!canAct()) return;
+            if (hasPendingWrites()) { showError("后台仍在保存修改，请保存完成后再清空或注销；当前任务会继续执行"); return; }
+            if (password.length() == 0) { password.setError("请输入密码"); return; }
+            JSONObject confirmation = json("password", password.getText().toString());
+            request("auth", client -> client.json("DELETE", account ? "/auth/account" : "/v1/data", confirmation), r -> {
                 dialog.dismiss(); if (commutePanel != null) commutePanel.reset(); clearLocationCache(); TaskReminders.clear(this); getSharedPreferences("meeting_edit_drafts", MODE_PRIVATE).edit().clear().apply(); clearPrivateSnapshots(); if (account) signOut(); else refresh();
             });
         }); }); dialog.show();
     }
 
     private void export() {
-        if (!canAct()) return;
-        request(() -> api.json("GET", "/v1/export", null), data -> {
+        if (!canAct() || pendingOperations.containsKey("export")) return;
+        request("export", client -> client.json("GET", "/v1/export", null), data -> {
             exportData = data.toString(2).getBytes(StandardCharsets.UTF_8);
             Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT); intent.addCategory(Intent.CATEGORY_OPENABLE); intent.setType("application/json"); intent.putExtra(Intent.EXTRA_TITLE, "aidol-" + api.vault.username() + ".json"); startActivityForResult(intent, 20);
         });
@@ -2508,9 +2583,9 @@ public final class MainActivity extends Activity {
         stopRepeat(); clearHeadsetGesture();
         if (!modeFailureNotice.isEmpty() && lastNotice.equals(modeFailureNotice)) lastNotice = "";
         modeFailureNotice = "";
-        JSONObject body = cloneJson(settings()); put(body, "mode", mode); put(body, "auto_mode", false);
+        JSONObject body = json(); put(body, "mode", mode); put(body, "auto_mode", false);
         ModeChangeRetry change = new ModeChangeRetry(mode, api, sessionGeneration, android.os.SystemClock.elapsedRealtime());
-        modeChange = change; busy = true; updateStatus();
+        modeChange = change; ++stateRevision; busy = true; updateStatus();
         submitModeChange(change, api, body, openConversation);
     }
     private boolean currentModeChange(ModeChangeRetry change) {
@@ -2546,12 +2621,13 @@ public final class MainActivity extends Activity {
             abandonModeChange(change); return;
         }
         modeChangeDelay = null;
-        worker.execute(() -> {
+        operations.execute("settings", () -> {
             try {
-                JSONObject result = client.json("PUT", "/v1/settings", body);
+                if (!change.matches(api, sessionGeneration)) return;
+                JSONObject result = client.patchSettings(body);
                 runOnUiThread(() -> {
                     if (!currentModeChange(change)) { abandonModeChange(change); return; }
-                    finishModeChange(change);
+                    finishModeChange(change); ++stateRevision;
                     put(state, "settings", result);
                     String appliedMode = result.optString("mode", change.mode);
                     JSONObject agent = state.optJSONObject("agent"); if (agent == null) agent = new JSONObject();
@@ -2597,39 +2673,87 @@ public final class MainActivity extends Activity {
         });
     }
     private void saveModeAndOpenWork() { changeMode("work", true); }
-    private void mutate(String method, String path, JSONObject body) { if (canAct()) request(() -> api.json(method, path, body), r -> {
-        if (path.startsWith("/v1/memories/") && ("DELETE".equals(method) || "PUT".equals(method))) clearPrivateSnapshots();
-        refresh();
-    }); }
-    private void refresh() {
-        if (busy || session != null || api.vault.token().isEmpty()) return;
-        // Background state sync must not erase the reason a voice turn just failed.
-        // The explicit refresh button clears lastNotice before calling this method.
-        final String notice = lastNotice;
-        request(() -> api.json("GET", "/v1/state", null), r -> {
-            state = r; lastNotice = notice; markTabsDirty(); renderTab();
+    private void mutate(String method, String path, JSONObject body) {
+        if (!canAct()) return;
+        int originTab = tab;
+        String key = path.equals("/v1/settings") ? "settings" : path.startsWith("/v1/memories/") ? "memory:" + path.substring("/v1/memories/".length()) : path;
+        request(key, client -> path.equals("/v1/settings") && method.equals("PATCH") ? client.patchSettings(body) : client.json(method, path, body), r -> {
+            if (path.startsWith("/v1/memories/") && ("DELETE".equals(method) || "PUT".equals(method))) clearPrivateSnapshots();
+            refresh(tab == originTab);
+        });
+    }
+    private void refresh() { refresh(true); }
+    private void refresh(boolean display) {
+        if (api.vault.token().isEmpty()) return;
+        if (stateRefreshing) { stateRefreshAgain = true; return; }
+        stateRefreshing = true;
+        final long revision = stateRevision;
+        final int originTab = tab;
+        request("state", client -> client.json("GET", "/v1/state", null), r -> {
+            if (revision != stateRevision) { refresh(display && tab == originTab); return; }
+            if (taskBoard != null && taskBoard.hasPendingMutations()) put(r, "tasks", taskBoard.snapshot());
+            state = r; markTabsDirty();
+            // Completion of a request must not rebuild the page the user moved to, or
+            // remove an editor they are currently typing in.
+            View focus = getCurrentFocus();
+            if (display && tab == originTab && !(focus instanceof EditText) && session == null) {
+                ScrollView viewport = scroll; int y = viewport == null ? 0 : viewport.getScrollY();
+                renderTab(); restoreWorkScroll(viewport, y);
+            }
             if (taskBoard != null) taskBoard.refreshReminders();
             handler.post(startupLocationTick);
         });
     }
-    private void request(Job job, Result result) {
-        if (busy) return; busy = true; updateStatus();
-        worker.execute(() -> {
-            try { JSONObject value = job.run(); runOnUiThread(() -> {
-                busy = false; if (isDestroyed()) return; lastNotice = ""; updateStatus();
-                try { result.accept(value); } catch (Exception e) { showError("操作未完成，请稍后重试"); }
-            }); } catch (Exception e) { runOnUiThread(() -> { busy = false; if (!isDestroyed()) { lastNotice = fallback(e.getMessage(), "无法连接服务器，请检查网络后重试"); diagnosticError = lastNotice; renderDiagnostics(); updateStatus();
-                // A 409 on the sign-in screen (e.g. username taken) must replace "正在连接…"; elsewhere 409 stays quiet.
-                if (authError != null || !(e instanceof ApiClient.ApiException) || ((ApiClient.ApiException) e).status != 409) showError(lastNotice); } }); }
+    private void request(Job job, Result result) { request("read:" + (++requestSequence), job, result); }
+    private void request(String key, Job job, Result result) {
+        if (("history".equals(key) || key.startsWith("meeting:")) && pendingOperations.containsKey(key)) return;
+        if (key.startsWith("meeting:") && meetingChanges.contains(key.substring("meeting:".length()))) return;
+        final ApiClient client = api;
+        final String token = client.vault.token();
+        final boolean auth = "auth".equals(key), snapshot = "state".equals(key);
+        if (auth) { if (busy) return; busy = true; updateStatus(); }
+        if (!snapshot) ++stateRevision;
+        pendingOperations.put(key, pendingOperations.getOrDefault(key, 0) + 1);
+        if ("history".equals(key) && historyRangeAction != null) historyRangeAction.setText("后台整理中…");
+        operations.execute(key, () -> {
+            JSONObject response = null; Exception failure = null;
+            try {
+                if (api == client && token.equals(client.vault.token())) response = job.run(client);
+            } catch (Exception error) { failure = error; }
+            final JSONObject value = response; final Exception error = failure;
+            runOnUiThread(() -> {
+                if (isDestroyed() || api != client || !token.equals(client.vault.token())) return;
+                int remaining = pendingOperations.getOrDefault(key, 1) - 1;
+                if (remaining > 0) pendingOperations.put(key, remaining); else pendingOperations.remove(key);
+                if ("history".equals(key) && remaining <= 0 && historyRangeAction != null) historyRangeAction.setText("选择范围");
+                if (auth) busy = false;
+                if (!snapshot) ++stateRevision;
+                boolean refreshAgain = snapshot && stateRefreshAgain;
+                if (snapshot) { stateRefreshing = false; stateRefreshAgain = false; }
+                updateStatus();
+                if (error == null && value != null) {
+                    try { result.accept(value); } catch (Exception e) { showError("操作未完成，请稍后重试"); }
+                } else if (error != null) {
+                    lastNotice = fallback(error.getMessage(), "无法连接服务器，请检查网络后重试");
+                    diagnosticError = lastNotice; renderDiagnostics(); updateStatus();
+                    showError(lastNotice);
+                }
+                if (refreshAgain && !stateRefreshing) refresh(false);
+            });
         });
     }
-    private void signOut() { if (commutePanel != null) commutePanel.reset(); TaskReminders.clear(this); getSharedPreferences("meeting_edit_drafts", MODE_PRIVATE).edit().clear().apply(); clearVoicePreparation(); preparationAttemptAt = -60000; if (quickFeedback != null) quickFeedback.stop(); chatDraft = ""; stopLockScreenSession(); cancelSession(""); clearPrivateSnapshots(); api.vault.clear(); clearLocationCache(); syncHeadsetControls(); state = new JSONObject(); lastNotice = ""; showAuth(0); }
-    private boolean canAct() { if (busy || session != null || locationListener != null) { feedback("上一项操作正在进行，请稍候", LocalCue.BUSY); return false; } return true; }
+    private void signOut() { pendingCommutePlan = null; meetingChanges.clear(); pendingOperations.clear(); stateRefreshing = false; stateRefreshAgain = false; ++stateRevision; if (commutePanel != null) commutePanel.reset(); TaskReminders.clear(this); getSharedPreferences("meeting_edit_drafts", MODE_PRIVATE).edit().clear().apply(); clearVoicePreparation(); preparationAttemptAt = -60000; if (quickFeedback != null) quickFeedback.stop(); chatDraft = ""; stopLockScreenSession(); cancelSession(""); clearPrivateSnapshots(); api.vault.clear(); clearLocationCache(); syncHeadsetControls(); state = new JSONObject(); lastNotice = ""; showAuth(0); }
+    private boolean canAct() { if (busy) { feedback("账号或模式设置正在保存，请稍候", LocalCue.BUSY); return false; } return true; }
+    private boolean canUseAudio() {
+        if (!canAct()) return false;
+        if (session != null) { feedback("当前音频会话仍在进行，请先结束后再开启另一项音频操作", LocalCue.BUSY); return false; }
+        return true;
+    }
 
     private boolean lockScreenEnabled() { return voiceService != null && voiceService.enabled(); }
     private boolean sessionAvailable() { return visible || lockScreenEnabled(); }
     private void enableLockScreenSession() {
-        if (!visible || permissionPending || voiceServiceBound || !canAct() || api.vault.token().isEmpty()) return;
+        if (!visible || permissionPending || voiceServiceBound || !canUseAudio() || api.vault.token().isEmpty()) return;
         ArrayList<String> missing = audioPermissions(development.audioMode() == AudioMode.RISE_SDK);
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
             missing.add(Manifest.permission.POST_NOTIFICATIONS);
@@ -2696,7 +2820,7 @@ public final class MainActivity extends Activity {
                 || !state.optJSONObject("capabilities").optBoolean("voice_realtime"))) {
             stopRepeat(); feedback("千问实时语音当前不可用，请配置后端并刷新连接状态后重试", LocalCue.RETRY); return;
         }
-        if (!sessionAvailable() || permissionPending || !canAct()) return;
+        if (!sessionAvailable() || permissionPending || !canUseAudio()) return;
         if (!VoiceInteraction.allowed(listenMode, mode())) {
             stopRepeat(); headsetNotice(InteractionCopy.name(listenMode) + "不适用于" + modeName(mode()) + "，请重新选择通话与记录方式"); return;
         }
@@ -2848,7 +2972,7 @@ public final class MainActivity extends Activity {
                 avatarMeetingId = value.optString("id");
                 if (!value.optString("id").equals(workCaptionMeetingId)) {
                     workCaptionMeetingId = value.optString("id"); workCaptionList.reset(); conversationCaptionList.reset();
-                    workCaptionStartedAt = value.optString("started_at"); markTabsDirty(); renderTab();
+                    workCaptionStartedAt = value.optString("started_at"); markTabsDirty(); if (tab == 2) renderTab();
                 }
                 JSONArray previous = array(state, "work_meetings"), updated = new JSONArray();
                 updated.put(value);
@@ -2869,6 +2993,9 @@ public final class MainActivity extends Activity {
                 if (value.has("meeting_id")) { turnHasResult = true; uncertainTurnId = ""; return; }
                 turnSucceeded = true;
                 acceptBusinessResult(value);
+                if ("commute_ready".equals(value.optString("interaction")) && "commute".equals(mode())) {
+                    pendingCommutePlan = value.optJSONObject("commute_plan"); pendingCommuteOwner = CommuteService.owner(api); stopRepeat();
+                }
                 if (value.optBoolean("voice_error")) { turnSucceeded = false; stopRepeat(); }
             }
             @Override public void transcript(String text) { if (!currentSession(generation)) return; liveTranscript = text; if (liveWords != null) liveWords.setText(text); if (submittedInteraction != VoiceInteraction.NOTES && conversationFeed.transcript(text)) renderLiveTurn(); }
@@ -2888,6 +3015,7 @@ public final class MainActivity extends Activity {
                 ++sessionGeneration;
                 if (voiceService != null) voiceService.release(session, repeatArmed && listenMode == VoiceInteraction.CALL && turnSucceeded);
                 session = null; recording = false;
+                handler.post(MainActivity.this::startPendingCommute);
                 if (avatarPhase != CompanionPhase.ERROR) setAvatarPhase(CompanionPhase.COMPLETE);
                 updateWorkAvatar();
                 releaseAutomaticWorkService();
@@ -2906,8 +3034,8 @@ public final class MainActivity extends Activity {
                     else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                     if (voiceButton != null) voiceButtonText(InteractionCopy.start(listenMode)); if (cancelButton != null) cancelButton.setVisibility(repeatArmed ? View.VISIBLE : View.GONE);
                     if (api.vault.token().isEmpty()) { showAuth(0); authError.setText("登录已失效，请重新登录"); } else {
-                        if (visible && submittedInteraction == VoiceInteraction.NOTES) { tab = 2; markTabsDirty(); renderTab(); }
-                        updateStatus(); if (visible && !repeatArmed) refresh();
+                        if (visible && submittedInteraction == VoiceInteraction.NOTES && tab == 2) { markTabsDirty(); renderTab(); }
+                        updateStatus(); if (visible && !repeatArmed) refresh(false);
                     }
                 }
             }
@@ -2920,6 +3048,11 @@ public final class MainActivity extends Activity {
         if (lifeConversationLayout && callCaption != null) callCaption.setText("正在接通 AI…");
         if (cancelButton != null) cancelButton.setVisibility(View.VISIBLE); updateStatus();
     }
+    private void startPendingCommute() {
+        if (pendingCommutePlan == null || session != null || !visible || isDestroyed()) return;
+        JSONObject plan = pendingCommutePlan; pendingCommutePlan = null;
+        if ("commute".equals(mode()) && pendingCommuteOwner.equals(CommuteService.owner(api))) commutePanel.startFromConversation(plan);
+    }
     private boolean currentSession(long generation) { return !isDestroyed() && generation == sessionGeneration; }
     private boolean hasHeadsetBoundSession() { return modeCueActive() || session != null && (sessionUsesCapture || sessionIsReplay); }
     private void scheduleNextTurn() {
@@ -2929,6 +3062,7 @@ public final class MainActivity extends Activity {
         handler.removeCallbacks(repeatTick); handler.postDelayed(repeatTick, delay);
     }
     private void cancelSession(String reason) {
+        pendingCommutePlan = null;
         cancelAvatarStopCheck();
         if (modeCuePlayer != null) modeCuePlayer.stop();
         callStartPending = false;
@@ -2989,7 +3123,7 @@ public final class MainActivity extends Activity {
         if (grants.length > 0 && visible) { if (code == 3) connectHeadset(); else startVoice(); }
     }
     @Override protected void onResume() {
-        super.onResume(); visible = true; syncHeadsetControls();
+        super.onResume(); visible = true; syncHeadsetControls(); handler.post(this::startPendingCommute);
         if (commutePanel != null) commutePanel.resume();
         automaticHeadsetSuppressed = false;
         enterMaintenance("app_open");
@@ -3013,7 +3147,7 @@ public final class MainActivity extends Activity {
         else if (listenMode != VoiceInteraction.CALL && session != null && sessionUsesCapture && !session.recordsWorkCalls()) endVoice();
         stopLocation(); super.onPause();
     }
-    @Override protected void onDestroy() { visible = false; hideAvatars(); if (lifeCallSettingsDialog != null) lifeCallSettingsDialog.dismiss(); if (commutePanel != null) commutePanel.close(); if (meetingDeleteDialog != null) meetingDeleteDialog.dismiss(); if (workOptionsDialog != null) workOptionsDialog.dismiss(); if (taskBoard != null) taskBoard.close(); if (locationMonitor != null) locationMonitor.close(); if (statusPopup != null) statusPopup.dismiss(); handler.removeCallbacks(automaticHeadsetTick); if (quickFeedback != null) quickFeedback.close(); if (modeCuePlayer != null) modeCuePlayer.close(); if (meetingPlayback != null) meetingPlayback.close(); handler.removeCallbacks(workMeetingPlaybackTick); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } if (meetingPage != null) meetingPage.dismiss(); stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); ioPool.shutdownNow(); super.onDestroy(); }
+    @Override protected void onDestroy() { visible = false; hideAvatars(); if (lifeCallSettingsDialog != null) lifeCallSettingsDialog.dismiss(); if (commutePanel != null) commutePanel.close(); if (meetingDeleteDialog != null) meetingDeleteDialog.dismiss(); if (workOptionsDialog != null) workOptionsDialog.dismiss(); if (taskBoard != null) taskBoard.close(); if (locationMonitor != null) locationMonitor.close(); if (statusPopup != null) statusPopup.dismiss(); handler.removeCallbacks(automaticHeadsetTick); if (quickFeedback != null) quickFeedback.close(); if (modeCuePlayer != null) modeCuePlayer.close(); if (meetingPlayback != null) meetingPlayback.close(); handler.removeCallbacks(workMeetingPlaybackTick); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } if (meetingPage != null) meetingPage.dismiss(); stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } operations.shutdownNow(); ioPool.shutdownNow(); super.onDestroy(); }
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent); setIntent(intent);
         if (intent.getBooleanExtra("open_commute", false) && api != null && !api.vault.token().isEmpty()) switchTab(3);
@@ -3041,14 +3175,7 @@ public final class MainActivity extends Activity {
             session != null && sessionUsesCapture && session.workCapturing());
     }
     private void handleHeadsetControl(HeadsetController.ControlEvent event) {
-        HeadsetInteractionPolicy.Gesture gesture;
-        switch (event.kind) {
-            case TAP: case PRESS_SINGLE: gesture = HeadsetInteractionPolicy.Gesture.TOGGLE; break;
-            case DOUBLE_TAP: case PRESS_DOUBLE: gesture = HeadsetInteractionPolicy.Gesture.NEXT_MODE; break;
-            case TRIPLE_TAP: case PRESS_TRIPLE: gesture = HeadsetInteractionPolicy.Gesture.DISCARD_COMBINATION; break;
-            case LONG_PRESS: case PRESS_LONG: gesture = HeadsetInteractionPolicy.Gesture.CANCEL; break;
-            default: gesture = HeadsetInteractionPolicy.Gesture.IGNORE; break;
-        }
+        HeadsetInteractionPolicy.Gesture gesture = HeadsetInteractionPolicy.gesture(event.kind);
         long now = android.os.SystemClock.elapsedRealtime();
         applyHeadsetDecision(headsetPolicy.event(gesture, event.sequence, event.receivedAtMillis, now, headsetInteractionContext()));
         handler.removeCallbacks(settleHeadsetGesture);
@@ -3058,6 +3185,8 @@ public final class MainActivity extends Activity {
         if (!decision.message.isEmpty()) headsetNotice(decision.message);
         for (HeadsetInteractionPolicy.Action action : decision.actions) {
             switch (action) {
+                case VOLUME_UP: adjustHeadsetMediaVolume(true); break;
+                case VOLUME_DOWN: adjustHeadsetMediaVolume(false); break;
                 case CANCEL:
                     endVoice();
                     break;
@@ -3086,6 +3215,21 @@ public final class MainActivity extends Activity {
                     else if (repeatArmed) { handler.removeCallbacks(repeatTick); repeatAt = 0; handler.post(repeatTick); }
                     break;
             }
+        }
+    }
+    private void adjustHeadsetMediaVolume(boolean raise) {
+        android.media.AudioManager audio = (android.media.AudioManager) getSystemService(AUDIO_SERVICE);
+        if (audio == null || audio.isVolumeFixed()) {
+            headsetNotice("当前设备不支持调节媒体音量");
+            return;
+        }
+        try {
+            // One platform step, no focus request, route change, or audible feedback.
+            audio.adjustStreamVolume(android.media.AudioManager.STREAM_MUSIC,
+                raise ? android.media.AudioManager.ADJUST_RAISE : android.media.AudioManager.ADJUST_LOWER,
+                android.media.AudioManager.FLAG_SHOW_UI);
+        } catch (SecurityException error) {
+            headsetNotice("系统暂不允许调节媒体音量，请使用手机音量键");
         }
     }
     private void clearHeadsetGesture() { headsetPolicy.clearPending(); handler.removeCallbacks(settleHeadsetGesture); }
@@ -3225,7 +3369,7 @@ public final class MainActivity extends Activity {
         setStatusText(busy && modeChange == null ? "正在同步…" : lastNotice);
         if (status != null) status.setTextColor(busy && modeChange == null ? MUTED : ACCENT);
         if (activeCallRow != null) activeCallRow.setVisibility(
-            tab != 0 && repeatArmed && listenMode == VoiceInteraction.CALL ? View.VISIBLE : View.GONE);
+            tab != 0 && (session != null || repeatArmed) && listenMode == VoiceInteraction.CALL ? View.VISIBLE : View.GONE);
         // The toggle's label is baked at build time; keep it in step when the service state flips.
         if (lockScreenButton != null) lockScreenButton.setText(lockScreenEnabled() ? "停止锁屏耳机会话" : "开启本次锁屏耳机会话");
         if (voiceButton != null && session == null) voiceButtonText(callStartPending ? "正在接通…" : repeatArmed ? "通话中 · 我在听" : InteractionCopy.start(listenMode));
@@ -3242,7 +3386,7 @@ public final class MainActivity extends Activity {
         clearVoicePreparation(); preparationAttemptAt = -60000;
         ApiClient next = new ApiClient(this, development.serverUrl());
         if (api != null && !api.serverUrl.equals(next.serverUrl)) TaskReminders.clear(this);
-        api = next;
+        api = next; meetingChanges.clear(); pendingOperations.clear(); stateRefreshing = false; stateRefreshAgain = false; ++stateRevision;
         next.setDiagnostics(message -> runOnUiThread(() -> {
             if (isDestroyed() || api != next) return;
             if (message.contains("request_id=") && (session == null || !message.contains("request_id=" + session.requestId()))) return;
@@ -3259,19 +3403,17 @@ public final class MainActivity extends Activity {
         LinearLayout details = disclosure(parent, "连接设置", "Rise · 本地或远端服务", false);
         developmentSummary = label(details, "音频 · " + audioModeLabel() + "\n" + api.serverUrl, 11, ACCENT);
         button(details, "连接设置", false, this::showDevelopmentSettings);
-        button(details, "检查后端连接", false, () -> { if (canAct()) request(() -> {
-            JSONObject health = api.json("GET", "/healthz", null);
-            if (!api.vault.token().isEmpty()) health.put("account_state", api.json("GET", "/v1/state", null));
+        button(details, "检查后端连接", false, () -> { if (canAct()) request("health", client -> {
+            JSONObject health = client.json("GET", "/healthz", null);
+            if (!client.vault.token().isEmpty()) health.put("account_state", client.json("GET", "/v1/state", null));
             return health;
         }, r -> {
             JSONObject current = r.optJSONObject("account_state");
             String availability = "请登录后检查实时语音配置";
             if (current != null) {
-                state = current;
-                JSONObject caps = state.optJSONObject("capabilities");
+                JSONObject caps = current.optJSONObject("capabilities");
                 availability = caps != null && caps.optBoolean("voice_realtime")
                     ? "千问实时语音已配置（实际通话仍需验证）" : "千问实时语音未配置，请检查电脑后端";
-                markTabsDirty(); renderTab();
             }
             new AlertDialog.Builder(this).setTitle("后端可达").setMessage(api.serverUrl + "\n" + availability).setPositiveButton("完成", null).show();
         }); });
@@ -3286,7 +3428,7 @@ public final class MainActivity extends Activity {
         return group;
     }
     private void showDevelopmentSettings() {
-        if (permissionPending || !canAct()) return;
+        if (permissionPending || !canUseAudio()) return;
         stopRepeat(); clearHeadsetGesture();
         LinearLayout body = dialogBody();
         label(body, "音频模式", 15, ACCENT);
@@ -3298,7 +3440,7 @@ public final class MainActivity extends Activity {
         ScrollView container = new ScrollView(this); container.addView(body);
         new AlertDialog.Builder(this).setTitle("连接设置").setView(container).setNegativeButton("取消", null)
             .setPositiveButton("应用", (dialog, which) -> {
-                if (permissionPending || !canAct()) return;
+                if (permissionPending || !canUseAudio()) return;
                 AudioMode selected = AudioMode.RISE_SDK;
                 boolean localBackend = backend.getCheckedRadioButtonId() == backend.getChildAt(0).getId();
                 if (selected == development.audioMode() && localBackend == development.localBackend()) return;
@@ -3356,7 +3498,7 @@ public final class MainActivity extends Activity {
         deviceDetails = label(body, "", 13, INK); renderHeadset();
         label(body, "先在手机系统配对 Rise，再连接耳机。显示就绪后，点一下接通 AI 就可以一直聊。", 12, MUTED);
         if (development.audioMode() == AudioMode.RISE_SDK) {
-            button(body, "连接 / 重新连接 Rise", true, () -> { if (canAct()) connectHeadset(); });
+            button(body, "连接 / 重新连接 Rise", true, () -> { if (canUseAudio()) connectHeadset(); });
             button(body, "断开耳机", false, () -> { automaticHeadsetSuppressed = true; cancelSession("耳机已断开"); headset.disconnect(); });
             if (BuildConfig.DEBUG) button(body, "结束耳机本地录音（调试）", false, () -> confirm("结束耳机本地录音？",
                 "这会结束耳机自身正在进行的录音片段。确认当前录音可以结束后再继续；结束后可回到对话页接通 AI。",
@@ -3369,8 +3511,8 @@ public final class MainActivity extends Activity {
                 clearHeadsetGesture(); syncHeadsetControls();
                 feedback(checked ? "已申请触控联动；请看设备状态并实际测试手势" : "触控联动已关闭", checked ? LocalCue.TOUCH : LocalCue.UNTOUCH);
             });
-            label(body, "单击 / 单捏：待机时开始；聆听、思考或播报时均结束整场会话。工作录音停止后提交并保存。\n双击 / 双捏：生活 → 工作 → 通勤 → 生活；先结束当前会话，工作先保存，AI 停止播报；目标模式保持待机。\n长按 / 长捏：结束当前会话；工作录音停止后提交并保存。已提交内容可查看历史。\n\n单击、双击等待 400 毫秒组合判定；三击只撤销尚在判定的动作。短按、释放、滑动不绑定操作。\n\n仅响应 SDK 实际上报的事件，不修改耳机系统手势或固件。开启成功不等于所有手势已经实测。", 11, MUTED);
-            label(body, "单击开始或结束；双击按生活、工作、通勤循环切换。工作记录先提交再切换。断连、摘下或来电后不会自动开麦。", 11, MUTED);
+            label(body, "单击 / 单捏：待机时开始；聆听、思考或播报时均结束整场会话。工作录音停止后提交并保存。\n双击 / 双捏：生活 → 工作 → 通勤 → 生活；工作会议录音中为标记重点，其他状态切换后保持待机。\n耳机柄滑动：调节媒体音量，每次一档。\n长按 Logo 触控区：结束当前会话；工作录音停止后保存。\n长捏耳机柄：不结束会话。降噪 / 通透由耳机固件处理，当前 SDK 不支持 App 设置或确认切换。\n\n单击、双击等待 400 毫秒组合判定；三击只撤销尚在判定的动作。短按、释放不绑定操作。\n\n仅响应 SDK 实际上报的事件，不修改耳机系统手势或固件。开启成功不等于所有手势已经实测。", 11, MUTED);
+            label(body, "单击开始或结束；双击循环切换模式，工作会议录音中双击标记重点。滑动不打断录音或播放。", 11, MUTED);
         } else label(body, "当前使用 " + audioModeLabel() + "。Rise 接入在开发设置中选择，实物验收后再调整发布策略。", 12, MUTED);
         button(body, "打开系统蓝牙设置", false, () -> startActivity(new Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS)));
         ScrollView container = new ScrollView(this); container.addView(body);
@@ -3378,7 +3520,7 @@ public final class MainActivity extends Activity {
         dialog.setOnDismissListener(d -> deviceDetails = null); dialog.show();
     }
     private void connectHeadset() {
-        if (permissionPending || !canAct()) return;
+        if (permissionPending || !canUseAudio()) return;
         automaticHeadsetSuppressed = false;
         ArrayList<String> missing = audioPermissions(true);
         if (!missing.isEmpty()) { permissionPending = true; requestPermissions(missing.toArray(new String[0]), 3); return; }
@@ -3529,7 +3671,7 @@ public final class MainActivity extends Activity {
         return body;
     }
     private void fillPrompt(String prompt) {
-        if (chatInput == null || !canAct()) return;
+        if (chatInput == null || !canUseAudio()) return;
         chatInput.setText(prompt); chatInput.setSelection(chatInput.length()); chatInput.requestFocus();
         ((InputMethodManager) getSystemService(INPUT_METHOD_SERVICE)).showSoftInput(chatInput, InputMethodManager.SHOW_IMPLICIT);
     }
