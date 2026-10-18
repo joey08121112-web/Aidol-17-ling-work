@@ -10,12 +10,13 @@
 | `POST /v1/voice?request_id=…&meeting_id=…&segment_index=0&offset_ms=0` | PCM16/16kHz；`meeting_id` 与从0递增的 `segment_index` 必须同时提供，来源为 `ambient_capture`。`recognize=0` 表示该段文字已由实时字幕保存：只存录音，不做 ASR、不计额度。默认 `recognize=1` 时做整段识别，并删除起点落在该段内的实时字幕句子再写入识别结果（实时字幕中断时的兜底）。`offset_ms` 为该段在本场录音时间轴上的起点（只计已录 PCM，32 字节/毫秒，不含暂停）；旧客户端省略时按 `segment_index×20000`。只能与会议参数一起使用。每段独立 request_id；原文与场次关联在一个事务内提交。静音段保留无原文回执，不假装记录了文字。同一编号重试不重复 ASR 或原文，不同请求占用同一片段编号返回409。 |
 | `POST /v1/work-meetings/{id}/finish` | `{"segment_count":N,"complete":true}`；客户端排空后告知本场总片段数。核对0到N−1回执，完整且有文字才为 `saved`；无讲话为 `empty`，缺段／非正常结束为 `partial`。返回原文和后台整理状态；结束请求幂等，不再接受追加。异常中断可用 `complete:false` 收尾已保存部分。 |
 | `GET /v1/work-meetings` | `{"meetings":[…]}`；最多100场，置顶优先，同组按开始时间从新到旧（按实际时刻比较时区），同刻按ID稳定排序；含pinned、开始／结束时间、原文段数、标题、摘要和处理状态。只读 SQLite 快照不等待 ASR 账号锁。 |
-| `GET /v1/work-meetings/{id}` | 本场完整有序 `sources`（含 `offset_ms/duration_ms`）、`utterances`、`events`、`audio` 和 `report`；原文不按最近100条聊天裁剪。未知／其他账号编号返回404。列表另含 `duration_ms`。 |
+| `GET /v1/work-meetings/{id}` | 本场完整有序 `sources`（含 `offset_ms/duration_ms`）、`utterances`、`events`、`audio` 和 `report`；原文不按最近100条聊天裁剪。另含 `action_tasks`：行动清单中来自本场的行动项 `[{id,content,owner,due,due_at,reminder_hours,status,source_ids}]`（按生成顺序，含用户编辑过的，不含已删除的），与 `/v1/tasks` 是同一批记录，完成状态共用。未知／其他账号编号返回404。列表另含 `duration_ms`。 |
 | `WS /v1/work-meetings/{id}/live?offset_ms=N` | 实时字幕（仅请求头 Bearer 鉴权）。会议须为录音中且工作模式，否则以 4409 关闭；每条连接计一次额度，不占账号锁。客户端发送已录 PCM 二进制帧（16 kHz 单声道 PCM16，单帧 ≤64000 字节；暂停期间不发），控制消息 `{"type":"pause"}` / `{"type":"resume","offset_ms":N}` / `{"type":"end"}`。服务端发送 `ready`、`partial {text,start_ms}`（仅显示、不保存）、`final {sentences:[{id,transcript_id,start_ms,end_ms,text,speaker}]}`（已保存到本场）、`paused`、`done`（收到 end 后保存完最后几句）、`error`（上游失败，随后关闭）。时间轴为 `offset_ms` 起累计的已录 PCM；暂停或单次上游满10分钟时结束当前识别并另起一段。字幕句子以 `segment_index=-1` 进入 `utterances`/`sources`，纪要可直接引用。 |
 | `POST /v1/work-meetings/{id}/events` | `{"event_id":"16–64位","kind":"pause|resume|mark|call_start|call_end","offset_ms":N,"origin":"app|headset"}`；仅录音中可写。同一 event_id 重试返回原记录，内容不同返回409；已暂停再暂停、未暂停时继续返回409。`call_start/call_end` 标注当前会议内的耳机通话录音区间，重复开始或未开始就结束返回409；与手动暂停状态独立。读 SQLite 快照写入，不等待片段 ASR 持有的账号锁。 |
 | `GET /v1/work-meetings/{id}/audio?start_ms=0&duration_ms=600000` | 返回本场录音时间轴 `[start_ms, start_ms+duration_ms)` 的 16 kHz 单声道 WAV，单次最多 10 分钟，裁到最后一段已存音频；缺失片段补静音。无录音、已过期或已删除返回404。 |
 | `DELETE /v1/work-meetings/{id}/audio` | 只删除本场录音文件，保留原文、句子与纪要；录音中返回409。返回会议详情。 |
 | `PATCH /v1/work-meetings/{id}` | `{pinned:true/false}`（严格布尔值）；返回`{meeting_id,pinned,meetings}`。重复设置幂等，未找到/跨账号404；不改原开始时间、状态或纪要。 |
+| `PUT /v1/work-meetings/{id}/speakers` | `{"label":"说话人N","name":"张三"}`；`name` 合并空白后最多20字，空字符串清除该名称，不能是另一个“说话人N/发言人N”编号或含控制字符（422）。返回完整会议，其中 `speaker_names` 为 `{label: name}`，只含本场仍存在的标签。录音中或整场识别 pending 时返回409；会议不存在或本场没有该标签返回404。仅改显示：原文句子、`speakers`、纪要和任务仍保存标签，客户端在文字记录、纪要和导出中把标签替换为名称，无需重新生成纪要。整场说话人识别写入新结果时清空本场 `speaker_names`。会议列表也返回 `speaker_names`。 |
 | `DELETE /v1/work-meetings/{id}` | 删除已结束会议；录音中409，未知/跨账号404。成功返回`{ok,deleted_task_ids,meetings,meeting_report,tasks,transcripts}`，后四项为删除后的当前账号快照；同账号已删除ID重复请求返回相同删除回执，不恢复会议。 |
 | `POST /v1/work-meetings/{id}/retry-summary` | 只重新处理已保存的文字，不重新 ASR 或上传音频；并发轮询不重复启动后台任务。替换同场旧纪要和待办，保留相同待办的完成状态。 |
 
@@ -110,7 +111,7 @@ state 最多返回 100 条转写（按时间正序）、300 条记忆、300 条�
 
 ### 自定义行动清单与通知（2026-10-18）
 
-- `GET /v1/tasks`：当前账号最多10000条行动项，含原有字段及 `due_at`（UTC ISO时间，旧AI待办为空）、`reminder_hours`（旧记录为0）。此快照不等待语音业务锁。state原有最近300条保持兼容。
+- `GET /v1/tasks`：当前账号最多10000条行动项，含原有字段及 `due_at`（UTC ISO时间，旧AI待办为空）、`reminder_hours`（旧记录为0）、`meeting_id`（工作会议纪要生成的行动项所属会议，手动任务为空；用户编辑后仍保留）和 `meeting`（`{id,title,started_at}`，会议不存在或手动任务为 null）。旧行动项在升级后按所属纪要或引用的原文句子自动补齐 `meeting_id`。此快照不等待语音业务锁。state原有最近300条保持兼容；`POST/PUT /v1/tasks` 的返回也带这两个字段。
 - `POST /v1/tasks`：`{task_id, content, owner, due_at, reminder_hours}`。客户端UUID（16–64位字母/数字/连字符），内容1–500有效字、负责人0–100字、带时区的未来截止时间，提前量0/1/6/24小时（0为不提醒）。返回行动项，同ID同内容幂等，不同内容409；已删除ID不能被迟到重试重建。手动任务没有report或录音来源，不消耗模型额度。
 - `PUT /v1/tasks/{id}`：`{content, owner, due?, due_at?, reminder_hours}`，编辑已有手动或AI任务，返回更新后的行动项；未知/跨账号/已删除404。内容1–500有效字、负责人0–100字、文字截止时间0–500字；`due_at`可为空，否则须含时区并统一为UTC；有具体时间时覆盖文字due。允许保留已过期截止时间，过期不安排通知；提前量0/1/6/24，有提醒时必须提供具体截止时间。保留原ID、创建时间、完成状态和来源，不创建副本。修改过的AI行动项独立保存，原会议纪要的生成快照不变，重新整理不会覆盖该行动项或恢复完全相同的原始行动项；撤回原来源时仍可联动删除。未改变字段的保存不解除原纪要关联；重复相同PUT幂等，不消耗模型额度。
 - `PATCH /v1/tasks/{id}`：原有open/done契约保留。Android只更新对应卡片、计数及提醒，不刷新整页、不改变排序或当前滚动位置。

@@ -48,6 +48,14 @@ final class CommutePanel implements AutoCloseable {
     private Runnable permissionAction;
     private LinearLayout summary, addressRows;
     private TextView originButton, destinationButton, transportButton, startButton, endButton, navigationButton, navigationHint, status;
+    /** While a commute runs, its state and the only in-app end control stay above the fold. */
+    private LinearLayout activeBar;
+    private TextView activeTitle;
+    /** Reverse-geocoded phone position shown on the origin row while the origin follows GPS. */
+    private JSONObject currentPlace;
+    private long originAttemptAt = -600_000;
+    private boolean locatingOrigin;
+    private String originProblem = "";
     private ScrollView pageScroll;
     private String lastRender = "";
     private Dialog navigationFallback;
@@ -195,6 +203,7 @@ final class CommutePanel implements AutoCloseable {
     }
     private final Runnable tick = new Runnable() { public void run() {
         if (closed || !visible.getAsBoolean()) return;
+        locateOrigin(false);
         boolean running = CommuteService.running(client.get());
         JSONObject active = CommuteService.current(client.get());
         if (active != null) journey = active;
@@ -203,9 +212,22 @@ final class CommutePanel implements AutoCloseable {
     }};
     void render(LinearLayout parent, ScrollView scroll) {
         pageScroll = scroll; resume();
+        activeBar = card(parent); activeBar.setOrientation(LinearLayout.HORIZONTAL); activeBar.setGravity(Gravity.CENTER_VERTICAL);
+        activeBar.setPadding(dp(16), dp(10), dp(10), dp(10));
+        activeBar.setBackground(EditorUi.shape(activity, 0xfff3f7ff, 22, 0xffd0dfff));
+        activeTitle = EditorUi.text(activity, "", 15, EditorUi.INK);
+        activeBar.addView(activeTitle, new LinearLayout.LayoutParams(0, -2, 1));
+        endButton = EditorUi.button(activity, "结束通勤", false, this::stop);
+        endButton.setTextColor(EditorUi.RED); endButton.setBackground(EditorUi.shape(activity, 0xffffffff, 16, EditorUi.RED));
+        endButton.setMinWidth(dp(112)); endButton.setMinHeight(dp(48)); endButton.setContentDescription("结束本次通勤");
+        activeBar.addView(endButton, new LinearLayout.LayoutParams(-2, -2));
         mapPanel.renderMap(parent);
         LinearLayout plan = card(parent);
-        originButton = compactButton(plan, "", () -> { if (editable()) choosePlace(true, p -> { journeyVersion++; origin = p; originMode = p == null ? "gps" : "fixed"; update(); }); });
+        originButton = compactButton(plan, "", () -> {
+            if (!editable()) return;
+            if ("gps".equals(originMode) && !locationAllowed()) { withPermission(false, () -> locateOrigin(true)); return; }
+            choosePlace(true, p -> { journeyVersion++; origin = p; originMode = p == null ? "gps" : "fixed"; update(); if (p == null) locateOrigin(true); });
+        });
         destinationButton = compactButton(plan, "", () -> { if (editable()) choosePlace(false, p -> { journeyVersion++; destination = p; update(); }); });
         transportButton = compactButton(plan, "", () -> {
             if (!editable()) return;
@@ -217,9 +239,8 @@ final class CommutePanel implements AutoCloseable {
         navigationHint = text(plan, "", 12, EditorUi.MUTED);
         startButton = button(plan, "开始通勤", true, this::start);
         navigationPrimary = null;
-        endButton = button(plan, "结束通勤", false, this::stop);
         status = text(plan, "", 12, EditorUi.MUTED);
-        text(plan, "开始后每 3 分钟更新定位与路线，锁屏也继续；可从通知结束。固定起点保留原地址，仅更新路线耗时估算。", 12, EditorUi.MUTED);
+        text(plan, "开始后每 3 分钟更新路线，锁屏也会继续。随时可以在本页结束通勤；部分手机需要长按通知才会出现操作按钮。", 12, EditorUi.MUTED);
         LinearLayout stations = card(parent);
         text(stations, "站点提醒", 18, EditorUi.INK);
         stationStatus = text(stations, CommuteService.reminderStatus(client.get()), 13, EditorUi.MUTED);
@@ -239,17 +260,65 @@ final class CommutePanel implements AutoCloseable {
         LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, dp(48)); p.setMargins(0, dp(3), 0, dp(3));
         parent.addView(button, p); return button;
     }
+    private String gpsOrigin() {
+        if (currentPlace != null) {
+            String address = currentPlace.optString("address"), city = currentPlace.optString("city");
+            // The city is implied by the route; keep the row to district and street.
+            if (!city.isEmpty() && address.startsWith(city) && address.length() > city.length()) address = address.substring(city.length());
+            return "当前位置 · " + address;
+        }
+        if (locatingOrigin) return "正在定位当前位置…";
+        if (!locationAllowed()) return "当前位置（点此开启定位）";
+        return originProblem.isEmpty() ? "当前位置" : "当前位置（" + originProblem + "）";
+    }
+    private boolean locationAllowed() {
+        return activity.checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            || activity.checkSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED;
+    }
+    /** Resolves the phone's position to an address: every 3 minutes while visible, or 1 minute after a failure. */
+    private void locateOrigin(boolean force) {
+        if (closed || locatingOrigin || !"gps".equals(originMode) || !locationAllowed()) return;
+        long now = SystemClock.elapsedRealtime();
+        if (!force && now - originAttemptAt < (currentPlace == null ? 60_000 : 180_000)) return;
+        ApiClient api = client.get(); if (api == null || api.vault.token().isEmpty()) return;
+        String token = api.vault.token(); long current = generation;
+        originAttemptAt = now; locatingOrigin = true; update();
+        queries.execute(() -> {
+            JSONObject place = null; String problem = "";
+            try {
+                JSONObject fix = MeetingStartLocation.capture(activity, api, visible);
+                LocationSnapshot snap = fix == null ? null : LocationSnapshot.parse(fix.toString());
+                if (snap == null || !snap.usable(System.currentTimeMillis(), 120_000)) problem = "暂未获得定位";
+                else {
+                    JSONObject data = api.json("POST", "/v1/maps/reverse", fix);
+                    if (data.optBoolean("available")) place = data; else problem = data.optString("reason", "无法识别当前位置");
+                }
+            } catch (Exception e) { problem = "定位失败"; }
+            JSONObject found = place; String reason = problem;
+            ui.post(() -> {
+                locatingOrigin = false;
+                if (!current(api, token, current)) return;
+                if (found != null) currentPlace = found;
+                originProblem = reason; update();
+            });
+        });
+    }
     private boolean editable() { if (journey.optBoolean("active")) { notice = "请先结束本次通勤，再修改起终点"; update(); return false; } return !mutating; }
     private void update() {
         if (stationStatus != null) stationStatus.setText(CommuteService.reminderStatus(client.get()));
         if (originButton == null) return;
-        originButton.setText("起点  ·  " + ("gps".equals(originMode) ? "当前位置" : origin == null ? "选择自定义起点" : origin.optString("name")));
+        originButton.setText("起点  ·  " + ("gps".equals(originMode) ? gpsOrigin() : origin == null ? "选择自定义起点" : origin.optString("name")));
         destinationButton.setText("终点  ·  " + (destination == null ? "选择目的地" : destination.optString("name")));
         transportButton.setText("出行方式  ·  " + methodName(transport));
         boolean running = CommuteService.running(client.get()), active = journey.optBoolean("active");
         startButton.setText(running ? "立即更新路线" : active ? "继续通勤" : "开始通勤"); startButton.setEnabled(!mutating);
-        endButton.setVisibility(active || running || !pendingJourneyId.isEmpty() ? View.VISIBLE : View.GONE);
-        endButton.setEnabled(!stopping);
+        activeBar.setVisibility(active || running || !pendingJourneyId.isEmpty() ? View.VISIBLE : View.GONE);
+        endButton.setEnabled(!stopping); endButton.setText(stopping ? "正在结束…" : "结束通勤");
+        JSONObject activeRoute = journey.optJSONObject("route");
+        activeTitle.setText(!running && active ? "通勤已暂停\n可继续或结束"
+            : activeRoute != null && activeRoute.optBoolean("available")
+            ? "通勤进行中\n预计还需 " + Math.max(1, Math.round(activeRoute.optDouble("eta_seconds") / 60)) + " 分钟"
+            : "通勤进行中\n正在获取路线…");
         updateNavigation(active, running);
         status.setText(!notice.isEmpty() ? notice : running ? CommuteService.status(client.get()) : active ? "后台定位已暂停，请点继续通勤" : "选择起终点后开始通勤");
         mapPanel.update(originMode, origin, destination, transport, journey);
@@ -446,7 +515,14 @@ final class CommutePanel implements AutoCloseable {
         }
         runningChanged.run();
     }
-    void modeChanged(String mode) { if (!"commute".equals(mode)) { speaker.stop(); briefingVersion++; dialogueJourney = ""; } if (!"commute".equals(mode) && (journey.optBoolean("active") || !pendingJourneyId.isEmpty() || CommuteService.running(client.get()))) stop(); }
+    boolean inProgress() { return journey.optBoolean("active") || !pendingJourneyId.isEmpty() || CommuteService.running(client.get()); }
+    /** Leaving commute mode ends the journey; returns whether one was running. */
+    boolean modeChanged(String mode) {
+        if ("commute".equals(mode)) return false;
+        speaker.stop(); briefingVersion++; dialogueJourney = "";
+        if (!inProgress()) return false;
+        stop(); return true;
+    }
     void addressBook() {
         resume(); LinearLayout body = EditorUi.column(activity), footer = EditorUi.column(activity);
         text(body, "家、公司、学校和自定义地点。地址定位一次后保存坐标，下次直接选用。", 13, EditorUi.MUTED);
@@ -561,15 +637,20 @@ final class CommutePanel implements AutoCloseable {
             public void afterTextChanged(Editable e) {}
         };
         city.addTextChangedListener(changed); query.addTextChangedListener(changed);
-        TextView progress = text(body, "常用地址直接复用已保存坐标。", 12, EditorUi.MUTED);
+        TextView progress = text(body, addresses.length() > 0 ? "点上方常用地址可直接选择" : "", 12, EditorUi.MUTED);
         button(body, "查找地址", false, () -> {
             String value = query.getText().toString().trim(), cityValue = city.getText().toString().trim();
-            if (value.isEmpty() || cityValue.isEmpty()) { progress.setText("请填写城市和地址"); return; }
+            city.setBackground(EditorUi.shape(activity, 0xffffffff, 14, cityValue.isEmpty() ? EditorUi.RED : EditorUi.LINE));
+            query.setBackground(EditorUi.shape(activity, 0xffffffff, 14, value.isEmpty() ? EditorUi.RED : EditorUi.LINE));
+            if (value.isEmpty() || cityValue.isEmpty()) {
+                progress.setTextColor(EditorUi.RED); progress.setText(cityValue.isEmpty() && value.isEmpty() ? "请填写城市和地址" : cityValue.isEmpty() ? "请填写城市" : "请填写地址或地点名称"); return;
+            }
+            progress.setTextColor(EditorUi.MUTED);
             long request = ++searchVersion[0];
             BooleanSupplier relevant = () -> editorCurrent.getAsBoolean() && request == searchVersion[0];
             query(api -> api.json("GET", "/v1/maps/geocode?address=" + Uri.encode(value) + "&city=" + Uri.encode(cityValue), null), data -> {
                 JSONArray results = data.optJSONArray("places");
-                if (results == null || results.length() == 0) { progress.setText(data.optString("reason", "未找到地址")); return; }
+                if (results == null || results.length() == 0) { progress.setTextColor(EditorUi.RED); progress.setText(data.optString("reason", "未找到地址，换个说法试试")); return; }
                 pointResults("选择地址", results, point -> { if (relevant.getAsBoolean()) { put(point, "name", value); select.accept(copy(point)); } });
             }, progress, relevant);
         });
@@ -653,7 +734,8 @@ final class CommutePanel implements AutoCloseable {
     }
     private void resetViews() {
         speaker.stop(); briefingVersion++; dialogueJourney = ""; mapPanel.reset(); navigationOpenedAt = -2000;
-        generation++; addressesVersion++; journeyVersion++; addressWrites = 0; addressesNeedReload = addressRefreshInFlight = false; pendingJourneyId = ""; loaded = loading = mutating = stopping = false; addresses = new JSONArray(); journey = new JSONObject(); origin = destination = null; originMode = "gps"; transport = "driving"; notice = ""; permissionAction = null; lastRender = "";
+        generation++; addressesVersion++; journeyVersion++; addressWrites = 0; addressesNeedReload = addressRefreshInFlight = false; pendingJourneyId = ""; loaded = loading = mutating = stopping = false; addresses = new JSONArray(); journey = new JSONObject(); origin = destination = null; originMode = "gps";
+        currentPlace = null; originAttemptAt = -600_000; locatingOrigin = false; originProblem = ""; transport = "driving"; notice = ""; permissionAction = null; lastRender = "";
         for (Dialog dialog : new ArrayList<>(dialogs)) dialog.dismiss(); addressRows = null;
     }
     void reset() { CommuteService.stop(activity); resetViews(); account = ""; }

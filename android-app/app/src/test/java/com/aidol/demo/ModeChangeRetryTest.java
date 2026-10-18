@@ -7,11 +7,22 @@ public class ModeChangeRetryTest {
     @Test public void explicitBusyRejectionKeepsOriginalIntentWithinThreeRetries() {
         Object backend = new Object();
         ModeChangeRetry retry = new ModeChangeRetry("work", backend, 7, 1000);
-        assertEquals(500, retry.delayAfterFailure(409, ModeChangeRetry.BUSY_DETAIL, 1000, backend, 7, true));
-        assertEquals(1000, retry.delayAfterFailure(409, ModeChangeRetry.BUSY_DETAIL, 1500, backend, 7, true));
-        assertEquals(1500, retry.delayAfterFailure(409, ModeChangeRetry.BUSY_DETAIL, 2500, backend, 7, true));
+        assertEquals(300, retry.delayAfterFailure(409, ModeChangeRetry.BUSY_DETAIL, 1000, backend, 7, true));
+        assertEquals(600, retry.delayAfterFailure(409, ModeChangeRetry.BUSY_DETAIL, 1500, backend, 7, true));
+        assertEquals(1000, retry.delayAfterFailure(409, ModeChangeRetry.BUSY_DETAIL, 2500, backend, 7, true));
         assertEquals(-1, retry.delayAfterFailure(409, ModeChangeRetry.BUSY_DETAIL, 4000, backend, 7, true));
         assertEquals("work", retry.mode);
+    }
+
+    @Test public void lockWaitTimeoutIsRetriedLikeABusyRejection() {
+        // Each attempt may wait ~2 s server-side; three such waits still fit the window.
+        Object backend = new Object();
+        ModeChangeRetry retry = new ModeChangeRetry("commute", backend, 7, 1000);
+        assertEquals(300, retry.delayAfterFailure(409, ModeChangeRetry.SETTLING_DETAIL, 3000, backend, 7, true));
+        assertEquals(600, retry.delayAfterFailure(409, ModeChangeRetry.SETTLING_DETAIL, 5300, backend, 7, true));
+        assertTrue(retry.canAttempt(5900, backend, 7, true));
+        assertEquals(1000, retry.delayAfterFailure(409, ModeChangeRetry.SETTLING_DETAIL, 7900, backend, 7, true));
+        assertEquals(-1, retry.delayAfterFailure(409, ModeChangeRetry.SETTLING_DETAIL, 8950, backend, 7, true));
     }
 
     @Test public void unknownResultsAndOtherConflictsNeverAuthorizeAnotherMutation() {
@@ -37,13 +48,13 @@ public class ModeChangeRetryTest {
     @Test public void elapsedDeadlineStopsRetriesEvenIfAttemptBudgetRemains() {
         Object backend = new Object();
         ModeChangeRetry retry = new ModeChangeRetry("work", backend, 7, 1000);
-        assertEquals(-1, retry.delayAfterFailure(409, ModeChangeRetry.BUSY_DETAIL, 4501, backend, 7, true));
+        assertEquals(-1, retry.delayAfterFailure(409, ModeChangeRetry.BUSY_DETAIL, 9001, backend, 7, true));
     }
 
     @Test public void leavingForegroundPermanentlyDisarmsRemainingRetries() {
         Object backend = new Object();
         ModeChangeRetry retry = new ModeChangeRetry("work", backend, 7, 1000);
-        assertEquals(500, retry.delayAfterFailure(409, ModeChangeRetry.BUSY_DETAIL, 1000, backend, 7, true));
+        assertEquals(300, retry.delayAfterFailure(409, ModeChangeRetry.BUSY_DETAIL, 1000, backend, 7, true));
         retry.stopRetrying();
         assertEquals(-1, retry.delayAfterFailure(409, ModeChangeRetry.BUSY_DETAIL, 1500, backend, 7, true));
         assertFalse(retry.canAttempt(1500, backend, 7, true));
@@ -53,7 +64,7 @@ public class ModeChangeRetryTest {
     @Test public void delayedHandlerCannotSubmitAfterTheRetryWindow() {
         Object backend = new Object();
         ModeChangeRetry retry = new ModeChangeRetry("work", backend, 7, 1000);
-        assertEquals(500, retry.delayAfterFailure(409, ModeChangeRetry.BUSY_DETAIL, 1000, backend, 7, true));
-        assertFalse(retry.canAttempt(5001, backend, 7, true));
+        assertEquals(300, retry.delayAfterFailure(409, ModeChangeRetry.BUSY_DETAIL, 1000, backend, 7, true));
+        assertFalse(retry.canAttempt(9001, backend, 7, true));
     }
 }

@@ -306,6 +306,8 @@ public final class HostedSession {
     }
     public void start() { launch(null, null, null, "aidol-voice"); }
     public void startText(String text) { launch(text, null, null, "aidol-chat"); }
+    /** Without a verified playback target a typed turn stays text-only instead of reporting a speech failure. */
+    public void startText(String text, boolean speakReply) { if (!speakReply) skipReply.set(true); startText(text); }
     public void speak(String text) { launch(null, text, null, "aidol-play"); }
     /** Announce an already-confirmed settings change; never calls the backend or starts capture. */
     public void announceMode(String businessMode) { launch(null, null, LocalCue.forMode(businessMode), "aidol-mode-cue"); }
@@ -406,7 +408,7 @@ public final class HostedSession {
                 post(() -> listener.reply(reply));
                 try { play(reply); }
                 catch (Exception e) {
-                    check(); fail("文字已保存。" + (e instanceof IOException ? e.getMessage() : "播放失败，请检查音频输出"));
+                    check(); fail("已用文字回复，语音没有播放：" + (e instanceof IOException ? e.getMessage() : "请检查耳机连接后再试"));
                     return;
                 }
             }
@@ -856,7 +858,8 @@ public final class HostedSession {
         } catch (Exception e) {
             check();
             if (e instanceof ApiClient.ApiException && ((ApiClient.ApiException) e).status == 401) api.vault.clear();
-            throw new IOException("播放失败：" + stage + " · " + (e.getMessage() == null ? "请检查音频输出后重试" : e.getMessage()), e);
+            diagnostic("播放失败 · " + stage);
+            throw new IOException(e.getMessage() == null ? "请检查音频输出后重试" : e.getMessage(), e);
         }
     }
     private void playStreaming(String text) throws Exception {

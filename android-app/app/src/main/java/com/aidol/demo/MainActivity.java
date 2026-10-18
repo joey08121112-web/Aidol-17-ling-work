@@ -93,6 +93,10 @@ public final class MainActivity extends Activity {
     private boolean sessionUsesCapture;
     private ModeChangeRetry modeChange;
     private String modeFailureNotice = "";
+    /** The mode shown before an optimistic switch; restored if the server never confirms it. */
+    private String modeBeforeChange = "";
+    /** errorNotice colours a failure red; pageNotice only explains the page it was raised on. */
+    private String errorNotice = "", pageNotice = "";
     private Runnable modeChangeDelay;
     private boolean sessionIsReplay;
     private String deferredMode;
@@ -112,7 +116,7 @@ public final class MainActivity extends Activity {
         handler.removeCallbacks(preparationTick);
         if (headset == null || api == null) return;
         HeadsetController.Snapshot device = headset.snapshot();
-        boolean eligible = visible && tab == 0 && session == null && !modeCueActive()
+        boolean eligible = visible && tab == 0 && session == null
             && !api.vault.token().isEmpty() && !"work".equals(mode())
             && state.optJSONObject("capabilities") != null
             && state.optJSONObject("capabilities").optBoolean("voice_prepare")
@@ -120,6 +124,8 @@ public final class MainActivity extends Activity {
             && WearState.from(device.leftWorn, device.rightWorn) != WearState.REMOVED
             && checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
         if (!eligible) { clearVoicePreparation(); return; }
+        // The mode cue owns the headset briefly; keep a ready link but start none until it ends.
+        if (modeCueActive()) { handler.postDelayed(preparationTick, 1000); return; }
         if (voicePreparation != null && !voicePreparation.usable(api)) clearVoicePreparation();
         // Keep standby alive while eligible, including after an expired/failed
         // preparation. A stale object must never suppress future preparation.
@@ -318,6 +324,7 @@ public final class MainActivity extends Activity {
                     permissionPending = true; requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 7);
                 }
             });
+        taskBoard.onOpenMeeting(this::openWorkMeetingAt);
         connectBackend();
         commutePanel = new CommutePanel(this, () -> api, () -> state, () -> !busy, () -> visible,
             this::commutePermissions, () -> {
@@ -370,36 +377,36 @@ public final class MainActivity extends Activity {
     private void showAuth(int mode) {
         chatDraft = "";
         authMode = mode; status = null; voiceButton = null; cancelButton = null; content = null; base();
+        // Monochrome, centred and quiet: wordmark, the fields, one primary action, text links.
+        root.setBackgroundColor(AUTH_BG);
         ScrollView sc = new ScrollView(this); sc.setFillViewport(true);
         root.addView(sc, new LinearLayout.LayoutParams(-1, -1));
-        LinearLayout body = column(); body.setPadding(dp(28), dp(24), dp(28), dp(30)); sc.addView(body);
-        TextView brand = label(body, "aidol", 25, INK); brand.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL)); brand.setLetterSpacing(-.04f);
-        if (mode == 0) {
-            CompanionOrbView mark = new CompanionOrbView(this); body.addView(mark, new LinearLayout.LayoutParams(-1, dp(160)));
-        }
-        gap(body, 12);
-        label(body, mode == 1 ? "创建你的空间。" : mode == 2 ? "找回账号。" : "好好说话。\n慢慢了解你。", 32, INK).setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        if (mode != 2) label(body, mode == 1 ? "从一次对话，开始彼此了解。" : "登录 Aidol，让每一次对话都有回响。", 14, MUTED);
-        if (mode == 2) label(body, "使用恢复码重设密码。", 14, MUTED);
-        if (BuildConfig.DEBUG) label(body, development.localBackend() ? "本地账号 · USB" : "远端账号", 12, ACCENT);
-        gap(body, 18);
-        if (mode != 2) {
-            LinearLayout tabs = row(); body.addView(tabs);
-            segment(tabs, "登录", mode == 0, () -> { if (!busy) showAuth(0); });
-            segment(tabs, "创建账号", mode == 1, () -> { if (!busy) showAuth(1); });
-            gap(body, 12);
-        }
-        EditText username = field(body, mode == 1 ? "账号（英文不区分大小写）" : "账号", "起个好记的名字，中文也可以", false, 128);
-        username.setInputType(InputType.TYPE_CLASS_TEXT);
-        username.setSingleLine(true);
-        EditText password = field(body, mode == 2 ? "新密码" : "密码", "填一个好记的密码即可", true, 128);
-        EditText confirm = mode == 0 ? null : field(body, "确认密码", "再输入一次密码", true, 128);
-        EditText recovery = mode == 2 ? field(body, "账号恢复码", "粘贴之前保存的恢复码", false, 128) : null;
-        CheckBox consent = new CheckBox(this); consent.setTextColor(MUTED); consent.setTextSize(12);
-        consent.setButtonTintList(android.content.res.ColorStateList.valueOf(ACCENT));
+        LinearLayout body = column(); body.setPadding(dp(28), dp(24), dp(28), dp(20)); sc.addView(body);
+        body.addView(new View(this), new LinearLayout.LayoutParams(1, 0, 1));
+        TextView brand = label(body, "aidol", 46, AUTH_INK); brand.setGravity(Gravity.CENTER);
+        brand.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL)); brand.setLetterSpacing(-.04f);
+        TextView tagline = label(body, mode == 1 ? "创建你的空间" : mode == 2 ? "用恢复码重设密码" : "好好说话，慢慢了解你。", 15, AUTH_MUTED);
+        tagline.setGravity(Gravity.CENTER); tagline.setPadding(0, dp(6), 0, 0);
+        gap(body, 44);
+        EditText username = authField(body, mode == 1 ? "账号（英文不区分大小写）" : "账号", false);
+        EditText password = authField(body, mode == 2 ? "新密码" : "密码", true);
+        EditText confirm = mode == 0 ? null : authField(body, "确认密码", true);
+        EditText recovery = mode == 2 ? authField(body, "账号恢复码", false) : null;
+        CheckBox consent = new CheckBox(this); consent.setTextColor(AUTH_MUTED); consent.setTextSize(12);
+        consent.setButtonTintList(android.content.res.ColorStateList.valueOf(AUTH_INK));
         consent.setText("我已了解：录音和文字会发送到服务器及 AI 服务处理；账号数据可导出、清空或删除。");
         if (mode == 1) body.addView(consent);
-        authError = label(body, "", 13, RED); authError.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        authError = label(body, "", 13, AUTH_ERROR); authError.setGravity(Gravity.CENTER); authError.setPadding(0, dp(4), 0, dp(4));
+        authError.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        // A validation message must not outlive the input it describes.
+        TextView shownError = authError;
+        consent.setOnCheckedChangeListener((box, checked) -> { if (checked && !busy) shownError.setText(""); });
+        android.text.TextWatcher clearError = new android.text.TextWatcher() {
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            public void onTextChanged(CharSequence s, int start, int before, int count) { if (!busy) shownError.setText(""); }
+            public void afterTextChanged(android.text.Editable e) {}
+        };
+        for (EditText edited : new EditText[]{username, password, confirm, recovery}) if (edited != null) edited.addTextChangedListener(clearError);
         Button submit = button(body, mode == 1 ? "创建账号" : mode == 2 ? "重设密码并登录" : "登录", true, () -> {
             if (busy) return;
             String name = value(username), pass = password.getText().toString();
@@ -420,10 +427,38 @@ public final class MainActivity extends Activity {
                 refresh();
             });
         });
+        submit.setTextColor(Color.WHITE); submit.setTextSize(16);
+        submit.setBackground(new RippleDrawable(ColorStateList.valueOf(0x33ffffff), shape(AUTH_INK, 27, AUTH_INK), shape(AUTH_INK, 27, AUTH_INK)));
+        submit.setMinHeight(dp(54)); submit.setMinimumHeight(dp(54));
         submit.setEnabled(!busy);
-        button(body, mode == 0 ? "忘记密码" : "返回登录", false, () -> { if (!busy) showAuth(mode == 0 ? 2 : 0); });
-        gap(body, 8);
-        developmentEntry(body);
+        LinearLayout links = row(); links.setGravity(Gravity.CENTER); links.setPadding(0, dp(6), 0, 0); body.addView(links);
+        if (mode == 0) {
+            authLink(links, "创建账号", () -> showAuth(1));
+            label(links, "·", 14, AUTH_MUTED).setPadding(dp(4), 0, dp(4), 0);
+            authLink(links, "忘记密码", () -> showAuth(2));
+        } else authLink(links, mode == 1 ? "已有账号？登录" : "返回登录", () -> showAuth(0));
+        body.addView(new View(this), new LinearLayout.LayoutParams(1, 0, 1));
+        TextView connection = label(body, "连接设置" + (BuildConfig.DEBUG ? (development.localBackend() ? " · 本地账号 USB" : " · 远端账号") : ""), 12, AUTH_MUTED);
+        connection.setGravity(Gravity.CENTER); connection.setMinHeight(dp(48)); connection.setContentDescription("连接设置");
+        connection.setOnClickListener(v -> { if (!busy) showDevelopmentSettings(); });
+    }
+    private static final int AUTH_BG = 0xffffffff, AUTH_INK = 0xff0b0b0c, AUTH_FIELD = 0xfff4f5f7, AUTH_LINE = 0xffe6e8ec,
+        AUTH_MUTED = 0xff697381, AUTH_FAINT = 0xff8d939c, AUTH_ERROR = RED;
+    /** Sign-in field: the hint is the label, read aloud through its description. */
+    private EditText authField(LinearLayout parent, String hint, boolean password) {
+        EditText view = input(hint, password, 128);
+        view.setTextColor(AUTH_INK); view.setHintTextColor(AUTH_FAINT); view.setTextSize(16); view.setSingleLine(true);
+        if (password) view.setTransformationMethod(android.text.method.PasswordTransformationMethod.getInstance());
+        else view.setInputType(InputType.TYPE_CLASS_TEXT);
+        view.setMinHeight(dp(54)); view.setPadding(dp(18), dp(14), dp(18), dp(14));
+        view.setBackground(shape(AUTH_FIELD, 14, AUTH_LINE));
+        view.setOnFocusChangeListener((v, focused) -> v.setBackground(shape(focused ? AUTH_BG : AUTH_FIELD, 14, focused ? AUTH_INK : AUTH_LINE)));
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, -2); p.bottomMargin = dp(12); parent.addView(view, p); return view;
+    }
+    private void authLink(LinearLayout parent, String text, Runnable action) {
+        TextView link = label(parent, text, 14, AUTH_INK); link.setGravity(Gravity.CENTER);
+        link.setMinHeight(dp(48)); link.setPadding(dp(10), 0, dp(10), 0);
+        link.setOnClickListener(v -> { if (!busy) action.run(); });
     }
 
     private void recoveryDialog(String code) {
@@ -576,7 +611,9 @@ public final class MainActivity extends Activity {
         if (commutePanel != null) commutePanel.pauseMap();
         // A page change does not cancel an in-flight answer, playback, or recording.
         boolean keepCall = session != null || repeatArmed;
-        if (!keepCall) stopRepeat(); tab = next; if (next == 0) followingConversation = true; hideKeyboard(); renderTab();
+        if (!keepCall) stopRepeat(); tab = next; if (next == 0) followingConversation = true; hideKeyboard();
+        if (!pageNotice.isEmpty() && lastNotice.equals(pageNotice)) lastNotice = "";
+        pageNotice = ""; renderTab(); updateStatus();
         enterMaintenance("page_return");
     }
 
@@ -617,7 +654,7 @@ public final class MainActivity extends Activity {
         cancelButton.setTextColor(RED); cancelButton.setBackground(ripple(CARD, 24, CARD));
         cancelButton.setVisibility(session == null && !repeatArmed ? View.GONE : View.VISIBLE);
         callCaption = label(hero, InteractionCopy.ready(listenMode), 12, MUTED); callCaption.setGravity(Gravity.CENTER);
-        liveWords = label(hero, "试着说：上次答应客户的事是什么？", 13, MUTED);
+        liveWords = label(hero, "开始后，会议内容会实时转成文字", 13, MUTED);
         liveWords.setGravity(Gravity.CENTER); liveWords.setMinHeight(dp(48)); liveWords.setSingleLine(true); liveWords.setEllipsize(TextUtils.TruncateAt.END);
         if (session != null) {
             liveWords.setText(recording ? liveTranscript : liveReplyText);
@@ -790,7 +827,7 @@ public final class MainActivity extends Activity {
         if (lifeCallSettingsDialog != null && lifeCallSettingsDialog.isShowing()) return;
         LinearLayout body = dialogBody();
         button(body, "耳机详情", false, this::showDeviceDetails);
-        label(body, "接通后持续聆听，停顿后自动回答。说“小万”可打断当前回复；点黑色结束按钮挂断。", 14, MUTED);
+        label(body, "接通后持续聆听，停顿后自动回答。说“小万”可打断当前回复；点“挂断”按钮结束通话。", 14, MUTED);
         voiceHint = label(body, voiceHintText(), 12, MUTED);
         lockScreenButton = button(body, lockScreenEnabled() ? "停止锁屏耳机会话" : "开启本次锁屏耳机会话", false, () -> {
             if (lockScreenEnabled()) { stopLockScreenSession(); updateStatus(); }
@@ -886,10 +923,11 @@ public final class MainActivity extends Activity {
             sentences.add(new SpeakerParagraphs.Sentence(entry.id, entry.speaker, entry.startMs, entry.text));
         java.util.List<SpeakerParagraphs.Paragraph> paragraphs = SpeakerParagraphs.build(sentences);
         if (paragraphs.isEmpty()) { label(box, "这场会议没有保存到文字。", 13, MUTED); return; }
+        SpeakerNames names = new SpeakerNames(meeting);
         for (SpeakerParagraphs.Paragraph paragraph : paragraphs) {
             StringBuilder text = new StringBuilder();
             for (SpeakerParagraphs.Sentence sentence : paragraph.sentences) text.append(sentence.text);
-            transcriptParagraph(box, paragraph.header(), text).setTextIsSelectable(true);
+            transcriptParagraph(box, paragraph.header(names), text).setTextIsSelectable(true);
         }
     }
     /** A quiet block with a thin rule on the left, like the reference header. */
@@ -1231,7 +1269,7 @@ public final class MainActivity extends Activity {
                 + " · 已保存 " + meeting.optInt("transcript_count") + " 段原文", 11, MUTED);
             label(item, meetingPlace(meeting), 11, MUTED);
             label(item, workMeetingProgress(meeting), 13, WORK);
-            String summary = meeting.isNull("summary") ? "" : meeting.optString("summary");
+            String summary = meeting.isNull("summary") ? "" : new SpeakerNames(meeting).apply(meeting.optString("summary"));
             if (!summary.isEmpty()) label(item, summary.length() > 120 ? summary.substring(0, 120) + "…" : summary, 13, MUTED);
             button(item, "查看原文与纪要", false, () -> openWorkMeeting(meeting.optString("id")));
         }
@@ -1335,7 +1373,14 @@ public final class MainActivity extends Activity {
         });
     }
     /** Full-screen meeting page: header, section navigation, one scrolling body and a persistent player bar. */
+    /** A task's source sentence to scroll to once its meeting's transcript is on screen; "" for none. */
+    private String pendingMeetingCitation = "";
+    private void openWorkMeetingAt(String meetingId, String citation) {
+        openWorkMeeting(meetingId);
+        pendingMeetingCitation = citation == null ? "" : citation;
+    }
     private void openWorkMeeting(String meetingId) {
+        pendingMeetingCitation = "";
         if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; }
         if (meetingPage != null) meetingPage.dismiss();
         openWorkMeetingId = meetingId; workMeetingDetailSnapshot = "";
@@ -1396,7 +1441,8 @@ public final class MainActivity extends Activity {
             // content changes) and detail fields the body branches on; ended_at backfills on finish.
             "transcription_status", meeting.optString("transcription_status"), "summary_stage", meeting.optString("summary_stage"),
             "processed_sections", meeting.optInt("processed_sections"), "total_sections", meeting.optInt("total_sections"),
-            "received_segments", meeting.optInt("received_segments"), "ended_at", meeting.optString("ended_at")).toString();
+            "received_segments", meeting.optInt("received_segments"), "ended_at", meeting.optString("ended_at"),
+            "action_tasks", array(meeting, "action_tasks"), "speaker_names", meeting.optJSONObject("speaker_names")).toString();
     }
     private static boolean onlyMeetingAddressChanged(String before, String after) {
         if (before.isEmpty()) return false;
@@ -1441,7 +1487,9 @@ public final class MainActivity extends Activity {
             return;
         }
         workMeetingDetailSnapshot = snapshot;
-        JSONObject report = meeting.optJSONObject("report");
+        // Speaker names are display-only: the minutes keep labels and get names on the way to the screen.
+        SpeakerNames names = new SpeakerNames(meeting);
+        JSONObject report = names.report(meeting.optJSONObject("report"));
         JSONArray sources = array(meeting, "sources");
         MeetingTimeline timeline = new MeetingTimeline(meeting);
         boolean playable = MeetingTimeline.audioPlayable(meeting);
@@ -1467,7 +1515,7 @@ public final class MainActivity extends Activity {
         java.time.ZoneId zone = java.time.ZoneId.systemDefault();
         String recordedFrom = meeting.optString("audio_started_at", meeting.optString("started_at"));
         java.util.List<String> speakerNames = new java.util.ArrayList<>();
-        for (String label : timeline.speakers()) speakerNames.add(SpeakerParagraphs.name(label));
+        for (String label : timeline.speakers()) speakerNames.add(names.display(label));
         LinearLayout meta = metaBlock(workMeetingDetail);
         label(meta, "录音主题：" + (report == null ? "本次会议" : fallback(report.optString("title"), "本次会议")), 14, MUTED);
         label(meta, "录音时间：" + TimeFormat.chineseDay(recordedFrom, zone) + " " + TimeFormat.hourMinute(recordedFrom, zone) + " - "
@@ -1517,7 +1565,7 @@ public final class MainActivity extends Activity {
             meetingSection("决策", "关键决策");
             meetingItems(workMeetingDetail, array(report, "decisions"), meeting, timeline, false);
             meetingSection("待办", "行动待办");
-            meetingItems(workMeetingDetail, array(report, "tasks"), meeting, timeline, true);
+            meetingActions(meeting, timeline, array(report, "tasks"));
         }
         meetingSection("重点", "重点");
         meetingMarks(meeting, timeline, report == null ? new JSONArray() : array(report, "highlights"));
@@ -1528,6 +1576,7 @@ public final class MainActivity extends Activity {
 
         meetingSection("原文", "文字记录");
         label(workMeetingDetail, "语音识别原文，未经 AI 改写；说话人按声音自动区分，不代表真实身份。"
+            + (speakerRenamable(meeting) && !timeline.speakers().isEmpty() ? "点段首的说话人可改名。" : "")
             + (playable ? "点任意一句从那里播放。" : ""), 11, MUTED);
         if (timeline.sentences().isEmpty()) label(workMeetingDetail, "暂无已保存原文；录音转写后会陆续显示。", 14, MUTED);
         StringBuilder raw = new StringBuilder();
@@ -1538,7 +1587,7 @@ public final class MainActivity extends Activity {
                 String wall = TimeFormat.clockOf(entry.wallTime);
                 if (raw.length() > 0) raw.append("\n");
                 raw.append("[").append(wall.isEmpty() ? TimeFormat.hms(entry.startMs) : wall).append("] ")
-                    .append(entry.speaker.isEmpty() ? "" : SpeakerParagraphs.name(entry.speaker) + "：").append(entry.text);
+                    .append(entry.speaker.isEmpty() ? "" : names.display(entry.speaker) + "：").append(entry.text);
                 continue;
             }
             meetingParagraphs(run, meeting, timeline, playable); run.clear();
@@ -1551,6 +1600,11 @@ public final class MainActivity extends Activity {
             }
         }
         meetingParagraphs(run, meeting, timeline, playable);
+        if (!pendingMeetingCitation.isEmpty() && !timeline.sentences().isEmpty()) {
+            MeetingTimeline.Entry cited = timeline.sentence(pendingMeetingCitation);
+            pendingMeetingCitation = "";
+            if (cited != null) scrollToSentence(cited.id);
+        }
         gap(workMeetingDetail, 12);
         if (raw.length() > 0) {
             button(workMeetingDetail, "保存为文件（纪要 + 原文）", true, this::saveMeetingFile);
@@ -1622,9 +1676,13 @@ public final class MainActivity extends Activity {
     }
     /** Speaker paragraphs whose sentences stay individually tappable (play from there) and highlightable. */
     private void meetingParagraphs(java.util.List<SpeakerParagraphs.Sentence> sentences, JSONObject meeting, MeetingTimeline timeline, boolean playable) {
+        SpeakerNames names = new SpeakerNames(meeting);
+        boolean renamable = speakerRenamable(meeting);
         for (SpeakerParagraphs.Paragraph paragraph : SpeakerParagraphs.build(sentences)) {
             android.text.SpannableStringBuilder text = new android.text.SpannableStringBuilder();
-            TextView body = transcriptParagraph(workMeetingDetail, paragraph.header(), "");
+            String label = paragraph.speaker;
+            TextView body = transcriptParagraph(workMeetingDetail, paragraph.header(names), "",
+                renamable && !label.isEmpty() ? () -> renameSpeaker(meeting, label) : null);
             for (SpeakerParagraphs.Sentence sentence : paragraph.sentences) {
                 int start = text.length(); text.append(sentence.text);
                 workMeetingLines.put(sentence.id, body); workMeetingRanges.put(sentence.id, new int[]{start, text.length()});
@@ -1639,6 +1697,55 @@ public final class MainActivity extends Activity {
             if (playable) { body.setMovementMethod(android.text.method.LinkMovementMethod.getInstance()); body.setHighlightColor(Color.TRANSPARENT); }
             else body.setTextIsSelectable(true);
         }
+    }
+    /** Names wait for the final transcript: live labels and a pending whole-meeting pass still change. */
+    private static boolean speakerRenamable(JSONObject meeting) {
+        return !"recording".equals(meeting.optString("status")) && !"pending".equals(meeting.optString("transcription_status"));
+    }
+    private void renameSpeaker(JSONObject meeting, String label) {
+        if (!canAct()) return;
+        String id = meeting.optString("id"), number = SpeakerParagraphs.name(label), current = new SpeakerNames(meeting).custom(label);
+        LinearLayout root = EditorUi.column(this); root.setPadding(dp(20), dp(14), dp(20), dp(18));
+        root.setBackground(shape(0xfff8faff, 24, EditorUi.LINE));
+        TextView heading = EditorUi.text(this, "修改" + number + "的名称", 20, INK); heading.setTypeface(null, Typeface.BOLD); root.addView(heading);
+        // Without the whole-meeting pass, numbers are per recording run and may name different voices.
+        root.addView(EditorUi.text(this, "ready".equals(meeting.optString("transcription_status"))
+            ? "整场会议里的" + number + "都会显示为新名称，纪要和导出同步更新。原文和录音不变。"
+            : "这场会议的说话人编号可能前后不一致，改名会作用于所有标为" + number + "的段落。", 12, EditorUi.MUTED));
+        EditText input = EditorUi.input(this, root, "姓名或角色（最多20字）", current, false);
+        input.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(20)});
+        input.setSelection(input.getText().length());
+        TextView problem = EditorUi.text(this, "", 12, 0xffc34f5a); root.addView(problem);
+        android.app.Dialog dialog = new android.app.Dialog(this); dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE); dialog.setContentView(root);
+        boolean[] sending = {false};
+        java.util.function.Consumer<String> save = value -> {
+            if (sending[0]) return;
+            String name = value.trim().replaceAll("\\s+", " ");
+            if (name.matches("(说话人|发言人) ?\\d+")) { problem.setText("请填写姓名或角色，不要使用其他说话人编号"); return; }
+            sending[0] = true; problem.setText("正在保存…");
+            ApiClient client = api; String token = client.vault.token();
+            operations.execute("meeting:" + id + ":speakers", () -> {
+                try {
+                    JSONObject result = client.json("PUT", "/v1/work-meetings/" + Uri.encode(id) + "/speakers", json("label", label, "name", name));
+                    runOnUiThread(() -> {
+                        if (isDestroyed() || client != api || !token.equals(client.vault.token())) return;
+                        dialog.dismiss();
+                        if (latestMeetingDetail != null && id.equals(latestMeetingDetail.optString("id"))) latestMeetingDetail = result;
+                        workMeetingDetailSnapshot = ""; renderWorkMeetingDetail(result);
+                    });
+                } catch (Exception e) {
+                    runOnUiThread(() -> { sending[0] = false; problem.setText(fallback(e.getMessage(), "保存失败，请检查网络后重试")); });
+                }
+            });
+        };
+        root.addView(EditorUi.button(this, "保存", true, () -> save.accept(input.getText().toString())));
+        if (!current.isEmpty()) root.addView(EditorUi.button(this, "恢复为" + number, false, () -> save.accept("")));
+        root.addView(EditorUi.button(this, "取消", false, dialog::dismiss));
+        android.view.Window window = dialog.getWindow();
+        window.setBackgroundDrawableResource(android.R.color.transparent);
+        window.setLayout(getResources().getDisplayMetrics().widthPixels - dp(28), WindowManager.LayoutParams.WRAP_CONTENT);
+        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE | WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+        dialog.show(); input.requestFocus();
     }
     /** Background on one sentence inside its paragraph; null colour clears it. */
     private void markSentence(String id, Integer colour, Object[] holder) {
@@ -1689,6 +1796,57 @@ public final class MainActivity extends Activity {
             if (tasks) label(parent, "负责人：" + fallback(item.optString("owner"), "未明确") + " · 截止：" + fallback(item.optString("due"), "未提及"), 12, MUTED);
             meetingEvidence(meeting, timeline, array(item, "source_ids"));
         }
+    }
+    /**
+     * The meeting's rows in the action list, with the same completion state: checking here or in the
+     * list changes one task. Generated items the user removed from the list are shown read-only.
+     */
+    private void meetingActions(JSONObject meeting, MeetingTimeline timeline, JSONArray generated) {
+        JSONArray actions = array(meeting, "action_tasks");
+        if (actions.length() == 0) {
+            if (generated.length() > 0) label(workMeetingDetail, "以下待办已不在行动清单中：", 12, MUTED);
+            meetingItems(workMeetingDetail, generated, meeting, timeline, true);
+            return;
+        }
+        label(workMeetingDetail, "已同步到工作页“行动清单”，在这里或清单里勾选都会同步。", 12, MUTED);
+        SpeakerNames names = new SpeakerNames(meeting);  // "说话人2" owners show the name the user gave.
+        for (int i = 0; i < actions.length(); i++) {
+            JSONObject task = actions.optJSONObject(i); if (task == null) continue;
+            boolean done = "done".equals(task.optString("status"));
+            CheckBox check = new CheckBox(this); check.setText(names.apply(task.optString("content"))); check.setTextSize(15); check.setTextColor(done ? MUTED : INK);
+            check.setMinHeight(dp(48)); check.setChecked(done);
+            check.setButtonTintList(android.content.res.ColorStateList.valueOf(ACCENT));
+            check.setPaintFlags(done ? check.getPaintFlags() | Paint.STRIKE_THRU_TEXT_FLAG : check.getPaintFlags() & ~Paint.STRIKE_THRU_TEXT_FLAG);
+            workMeetingDetail.addView(check);
+            String due = task.optString("due_at").isEmpty() ? fallback(task.optString("due"), "未提及") : TimeFormat.format(task.optString("due_at"));
+            label(workMeetingDetail, "负责人：" + fallback(names.apply(task.optString("owner")), "未明确") + " · 截止：" + due, 12, MUTED);
+            meetingEvidence(meeting, timeline, array(task, "source_ids"));
+            check.setOnClickListener(v -> toggleMeetingAction(task, check));
+        }
+    }
+    private void toggleMeetingAction(JSONObject task, CheckBox check) {
+        boolean selected = check.isChecked();
+        if (!canAct()) { check.setChecked(!selected); return; }
+        check.setEnabled(false);
+        ApiClient client = api; String token = client.vault.token(), id = task.optString("id");
+        // One queue per task: repeated taps on this row apply in order.
+        operations.execute("task:" + id, () -> {
+            try {
+                client.json("PATCH", "/v1/tasks/" + Uri.encode(id), json("status", selected ? "done" : "open"));
+                runOnUiThread(() -> {
+                    if (isDestroyed() || client != api || !token.equals(client.vault.token())) return;
+                    put(task, "status", selected ? "done" : "open");
+                    check.setEnabled(true); check.setTextColor(selected ? MUTED : INK);
+                    check.setPaintFlags(selected ? check.getPaintFlags() | Paint.STRIKE_THRU_TEXT_FLAG : check.getPaintFlags() & ~Paint.STRIKE_THRU_TEXT_FLAG);
+                    if (taskBoard != null) taskBoard.refreshReminders();  // The action list and reminders follow.
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    check.setEnabled(true); check.setChecked(!selected);
+                    if (!isDestroyed()) showError(fallback(e.getMessage(), "待办状态未保存，请检查网络后重试"));
+                });
+            }
+        });
     }
     /** Compact "依据" links: the cited sentence's time and opening words; tap to jump (and play when saved). */
     private void meetingEvidence(JSONObject meeting, MeetingTimeline timeline, JSONArray ids) {
@@ -1996,8 +2154,14 @@ public final class MainActivity extends Activity {
     }
 
     /** Reference layout: small grey "说话人 1  00:00:41" header above a readable paragraph. */
-    private TextView transcriptParagraph(LinearLayout parent, String header, CharSequence text) {
+    private TextView transcriptParagraph(LinearLayout parent, String header, CharSequence text) { return transcriptParagraph(parent, header, text, null); }
+    /** onHeader, when given, makes the "说话人 1  00:00:41" line a button (rename that speaker). */
+    private TextView transcriptParagraph(LinearLayout parent, String header, CharSequence text, Runnable onHeader) {
         TextView head = label(parent, header, 13, MUTED); head.setPadding(0, dp(14), 0, dp(2));
+        if (onHeader != null) {
+            head.setClickable(true); head.setFocusable(true); head.setOnClickListener(v -> onHeader.run());
+            head.setContentDescription(header + "，点按修改说话人名称");
+        }
         TextView body = label(parent, "", 17, INK); body.setText(text);
         body.setLineSpacing(dp(6), 1.05f); body.setPadding(0, 0, 0, dp(6));
         return body;
@@ -2379,8 +2543,13 @@ public final class MainActivity extends Activity {
         LinearLayout settings = disclosure(page, "陪伴偏好", "日常习惯与聆听方式", false);
         EditText preferences = field(settings, "关于你的偏好", "喜欢什么、如何与你交流…", false, 2000); preferences.setMinLines(2); preferences.setText(settings().optString("preferences"));
         CheckBox retain = new CheckBox(this); retain.setText("保存转写与对话历史"); retain.setTextColor(INK); retain.setTextSize(13); retain.setButtonTintList(android.content.res.ColorStateList.valueOf(ACCENT)); retain.setChecked(settings().optBoolean("retain_transcripts", true)); settings.addView(retain);
-        label(settings, "关闭后不新增聊天转写历史；明确开始的工作记录仍保存转写。仍可能自动提取记忆并保存请求结果，已有数据也会保留。需要移除账号业务数据请使用清空数据。", 11, MUTED);
-        LinearLayout hours = row(); settings.addView(hours); EditText start = input("上班小时", false, 2), end = input("下班小时", false, 2); start.setInputType(InputType.TYPE_CLASS_NUMBER); end.setInputType(InputType.TYPE_CLASS_NUMBER); start.setText(String.valueOf(settings().optInt("work_start", 9))); end.setText(String.valueOf(settings().optInt("work_end", 18))); hours.addView(start, new LinearLayout.LayoutParams(0, -2, 1)); hours.addView(end, new LinearLayout.LayoutParams(0, -2, 1));
+        label(settings, "· 关闭后，新的聊天不再保存文字记录\n· 工作会议记录不受影响，仍会保存转写\n· 已有数据会保留，删除请用「账号与隐私」中的清空数据", 11, MUTED);
+        LinearLayout hours = row(); settings.addView(hours);
+        LinearLayout startColumn = column(), endColumn = column();
+        hours.addView(startColumn, new LinearLayout.LayoutParams(0, -2, 1));
+        LinearLayout.LayoutParams endSize = new LinearLayout.LayoutParams(0, -2, 1); endSize.leftMargin = dp(12); hours.addView(endColumn, endSize);
+        EditText start = field(startColumn, "上班时间（时）", "0–23", false, 2), end = field(endColumn, "下班时间（时）", "1–24", false, 2);
+        start.setInputType(InputType.TYPE_CLASS_NUMBER); end.setInputType(InputType.TYPE_CLASS_NUMBER); start.setText(String.valueOf(settings().optInt("work_start", 9))); end.setText(String.valueOf(settings().optInt("work_end", 18)));
         EditText zone = field(settings, "时区", "例如 Asia/Shanghai", false, 80); zone.setText(settings().optString("timezone", "Asia/Shanghai"));
         label(settings, "前台聆听设置", 15, INK);
         EditText interval = field(settings, "定时聆听间隔（秒）", "60–3600，默认 300", false, 4); interval.setInputType(InputType.TYPE_CLASS_NUMBER); interval.setText(String.valueOf(settings().optInt("life_poll_seconds", 300)));
@@ -2490,7 +2659,7 @@ public final class MainActivity extends Activity {
     }
 
     private void privacyInfo() {
-        new AlertDialog.Builder(this).setTitle("数据处理说明").setMessage("Aidol 测试版由测试负责人运营。\n\n账号使用唯一用户名和密码登录，无需邮箱或手机号。忘记密码时需使用注册时保存的恢复码。\n\n在你点击或通过耳机接通 AI 后采集麦克风，每句最多 60 秒；AI 通话会在回复后继续听，挂断即可停止。录音上传服务器用于语音识别；文字发送 AI 服务生成回复与记忆；回复可转换为语音播放。工作会议录音按账号保存在服务器，到期（默认30天，可设为不保存）自动删除；其他对话的原始录音不保存。\n\n对话、偏好、记忆和会议待办按账号存储在服务器。你可以关闭新的转写保存、导出、清空数据或注销账号。测试负责人可管理服务器及备份。\n\n录制他人讲话前，请先征得对方同意。AI 回复与纪要需要自行核对。\n\n账号密钥保存在设备加密存储中；服务商 API Key 不下发到手机。").setPositiveButton("了解", null).show();
+        new AlertDialog.Builder(this).setTitle("数据处理说明").setMessage("Aidol 测试版由测试负责人运营。\n\n账号使用唯一用户名和密码登录，无需邮箱或手机号。忘记密码时需使用注册时保存的恢复码。\n\n在你点击或通过耳机接通 AI 后采集麦克风，每句最多 60 秒；AI 通话会在回复后继续听，挂断即可停止。录音上传服务器用于语音识别；文字发送 AI 服务生成回复与记忆；回复可转换为语音播放。工作会议录音按账号保存在服务器，到期（默认30天，可设为不保存）自动删除；其他对话的原始录音不保存。\n\n对话、偏好、记忆和会议待办按账号存储在服务器。你可以关闭新的转写保存、导出、清空数据或注销账号。测试负责人可管理服务器及备份。\n\n录制他人讲话前，请先征得对方同意。AI 回复与纪要需要自行核对。\n\n登录凭据保存在本机加密存储中；第三方 AI 服务的密钥只保存在服务器，不会存到你的手机上。").setPositiveButton("了解", null).show();
     }
 
     private void showSources(JSONArray sources) {
@@ -2504,11 +2673,34 @@ public final class MainActivity extends Activity {
     }
 
     private void changeMode(String mode) { changeMode(mode, false); }
+    /** Leaving commute mode ends a running commute, so a tap asks first; see applyModeChange. */
     private void changeMode(String mode, boolean openConversation) {
+        if (!"commute".equals(mode) && modeChange == null && commutePanel != null && commutePanel.inProgress()) {
+            if (!canAct()) return;
+            new AlertDialog.Builder(this).setTitle("结束通勤并切换？")
+                .setMessage("切换到" + ModeCopy.name(mode) + "会结束本次通勤，后台定位和到站提醒也会停止。")
+                .setNegativeButton("继续通勤", null)
+                .setPositiveButton("结束并切换", (d, w) -> applyModeChange(mode, openConversation)).show();
+            return;
+        }
+        applyModeChange(mode, openConversation);
+    }
+    /** A headset gesture cannot be confirmed on screen, so it never ends a running commute. */
+    private void changeModeFromHeadset(String mode) {
+        if (!"commute".equals(mode) && commutePanel != null && commutePanel.inProgress()) {
+            String message = "通勤进行中，模式未切换。需要切换时，请先在通勤页结束通勤";
+            if (visible) feedback(message, LocalCue.BUSY); else pendingHeadsetNotice = message;
+            return;
+        }
+        applyModeChange(mode, false);
+    }
+    private void applyModeChange(String mode, boolean openConversation) {
         // A repeated tap during the settings request must not introduce a progress/error banner.
         if (modeChange != null) return;
         if (busy || locationListener != null || permissionPending) { feedback("上一项操作正在进行，请稍后切换模式", LocalCue.BUSY); return; }
-        clearVoicePreparation(); preparationAttemptAt = -60000;
+        // Life and commute share the call layout and a prepared voice link; the server refreshes
+        // its instructions when the call starts. Only work mode, which never prepares, drops it.
+        if ("work".equals(mode) || "work".equals(mode())) { clearVoicePreparation(); preparationAttemptAt = -60000; }
         if (modeCuePlayer != null) modeCuePlayer.stop();
         if (session != null && "work".equals(mode()) && sessionUsesCapture) {
             deferredMode = mode; deferredOpenConversation = openConversation;
@@ -2521,8 +2713,32 @@ public final class MainActivity extends Activity {
         modeFailureNotice = "";
         JSONObject body = json(); put(body, "mode", mode); put(body, "auto_mode", false);
         ModeChangeRetry change = new ModeChangeRetry(mode, api, sessionGeneration, android.os.SystemClock.elapsedRealtime());
-        modeChange = change; ++stateRevision; busy = true; updateStatus();
+        modeChange = change; ++stateRevision; busy = true;
+        // Optimistic: the tap shows the new mode at once; the request confirms or rolls it back.
+        modeBeforeChange = mode(); showMode(mode, openConversation); updateStatus();
         submitModeChange(change, api, body, openConversation);
+    }
+    /** Shows a mode locally (state, layout, controls) without touching the server or sessions. */
+    private void showMode(String value, boolean openConversation) {
+        JSONObject stored = state.optJSONObject("settings"); if (stored == null) { stored = new JSONObject(); put(state, "settings", stored); }
+        put(stored, "mode", value);
+        JSONObject agent = state.optJSONObject("agent"); if (agent == null) agent = new JSONObject();
+        put(agent, "mode", value); put(state, "agent", agent);
+        listenMode = "work".equals(value) ? VoiceInteraction.NOTES : VoiceInteraction.CALL;
+        boolean navigate = openConversation && tab != 0;
+        if (openConversation) tab = 0;
+        if (tab == 0 && !navigate && modeChoices != null) {
+            // Preserve the mounted conversation, draft/focus and the user's viewport.
+            ScrollView viewport = scroll;
+            int y = viewport == null ? 0 : viewport.getScrollY();
+            renderModeSelection();
+            if (voiceHint != null) voiceHint.setText(voiceHintText());
+            restoreWorkScroll(viewport, y);
+        } else { markTabsDirty(); renderTab(); }
+    }
+    private void restoreModeBeforeChange() {
+        String previous = modeBeforeChange; modeBeforeChange = "";
+        if (!previous.isEmpty() && !previous.equals(mode()) && !isDestroyed()) showMode(previous, false);
     }
     private boolean currentModeChange(ModeChangeRetry change) {
         return !isDestroyed() && modeChange == change && change.matches(api, sessionGeneration);
@@ -2538,7 +2754,10 @@ public final class MainActivity extends Activity {
         stopRepeat();
         finishModeChange(change);
         if (!isDestroyed()) {
-            modeFailureNotice = lastNotice = "模式切换已停止，请刷新确认当前模式"; updateStatus();
+            // An in-flight request may still have applied: show the old mode, then reload the truth.
+            restoreModeBeforeChange();
+            modeFailureNotice = lastNotice = "模式切换未确认，正在同步当前模式"; updateStatus();
+            refresh();
         }
     }
     private void pauseModeChange() {
@@ -2548,7 +2767,7 @@ public final class MainActivity extends Activity {
         // An in-flight request may already have applied, so let its existing response finish.
         if (modeChangeDelay != null) {
             stopRepeat();
-            finishModeChange(modeChange);
+            finishModeChange(modeChange); restoreModeBeforeChange();
             modeFailureNotice = lastNotice = "模式尚未切换，请稍后重新选择"; updateStatus();
         }
     }
@@ -2564,24 +2783,14 @@ public final class MainActivity extends Activity {
                 runOnUiThread(() -> {
                     if (!currentModeChange(change)) { abandonModeChange(change); return; }
                     finishModeChange(change); ++stateRevision;
+                    String shown = mode();
                     put(state, "settings", result);
                     String appliedMode = result.optString("mode", change.mode);
-                    JSONObject agent = state.optJSONObject("agent"); if (agent == null) agent = new JSONObject();
-                    put(agent, "mode", appliedMode); put(state, "agent", agent);
-                    diagnosticError = "无";
-                    if (commutePanel != null) commutePanel.modeChanged(appliedMode);
-                    listenMode = "work".equals(appliedMode) ? VoiceInteraction.NOTES : VoiceInteraction.CALL;
-                    boolean navigate = openConversation && tab != 0;
-                    if (openConversation) tab = 0;
-                    if (tab == 0 && !navigate && modeChoices != null) {
-                        // Preserve the mounted conversation, draft/focus and the user's viewport.
-                        ScrollView viewport = scroll;
-                        int y = viewport == null ? 0 : viewport.getScrollY();
-                        renderModeSelection();
-                        if (voiceHint != null) voiceHint.setText(voiceHintText());
-                        updateStatus();
-                        restoreWorkScroll(viewport, y);
-                    } else { markTabsDirty(); renderTab(); }
+                    diagnosticError = "无"; modeBeforeChange = "";
+                    if (commutePanel != null && commutePanel.modeChanged(appliedMode)) lastNotice = "已切换到" + ModeCopy.name(appliedMode) + "，本次通勤已结束";
+                    // The optimistic view already shows the request; redraw only if the server chose otherwise.
+                    if (!appliedMode.equals(shown)) showMode(appliedMode, false);
+                    updateStatus();
                     // Settings succeed independently of the local sound. No conversational session.
                     if (client == api && change.matches(api, sessionGeneration)) playModeCue(appliedMode);
                     prepareVoice();
@@ -2597,7 +2806,7 @@ public final class MainActivity extends Activity {
                     return;
                 }
                 finishModeChange(change);
-                stopRepeat();
+                stopRepeat(); restoreModeBeforeChange();
                 if (statusCode == 401) client.vault.clear();
                 lastNotice = statusCode == 409 ? "上一轮仍在处理，模式尚未切换；请稍后再试"
                     : statusCode == 401 ? "登录已失效，请重新登录"
@@ -2670,7 +2879,7 @@ public final class MainActivity extends Activity {
                 if (error == null && value != null) {
                     try { result.accept(value); } catch (Exception e) { showError("操作未完成，请稍后重试"); }
                 } else if (error != null) {
-                    lastNotice = fallback(error.getMessage(), "无法连接服务器，请检查网络后重试");
+                    lastNotice = errorNotice = fallback(error.getMessage(), "无法连接服务器，请检查网络后重试");
                     diagnosticError = lastNotice; renderDiagnostics(); updateStatus();
                     showError(lastNotice);
                 }
@@ -2703,7 +2912,7 @@ public final class MainActivity extends Activity {
         if (audio.getMode() == android.media.AudioManager.MODE_IN_CALL || audio.getMode() == android.media.AudioManager.MODE_IN_COMMUNICATION
             || headset.snapshot().inCall) { feedback("通话期间不能开启锁屏耳机会话", LocalCue.CALL); return; }
         if (development.audioMode() == AudioMode.RISE_SDK && !headset.snapshot().ready()) {
-            feedback("请先连接耳机，显示就绪后再开启", LocalCue.CONNECT); return;
+            pageFeedback("需要先连接 Rise 耳机，连好后再开启", LocalCue.CONNECT); return;
         }
         stopRepeat();
         Intent service = new Intent(this, VoiceSessionService.class);
@@ -2792,7 +3001,7 @@ public final class MainActivity extends Activity {
             requestPermissions(missing.toArray(new String[0]), 1); return;
         }
         if (development.audioMode() == AudioMode.RISE_SDK && !headset.snapshot().ready()) {
-            stopRepeat(); showDeviceDetails(); feedback("请先连接耳机，显示就绪后再点击开始", LocalCue.CONNECT); return;
+            stopRepeat(); showDeviceDetails(); pageFeedback("需要先连接 Rise 耳机，连好后再开始", LocalCue.CONNECT); return;
         }
         if (listenMode == VoiceInteraction.NOTES && !getSystemService(android.app.NotificationManager.class).areNotificationsEnabled()) {
             headsetNotice("请开启通知权限，以便切到音乐或接听电话时继续记录，并随时从通知停止"); return;
@@ -2835,7 +3044,7 @@ public final class MainActivity extends Activity {
                 qwen || state.optJSONObject("capabilities") != null && state.optJSONObject("capabilities").optBoolean("voice_reply_stream")); session.start();
     } else { lastUser = text; conversationFeed.transcript(text); renderLiveTurn();
         session.streaming(false, state.optJSONObject("capabilities") != null && state.optJSONObject("capabilities").optBoolean("speech_stream"));
-        session.startText(text); } }
+        session.startText(text, headset != null && headset.snapshot().ready()); } }
     private void newSession() {
         if (modeCuePlayer != null) modeCuePlayer.stop();
         if (quickFeedback != null) quickFeedback.stop();
@@ -2860,7 +3069,7 @@ public final class MainActivity extends Activity {
             @Override public void failure(String text) {
                 if (!currentSession(generation)) return;
                 if (!turnHasResult && session != null && session.requestId().equals(lastBusinessRequestId)) uncertainTurnId = lastBusinessRequestId;
-                turnSucceeded = false; stopRepeat(); lastNotice = text;
+                turnSucceeded = false; stopRepeat(); lastNotice = errorNotice = text;
                 setAvatarPhase(CompanionPhase.ERROR);
                 clearLiveTurn(); diagnosticError = text; renderDiagnostics(); renderTurnDetails(); updateStatus();
             }
@@ -2962,7 +3171,7 @@ public final class MainActivity extends Activity {
                     if (busy || permissionPending || locationListener != null) {
                         stopRepeat(); lastNotice = "另一项操作尚未完成，场景未切换；请完成后重新接通"; updateStatus(); return;
                     }
-                    changeMode(nextMode, open); return;
+                    applyModeChange(nextMode, open); return;
                 }
                 if (!isDestroyed()) {
                     if (!turnSucceeded || !sessionAvailable() || (!visible && listenMode != VoiceInteraction.CALL) || (listenMode == 2 && !"life".equals(mode()))) stopRepeat();
@@ -3126,8 +3335,8 @@ public final class MainActivity extends Activity {
                 case CANCEL:
                     endVoice();
                     break;
-                case CHANGE_MODE: changeMode(decision.mode); break;
-                case DEFER_MODE: changeMode(decision.mode); break;
+                case CHANGE_MODE: changeModeFromHeadset(decision.mode); break;
+                case DEFER_MODE: changeModeFromHeadset(decision.mode); break;
                 case START:
                     if (modeCuePlayer != null) modeCuePlayer.stop();
                     stopRepeat();
@@ -3303,7 +3512,8 @@ public final class MainActivity extends Activity {
     private void updateStatus() {
         renderAvatars();
         setStatusText(busy && modeChange == null ? "正在同步…" : lastNotice);
-        if (status != null) status.setTextColor(busy && modeChange == null ? MUTED : ACCENT);
+        if (status != null) status.setTextColor(busy && modeChange == null ? MUTED
+            : !errorNotice.isEmpty() && lastNotice.equals(errorNotice) ? RED : ACCENT);
         if (activeCallRow != null) activeCallRow.setVisibility(
             tab != 0 && (session != null || repeatArmed) && listenMode == VoiceInteraction.CALL ? View.VISIBLE : View.GONE);
         // The toggle's label is baked at build time; keep it in step when the service state flips.
@@ -3351,7 +3561,9 @@ public final class MainActivity extends Activity {
                 availability = caps != null && caps.optBoolean("voice_realtime")
                     ? "千问实时语音已配置（实际通话仍需验证）" : "千问实时语音未配置，请检查电脑后端";
             }
-            new AlertDialog.Builder(this).setTitle("后端可达").setMessage(api.serverUrl + "\n" + availability).setPositiveButton("完成", null).show();
+            // Endpoint and provider details are developer diagnostics; a release build only confirms the connection.
+            new AlertDialog.Builder(this).setTitle(BuildConfig.DEBUG ? "后端可达" : "服务连接正常")
+                .setMessage(BuildConfig.DEBUG ? api.serverUrl + "\n" + availability : "账号与服务都可以正常使用。").setPositiveButton("完成", null).show();
         }); });
     }
     private RadioGroup choices(LinearLayout parent, String[] options, int selected) {
@@ -3469,7 +3681,7 @@ public final class MainActivity extends Activity {
     }
     private void showError(String message) {
         if (authError != null) { authError.setText(message); return; }
-        if (message.contains("登录已失效")) { new AlertDialog.Builder(this).setTitle("请重新登录").setMessage(message).setCancelable(false).setPositiveButton("去登录", (d, w) -> signOut()).show(); return; }
+        if (message.contains("登录已失效")) { new AlertDialog.Builder(this).setTitle("登录已过期").setMessage("为保护账号安全，请重新登录。你的数据不会丢失。").setCancelable(false).setPositiveButton("去登录", (d, w) -> signOut()).show(); return; }
         new AlertDialog.Builder(this).setTitle("暂时未能完成").setMessage(message).setPositiveButton("知道了", null).show();
     }
     private void confirm(String title, String message, Runnable action) { if (!canAct()) return; new AlertDialog.Builder(this).setTitle(title).setMessage(message).setNegativeButton("取消", null).setPositiveButton("确认", (d, w) -> action.run()).show(); }
@@ -3480,6 +3692,7 @@ public final class MainActivity extends Activity {
         sourceDialog.show();
     }
     private void copy(String label, String text) { ((ClipboardManager) getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText(label, text)); feedback("已复制", LocalCue.COPIED); }
+    private void pageFeedback(String text, LocalCue cue) { feedback(text, cue); pageNotice = text; }
     private void feedback(String text, LocalCue cue) {
         if (isDestroyed()) return;
         lastNotice = text;
@@ -3616,7 +3829,10 @@ public final class MainActivity extends Activity {
         view.setMinHeight(dp(52)); view.setPadding(dp(16), dp(14), dp(16), dp(14)); view.setBackground(shape(BG, 14, LINE));
         view.setOnFocusChangeListener((v, focused) -> v.setBackground(shape(BG, 14, focused ? ACCENT : LINE)));
         view.setInputType(InputType.TYPE_CLASS_TEXT | (password ? InputType.TYPE_TEXT_VARIATION_PASSWORD : InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES));
-        view.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(max)}); view.setSingleLine(password); return view;
+        view.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(max)}); view.setSingleLine(password);
+        // setSingleLine installs SingleLineTransformationMethod, which would replace the password mask.
+        if (password) view.setTransformationMethod(android.text.method.PasswordTransformationMethod.getInstance());
+        return view;
     }
     private EditText field(LinearLayout parent, String title, String hint, boolean password, int max) {
         TextView caption = label(parent, title, 12, MUTED); EditText input = input(hint, password, max);

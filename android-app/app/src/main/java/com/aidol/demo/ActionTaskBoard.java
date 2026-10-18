@@ -33,6 +33,10 @@ final class ActionTaskBoard implements AutoCloseable {
     private Dialog addDialog;
     private ApiClient sessionClient;
     private String sessionToken = "";
+    private BiConsumer<String, String> openMeeting = (meetingId, citation) -> {};
+    private final UndoBar undo;
+    private SwipeTaskRow openRow;
+    private boolean closing;
     private void observeSession() {
         ApiClient c = api.get(); String t = c == null ? "" : c.vault.token();
         if (c != sessionClient || !t.equals(sessionToken)) {
@@ -42,8 +46,11 @@ final class ActionTaskBoard implements AutoCloseable {
     }
     ActionTaskBoard(Activity a, Supplier<ApiClient> api, BooleanSupplier allowed, Consumer<JSONArray> changed, Consumer<String> error, Runnable permission) {
         this.activity = a; this.api = api; this.allowed = allowed; this.changed = changed; this.error = error; this.notificationPermission = permission;
+        undo = new UndoBar(a);
     }
     private int dp(float n) { return EditorUi.dp(activity, n); }
+    /** Opens a task's source meeting at the sentence it cites (meeting id, first source id or ""). */
+    void onOpenMeeting(BiConsumer<String, String> open) { openMeeting = open; }
     static String account(ApiClient c) { return ServerEndpoint.sessionNamespace(c.serverUrl) + ":" + c.vault.username(); }
     boolean hasPendingMutations() { observeSession(); return mutations > 0; }
     JSONArray snapshot() { try { return new JSONArray(tasks.toString()); } catch (JSONException impossible) { return new JSONArray(); } }
@@ -101,11 +108,13 @@ final class ActionTaskBoard implements AutoCloseable {
         String id = task.optString("id"); boolean done = "done".equals(task.optString("status"));
         ApiClient rowClient = api.get(); String rowToken = rowClient.vault.token();
         SwipeTaskRow shell = new SwipeTaskRow(activity); shell.setTag(id); shell.setClipToOutline(true);
+        // Only one row keeps its actions revealed; touching another row folds the open one.
+        shell.listeners(() -> { if (openRow != null && openRow != shell) openRow.close(); }, () -> openRow = shell);
         shell.setBackground(EditorUi.shape(activity, 0xfffff0f0, 20, 0xfff2d8dc));
         LinearLayout.LayoutParams outer = new LinearLayout.LayoutParams(-1, -2); outer.setMargins(0, dp(6), 0, dp(6)); rows.addView(shell, first ? 0 : rows.getChildCount(), outer);
         LinearLayout actions = new LinearLayout(activity); actions.setGravity(Gravity.CENTER_VERTICAL);
         shell.addView(actions, new android.widget.FrameLayout.LayoutParams(dp(176), -1, Gravity.END));
-        TextView edit = EditorUi.button(activity, "编辑", false, () -> { if (current(rowClient, rowToken) && shell.isEnabled()) taskDialog(task); });
+        TextView edit = EditorUi.button(activity, "编辑", false, () -> { shell.close(); if (current(rowClient, rowToken) && shell.isEnabled()) taskDialog(task); });
         edit.setContentDescription("编辑待办：" + task.optString("content"));
         edit.setBackground(EditorUi.shape(activity, 0xffeaf1ff, 16, 0xffd0dfff));
         actions.addView(edit, new LinearLayout.LayoutParams(dp(88), -1));
@@ -114,15 +123,36 @@ final class ActionTaskBoard implements AutoCloseable {
         actions.addView(delete, new LinearLayout.LayoutParams(dp(88), -1));
         LinearLayout card = EditorUi.column(activity); card.setPadding(dp(14), dp(10), dp(14), dp(12)); card.setBackground(EditorUi.shape(activity, -1, 20, EditorUi.LINE));
         shell.addView(card, new android.widget.FrameLayout.LayoutParams(-1, -2)); shell.foreground(card);
-        CheckBox check = new CheckBox(activity); check.setText(task.optString("content")); check.setTextSize(15); check.setMinHeight(dp(48)); check.setFocusable(false);
-        check.setButtonTintList(android.content.res.ColorStateList.valueOf(EditorUi.ACCENT)); check.setChecked(done); paint(check, done); card.addView(check);
+        // The tick alone completes a task; the title opens the editor, so a stray tap never changes status.
+        LinearLayout head = new LinearLayout(activity); head.setGravity(Gravity.CENTER_VERTICAL); card.addView(head);
+        CheckBox check = new CheckBox(activity); check.setTag("done-toggle"); check.setFocusable(false);
+        check.setContentDescription("完成待办：" + task.optString("content"));
+        check.setButtonTintList(android.content.res.ColorStateList.valueOf(EditorUi.ACCENT)); check.setChecked(done);
+        head.addView(check, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        TextView taskTitle = EditorUi.text(activity, task.optString("content"), 15, EditorUi.INK);
+        taskTitle.setMinHeight(dp(48)); taskTitle.setGravity(Gravity.CENTER_VERTICAL); taskTitle.setPadding(dp(2), dp(6), 0, dp(6));
+        taskTitle.setContentDescription(task.optString("content") + "，点按编辑");
+        taskTitle.setOnClickListener(v -> { if (shell.isOpen()) { shell.close(); return; } if (current(rowClient, rowToken) && shell.isEnabled()) taskDialog(task); });
+        head.addView(taskTitle, new LinearLayout.LayoutParams(0, -2, 1)); paint(taskTitle, done);
         boolean pending = pendingTasks.contains(id); shell.setEnabled(!pending); check.setEnabled(!pending); card.setAlpha(pending ? .72f : 1f);
         String due = task.optString("due_at");
         String deadline = due.isEmpty() ? task.optString("due", "待确认") : TimeFormat.format(due);
         String detail = "负责人：" + (task.optString("owner").isEmpty() ? "待确认" : task.optString("owner")) + "\n截止：" + (deadline.isEmpty() ? "待确认" : deadline);
         if (task.optInt("reminder_hours") > 0) detail += " · 提前" + (task.optInt("reminder_hours") == 24 ? "1天" : task.optInt("reminder_hours") + "小时") + "提醒";
         card.addView(EditorUi.text(activity, detail, 11, EditorUi.MUTED));
+        JSONObject meeting = task.optJSONObject("meeting");
+        if (meeting != null) {
+            String title = meeting.optString("title", "会议记录"), when = TimeFormat.format(meeting.optString("started_at"));
+            TextView source = EditorUi.text(activity, "来自会议：" + title + (when == null || when.isEmpty() ? "" : " · " + when) + "  ›", 12, EditorUi.ACCENT);
+            source.setMinHeight(dp(40)); source.setGravity(Gravity.CENTER_VERTICAL); source.setClickable(true); source.setFocusable(true);
+            source.setContentDescription("查看来源会议：" + title + "，跳到对应原话");
+            JSONArray ids = task.optJSONArray("source_ids");
+            String meetingId = meeting.optString("id"), citation = ids == null || ids.length() == 0 ? "" : ids.optString(0);
+            source.setOnClickListener(v -> openMeeting.accept(meetingId, citation));
+            card.addView(source);
+        }
         check.setOnClickListener(v -> {
+            shell.close();
             if (!current(rowClient, rowToken) || !beginMutation(id)) { check.setChecked("done".equals(task.optString("status"))); return; }
             final ScrollView viewport = scroll;
             final LinearLayout list = rows;
@@ -132,9 +162,10 @@ final class ActionTaskBoard implements AutoCloseable {
                 finishMutation(id);
                 for (int i = 0; i < tasks.length(); i++) if (tasks.optJSONObject(i).optString("id").equals(id)) try { tasks.optJSONObject(i).put("status", selected ? "done" : "open"); } catch (JSONException ignored) {}
                 try { task.put("status", selected ? "done" : "open"); } catch (JSONException ignored) {}
-                paint(check, selected); check.setEnabled(true); card.animate().alpha(1).setDuration(180).start();
+                paint(taskTitle, selected); check.setEnabled(true); card.animate().alpha(1).setDuration(180).start();
                 refreshRebuiltRow(id, shell);
                 updateCount(); publish();
+                if (selected) undo.show("已完成：" + task.optString("content"), () -> reopen(id), null);
                 // A delayed reply must not move another work section or a rebuilt page.
                 if (viewport != null && viewport == scroll && list != null && list == rows
                         && viewport.isAttachedToWindow() && list.isAttachedToWindow() && list.isShown())
@@ -156,18 +187,50 @@ final class ActionTaskBoard implements AutoCloseable {
             }
         }
     }
-    private void paint(CheckBox view, boolean done) { view.setTextColor(done ? EditorUi.MUTED : EditorUi.INK); view.setPaintFlags(done ? view.getPaintFlags() | Paint.STRIKE_THRU_TEXT_FLAG : view.getPaintFlags() & ~Paint.STRIKE_THRU_TEXT_FLAG); }
+    /** Undo for a completion: the current row's tick runs the same reopen request as a manual untick. */
+    private void reopen(String id) {
+        View row = rows == null ? null : rows.findViewWithTag(id);
+        View box = row == null ? null : row.findViewWithTag("done-toggle");
+        if (box instanceof CheckBox && ((CheckBox) box).isChecked() && box.isEnabled()) box.performClick();
+    }
+    private void paint(TextView view, boolean done) { view.setTextColor(done ? EditorUi.MUTED : EditorUi.INK); view.setPaintFlags(done ? view.getPaintFlags() | Paint.STRIKE_THRU_TEXT_FLAG : view.getPaintFlags() & ~Paint.STRIKE_THRU_TEXT_FLAG); }
+    /** Hides the row at once and deletes after the undo window; 撤销 puts it back untouched. */
     private void remove(JSONObject task, View shell) {
         String id = task.optString("id");
         if (!shell.isEnabled() || !beginMutation(id)) return;
         shell.setEnabled(false);
-        execute("task:" + id, c -> c.json("DELETE", "/v1/tasks/" + id, null), r -> {
-            finishMutation(id); JSONArray next = new JSONArray(); for (int i = 0; i < tasks.length(); i++) if (!tasks.optJSONObject(i).optString("id").equals(id)) next.put(tasks.optJSONObject(i));
-            tasks = next; TaskReminders.cancel(activity, task.optString("id")); publish(); updateCount();
-            View visibleRow = rows == null ? null : rows.findViewWithTag(id);
-            View removed = visibleRow == null ? shell : visibleRow;
-            removed.animate().alpha(0).translationX(-dp(24)).setDuration(180).withEndAction(() -> { if (removed.getParent() instanceof android.view.ViewGroup) ((android.view.ViewGroup) removed.getParent()).removeView(removed); emptyState(); }).start();
-        }, () -> { finishMutation(id); shell.setEnabled(true); refreshRebuiltRow(id, shell); });
+        int index = -1; JSONArray next = new JSONArray();
+        for (int i = 0; i < tasks.length(); i++) { JSONObject item = tasks.optJSONObject(i); if (item.optString("id").equals(id)) index = i; else next.put(item); }
+        final int position = Math.max(0, index);
+        tasks = next; updateCount();
+        View visibleRow = rows == null ? null : rows.findViewWithTag(id);
+        View hidden = visibleRow == null ? shell : visibleRow;
+        hidden.animate().alpha(0).translationX(-dp(24)).setDuration(180).withEndAction(() -> { if (hidden.getParent() instanceof android.view.ViewGroup) ((android.view.ViewGroup) hidden.getParent()).removeView(hidden); emptyState(); }).start();
+        ApiClient client = api.get(); String token = client.vault.token();
+        Runnable restore = () -> {
+            finishMutation(id);
+            if (!current(client, token)) return;
+            JSONArray back = new JSONArray(); boolean placed = false;
+            for (int i = 0; i < tasks.length(); i++) { if (i == position) { back.put(task); placed = true; } back.put(tasks.optJSONObject(i)); }
+            if (!placed) back.put(task);
+            tasks = back; updateCount();
+            if (rows != null) {
+                View stale = rows.findViewWithTag(id); if (stale != null) { stale.animate().cancel(); rows.removeView(stale); }
+                View empty = rows.findViewWithTag("empty"); if (empty != null) rows.removeView(empty);
+                View row = row(task, false); rows.removeView(row); rows.addView(row, Math.min(position, rows.getChildCount()));
+            }
+        };
+        undo.show("已删除：" + task.optString("content"), restore, () -> {
+            if (closing) {
+                // The page is going away with the worker; the user saw this task deleted, so still send it.
+                // current() is already false during onDestroy; only the account must still match.
+                if (!token.isEmpty() && token.equals(client.vault.token())) new Thread(() -> { try { client.json("DELETE", "/v1/tasks/" + id, null); } catch (Exception ignored) { } }, "aidol-task-delete").start();
+                return;
+            }
+            execute("task:" + id, c -> c.json("DELETE", "/v1/tasks/" + id, null), r -> {
+                finishMutation(id); TaskReminders.cancel(activity, id); publish();
+            }, restore);
+        });
     }
     void addDialog() { taskDialog(null); }
     private void taskDialog(JSONObject existing) {
@@ -192,7 +255,7 @@ final class ActionTaskBoard implements AutoCloseable {
         });
         body.addView(EditorUi.text(activity, "提前提醒", 12, EditorUi.MUTED));
         RadioGroup options = new RadioGroup(activity); options.setOrientation(LinearLayout.HORIZONTAL); int[] hours = {0, 1, 6, 24}; int[] choice = {editing ? existing.optInt("reminder_hours") : 1};
-        for (int hour : hours) { RadioButton option = new RadioButton(activity); option.setText(hour == 0 ? "不提醒" : hour == 24 ? "1天" : hour + "h"); option.setId(View.generateViewId()); option.setTextSize(13);
+        for (int hour : hours) { RadioButton option = new RadioButton(activity); option.setText(hour == 0 ? "不提醒" : hour == 24 ? "1 天" : hour + " 小时"); option.setId(View.generateViewId()); option.setTextSize(13);
             option.setPadding(0, dp(8), 0, dp(8)); options.addView(option, new RadioGroup.LayoutParams(0, -2, 1)); if (hour == choice[0]) option.setChecked(true);
             option.setOnClickListener(v -> choice[0] = hour); }
         options.setBackground(EditorUi.shape(activity, -1, 14, EditorUi.LINE)); body.addView(options);
@@ -273,5 +336,5 @@ final class ActionTaskBoard implements AutoCloseable {
                 if (rows != null) { Runnable restore = preserveTaskPosition ? preserveViewport() : () -> {}; rows.removeAllViews(); for (int i = 0; i < tasks.length(); i++) row(tasks.optJSONObject(i), false); emptyState(); restore.run(); }
             }
         }, () -> {}); }
-    @Override public void close() { if (addDialog != null) addDialog.dismiss(); closed = true; worker.shutdownNow(); }
+    @Override public void close() { if (addDialog != null) addDialog.dismiss(); closing = true; undo.commitShown(); closed = true; worker.shutdownNow(); }
 }

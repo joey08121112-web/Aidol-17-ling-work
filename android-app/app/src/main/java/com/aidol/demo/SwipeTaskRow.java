@@ -11,11 +11,17 @@ final class SwipeTaskRow extends FrameLayout {
     private boolean dragging;
     private final float reveal;
     private final int slop;
+    private Runnable touched = () -> {}, opened = () -> {};
     SwipeTaskRow(Context context) { this(context, 176); }
     SwipeTaskRow(Context context, int widthDp) { super(context); reveal = widthDp * getResources().getDisplayMetrics().density; slop = ViewConfiguration.get(context).getScaledTouchSlop(); }
     void foreground(View value) { card = value; card.setClickable(true); }
+    /** touched: a gesture starts on this row; opened: its actions settle fully revealed. */
+    void listeners(Runnable touched, Runnable opened) { this.touched = touched; this.opened = opened; }
+    boolean isOpen() { return card != null && card.getTranslationX() < 0; }
+    void close() { if (isOpen()) card.animate().translationX(0).setDuration(180).start(); }
     @Override public boolean onInterceptTouchEvent(android.view.MotionEvent e) {
         if (e.getActionMasked() == MotionEvent.ACTION_DOWN) {
+            touched.run();
             startX = e.getX(); startY = e.getY(); startOffset = card.getTranslationX(); dragging = false;
             card.animate().cancel(); getParent().requestDisallowInterceptTouchEvent(true);
         } else if (e.getActionMasked() == MotionEvent.ACTION_MOVE) {
@@ -32,7 +38,9 @@ final class SwipeTaskRow extends FrameLayout {
         if (!dragging) return super.onTouchEvent(e);
         if (e.getActionMasked() == MotionEvent.ACTION_MOVE) card.setTranslationX(Math.max(-reveal, Math.min(0, startOffset + e.getX() - startX)));
         if (e.getActionMasked() == MotionEvent.ACTION_UP || e.getActionMasked() == MotionEvent.ACTION_CANCEL) {
-            card.animate().translationX(card.getTranslationX() < -reveal * .4f ? -reveal : 0).setDuration(200).start();
+            boolean open = card.getTranslationX() < -reveal * .4f;
+            card.animate().translationX(open ? -reveal : 0).setDuration(200).start();
+            if (open) opened.run();
             dragging = false; getParent().requestDisallowInterceptTouchEvent(false);
         }
         return true;

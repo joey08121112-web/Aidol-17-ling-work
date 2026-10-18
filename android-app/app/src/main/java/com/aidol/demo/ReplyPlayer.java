@@ -176,7 +176,7 @@ public final class ReplyPlayer {
             } finally { manager.unregisterAudioDeviceCallback(devices); }
             if (cancelled) { return; }
             if (target == null) throw new IOException(mode.requiresTargetIdentity()
-                ? "未核验到所连接 Rise 的媒体输出，请检查目标耳机的媒体音频和连接状态"
+                ? "没有找到 Rise 耳机的声音输出，请在系统蓝牙中打开 Rise 的“媒体音频”"
                 : "没有蓝牙媒体输出，请打开耳机的“媒体音频”开关");
         }
         if (cancelled) { return; }

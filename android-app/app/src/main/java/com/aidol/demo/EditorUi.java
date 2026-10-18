@@ -8,7 +8,7 @@ import android.view.*;
 import android.widget.*;
 
 final class EditorUi {
-    static final int INK = 0xff252b36, MUTED = 0xff77818f, ACCENT = 0xff2868df, LINE = 0xffe3e8ef;
+    static final int INK = 0xff252b36, MUTED = 0xff697381, ACCENT = 0xff2868df, LINE = 0xffe3e8ef, RED = 0xffb42318;
     static int dp(Context c, float v) { return Math.round(v * c.getResources().getDisplayMetrics().density); }
     static GradientDrawable shape(Context c, int fill, int radius, int stroke) {
         GradientDrawable d = new GradientDrawable(); d.setColor(fill); d.setCornerRadius(dp(c, radius)); d.setStroke(dp(c, 1), stroke); return d;

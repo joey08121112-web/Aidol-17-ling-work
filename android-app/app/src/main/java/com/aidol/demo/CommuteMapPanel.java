@@ -164,7 +164,7 @@ final class CommuteMapPanel implements AutoCloseable {
         if(!key.equals(mapKey)){cancel(mapTask);mapTask=null;mapKey=key;bitmap=null;image.setImageDrawable(null);mapAfter=0;}
         if(mapTask!=null || now<mapAfter)return;
         Task task=new Task(client.get());mapTask=task;mapAfter=now+180_000;
-        String message=routeReady?(route.optBoolean("geometry_partial")?"路线全景 · 部分路段未提供线形":body.optJSONArray("paths").length()==0?"已规划路线，暂无线形数据":"路线全景 · 优先展示可用方案中较短路线"):
+        String message=routeReady?(route.optBoolean("geometry_partial")?"路线全景 · 部分路段暂时无法在地图上画出":body.optJSONArray("paths").length()==0?"已规划路线，暂时无法在地图上画出":"路线全景 · 优先展示可用方案中较短路线"):
             start==null?"目的地位置 · 等待近期起点定位":end==null?"起点位置 · 请选择目的地":"起终点位置 · "+(route==null?"正在规划路线":route.optString("reason","暂未取得路线"));
         network.execute(() -> {
             try {

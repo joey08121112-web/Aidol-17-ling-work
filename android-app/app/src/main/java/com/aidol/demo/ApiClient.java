@@ -35,12 +35,14 @@ public final class ApiClient {
         HttpTransport() { this(false); }
         HttpTransport(boolean debugUsbOrigin) {
             // Reuse is safe everywhere: reads recover a stale socket on a fresh connection and
-            // mutations never replay an uncertain write. The debug USB origin only narrows the
-            // stale-socket window (adb reverse reloads) with a short pool keep-alive.
+            // mutations never replay an uncertain write.
             OkHttpClient.Builder base = new OkHttpClient.Builder().connectTimeout(15, TimeUnit.SECONDS)
                 .readTimeout(100, TimeUnit.SECONDS).writeTimeout(30, TimeUnit.SECONDS).callTimeout(120, TimeUnit.SECONDS)
                 .retryOnConnectionFailure(false).followRedirects(false).followSslRedirects(false);
-            if (debugUsbOrigin) base.connectionPool(new ConnectionPool(5, 10, TimeUnit.SECONDS));
+            // Idle sockets must be dropped before the server closes them, or the next write reuses a
+            // dead socket and fails without retry: uvicorn keeps idle connections 5 s (local USB),
+            // nginx 75 s (hosted). OkHttp's own default is 5 minutes.
+            base.connectionPool(new ConnectionPool(5, debugUsbOrigin ? 4 : 60, TimeUnit.SECONDS));
             mutations = base.build();
             safeReads = mutations.newBuilder().retryOnConnectionFailure(true).build();
             liveSockets = mutations.newBuilder().readTimeout(0, TimeUnit.SECONDS)
@@ -122,9 +124,9 @@ public final class ApiClient {
         diagnostics.accept(operation + " · HTTP " + response.code());
         if (response.isSuccessful() && response.body() != null) return response;
         try (Response failed = response) {
-            String detail = "服务暂不可用（" + failed.code() + "）";
-            try { detail = new JSONObject(failed.body().string()).optString("detail", detail); } catch (Exception ignored) {}
-            throw new ApiException(failed.code(), detail);
+            String body = null;
+            try { body = failed.body() == null ? null : failed.body().string(); } catch (IOException ignored) {}
+            throw new ApiException(failed.code(), errorMessage(failed.code(), body));
         }
     }
     public byte[] bytes(String method, String path, byte[] body, String contentType) throws Exception {
@@ -142,15 +144,23 @@ public final class ApiClient {
             if (response.body() == null) throw new IOException("服务器返回为空，请重试");
             byte[] bytes = response.body().bytes();
             if (!response.isSuccessful()) {
-                String detail = "服务暂不可用（" + response.code() + "）";
-                try { detail = new JSONObject(new String(bytes, StandardCharsets.UTF_8)).optString("detail", detail); } catch (Exception ignored) {}
-                throw new ApiException(response.code(), detail);
+                throw new ApiException(response.code(), errorMessage(response.code(), new String(bytes, StandardCharsets.UTF_8)));
             }
             return bytes;
         } catch (IOException e) {
             if (!(e instanceof ApiException)) diagnostics.accept(operation + " · " + (call.isCanceled() ? "已取消" : "网络失败：" + e.getClass().getSimpleName()));
             throw transportFailure(call, e);
         }
+    }
+    /** User-facing text for a failed response. Our routes raise Chinese details; framework
+     *  defaults ("Not Found", "Method Not Allowed", validation lists) mean a client/server mismatch. */
+    static String errorMessage(int status, String body) {
+        String detail = "";
+        try { Object value = new JSONObject(body).opt("detail"); if (value instanceof String) detail = ((String) value).trim(); }
+        catch (Exception ignored) { /* Non-JSON bodies (proxies, HTML error pages) use the fallback. */ }
+        if (!detail.isEmpty() && detail.codePoints().anyMatch(c -> Character.UnicodeScript.of(c) == Character.UnicodeScript.HAN)) return detail;
+        if (status == 404 || status == 405 || status == 501) return "服务版本暂不匹配，请更新 App 或稍后再试（错误 " + status + "）";
+        return "服务暂不可用，请稍后再试（错误 " + status + "）";
     }
     private static String operation(Call call) {
         // Only method/path/status: never log credentials, query strings or bodies.

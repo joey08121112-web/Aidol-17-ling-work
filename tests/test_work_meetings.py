@@ -1040,3 +1040,85 @@ def test_invalid_meeting_cache_metadata_is_rejected(work, extra):
         'location': {'longitude': 116.4, 'latitude': 39.9, **extra}})
     assert response.status_code == 422
     assert not runtime.store.work_meetings()
+
+
+def test_meeting_tasks_name_their_meeting_and_share_completion_with_the_detail(work):
+    client, runtime, _, _ = work
+    meeting_id = start(client)
+    upload(client, meeting_id)
+    finish(client, meeting_id)
+    [task] = client.get('/v1/tasks').json()['tasks']
+    assert task['content'] == '交设计稿' and task['meeting_id'] == meeting_id
+    assert task['meeting']['id'] == meeting_id and task['meeting']['title'] == '设计稿讨论'
+    assert task['meeting']['started_at'] and task['source_ids']
+    detail = client.get('/v1/work-meetings/' + meeting_id).json()
+    assert [(t['id'], t['status']) for t in detail['action_tasks']] == [(task['id'], 'open')]
+
+    # Completing in either place is the same row.
+    assert client.patch('/v1/tasks/' + task['id'], json={'status': 'done'}).status_code == 200
+    assert client.get('/v1/work-meetings/' + meeting_id).json()['action_tasks'][0]['status'] == 'done'
+
+    # A user edit detaches the task from the generated report but not from its meeting.
+    edited = client.put('/v1/tasks/' + task['id'], json={'content': '交终版设计稿', 'owner': '小林', 'reminder_hours': 0}).json()
+    assert edited['report_id'] == '' and edited['meeting_id'] == meeting_id and edited['meeting']['title'] == '设计稿讨论'
+    detail = client.get('/v1/work-meetings/' + meeting_id).json()
+    assert [(t['content'], t['status']) for t in detail['action_tasks']] == [('交终版设计稿', 'done')]
+
+    manual = client.post('/v1/tasks', json={'task_id': uuid4().hex, 'content': '自己加的', 'owner': '',
+                                            'due_at': '2031-02-03T18:00:00+08:00', 'reminder_hours': 0}).json()
+    assert manual['meeting_id'] == '' and manual['meeting'] is None
+    assert len(client.get('/v1/work-meetings/' + meeting_id).json()['action_tasks']) == 1
+
+
+def test_tasks_saved_before_meeting_links_are_backfilled(work):
+    client, runtime, _, _ = work
+    meeting_id = start(client)
+    upload(client, meeting_id)
+    finish(client, meeting_id)
+    generated = runtime.store.list('action_tasks')[0]
+    runtime.store.edit_action_task(generated['id'], '改过的任务', '', '', '', 0)  # Edited: no report link left.
+    with runtime.store.connect() as db:
+        db.execute("INSERT INTO action_tasks(id,report_id,content,owner,due,source_ids,status,created_at) "
+                   "SELECT 'by-report',report_id,'按报告关联','','','[]','open',created_at FROM work_meetings m "
+                   "JOIN meeting_reports r ON r.id=m.report_id WHERE m.id=?", (meeting_id,))
+        db.execute("UPDATE action_tasks SET meeting_id=''")
+        runtime.store._backfill_task_meetings(db)
+    tasks = {row['id']: row for row in runtime.store.list('action_tasks')}
+    assert tasks[generated['id']]['meeting_id'] == meeting_id  # Through its cited sentence.
+    assert tasks['by-report']['meeting_id'] == meeting_id      # Through its report signature.
+
+
+def test_speaker_names_are_display_only_and_reset_by_whole_meeting_diarization(work):
+    client, runtime, _, _ = work
+    meeting_id = start(client)
+    runtime.store.save_live_sentence(meeting_id, '我先说两句', 0, 900, speaker='说话人1')
+    runtime.store.save_live_sentence(meeting_id, '我补充一下', 1000, 1900, speaker='说话人2')
+    path = '/v1/work-meetings/' + meeting_id + '/speakers'
+    # Live labels can still be replaced, so naming waits for the final transcript.
+    busy = client.put(path, json={'label': '说话人1', 'name': '张三'})
+    assert busy.status_code == 409 and '整理完成' in busy.json()['detail']
+    finish(client, meeting_id, 0)
+
+    named = client.put(path, json={'label': '说话人1', 'name': '  张 三 '})
+    assert named.status_code == 200, named.text
+    assert named.json()['speaker_names'] == {'说话人1': '张 三'}
+    assert [u['speaker'] for u in named.json()['utterances']] == ['说话人1', '说话人2']
+    assert client.get('/v1/work-meetings/' + meeting_id).json()['speaker_names'] == {'说话人1': '张 三'}
+    assert client.get('/v1/work-meetings').json()['meetings'][0]['speaker_names'] == {'说话人1': '张 三'}
+
+    assert client.put(path, json={'label': '说话人9', 'name': '李四'}).status_code == 404
+    assert client.put('/v1/work-meetings/' + uuid4().hex + '/speakers', json={'label': '说话人1', 'name': '李四'}).status_code == 404
+    for bad in ({'label': '说话人1', 'name': '说话人2'}, {'label': '说话人1', 'name': '名' * 21},
+                {'label': '说话人1', 'name': '张\u0000三'}, {'label': '张三', 'name': '李四'}):
+        response = client.put(path, json=bad)
+        assert response.status_code == 422 and '说话人名称' in response.json()['detail']
+    assert client.put(path, json={'label': '说话人2', 'name': '李四'}).json()['speaker_names'] == {
+        '说话人1': '张 三', '说话人2': '李四'}
+    assert client.put(path, json={'label': '说话人2', 'name': ''}).json()['speaker_names'] == {'说话人1': '张 三'}
+
+    # A new whole-meeting transcription brings new clusters; the old names must not stick to them.
+    with runtime.store.connect() as db:
+        db.execute("UPDATE work_meetings SET transcription_status='pending' WHERE id=?", (meeting_id,))
+    assert runtime.store.save_work_dialogue(meeting_id, [
+        {'text': '整场原文', 'speaker': '发言人 1', 'begin_time': 0, 'end_time': 900}])
+    assert runtime.store.work_meeting(meeting_id)['speaker_names'] == {}
