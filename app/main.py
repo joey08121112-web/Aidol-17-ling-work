@@ -37,9 +37,10 @@ from .services.commute_journeys import PlacePoint, SavedAddressInput, CommuteSta
 from .services.maps import MapService
 from .providers.bocha import BochaSearch
 
-# Persisting finished minutes defers under account-lock contention instead of
-# discarding the generated report; tests shorten the waits.
-WORK_SUMMARY_SAVE_ATTEMPTS = 3
+# Background minutes wait out calls and segment ASR holding the account lock
+# (for up to WORK_SUMMARY_SAVE_PATIENCE seconds) instead of discarding finished
+# provider work; past that the job stays pending. Tests shorten the waits.
+WORK_SUMMARY_SAVE_PATIENCE = 1800
 WORK_SUMMARY_SAVE_LOCK_WAIT = 10
 WORK_SUMMARY_SAVE_RETRY_DELAY = 2
 
@@ -1088,18 +1089,43 @@ def create_hosted_app(config=None, data_directory=None):
     work_summaries_running = set()
     work_summary_slots = asyncio.Semaphore(2)
 
+    def account_alive(current):
+        found = accounts.user(current['username'])
+        return found is not None and found['id'] == current['id']
+
+    async def with_summary_lock(current, action):
+        """Run one summary write under the account lock and return (True, result).
+        Calls and segment ASR hold that lock for long stretches; waiting them out
+        keeps finished provider work instead of discarding it. Returns (False, None)
+        when the account is gone or the wait runs out; the job then stays pending."""
+        deadline = time.monotonic() + WORK_SUMMARY_SAVE_PATIENCE
+        while account_alive(current):
+            entered = False
+            try:
+                async with runtimes.use(current['id'], wait_seconds=WORK_SUMMARY_SAVE_LOCK_WAIT) as rt:
+                    entered = True
+                    return True, action(rt)
+            except HTTPException as exc:
+                if entered or exc.status_code != 409:
+                    raise
+            if time.monotonic() >= deadline:
+                diagnostics.info('work meeting summary save deferred by account lock')
+                break
+            await asyncio.sleep(WORK_SUMMARY_SAVE_RETRY_DELAY)
+        return False, None
+
     async def summarize_work(current, meeting_id):
         key = (current['id'], meeting_id)
         store = None
         try:
-            found = accounts.user(current['username'])
-            if found is None or found['id'] != current['id']:
+            if not account_alive(current):
                 return
-            async with runtimes.use(current['id'], wait_seconds=10) as rt:
-                store = rt.store
-                meeting = store.work_meeting(meeting_id)
-                if meeting is None or meeting['summary_status'] != 'pending':
-                    return
+            # Lock-free snapshot read: a call or segment ASR holding the account
+            # lock must not turn a queued job into a failed one.
+            store = read_work_store(current)
+            meeting = store.work_meeting(meeting_id) if store else None
+            if meeting is None or meeting['summary_status'] != 'pending':
+                return
             if meeting['transcription_status'] == 'pending':
                 # Whole-meeting diarization from the saved audio: one speaker namespace for the meeting.
                 import tempfile
@@ -1117,75 +1143,57 @@ def create_hosted_app(config=None, data_directory=None):
                 except (SpeechProviderError, ValueError) as exc:
                     # Keep the live sentences; a later retry can submit a new task.
                     store.fail_work_transcription(meeting_id, reset_task=isinstance(exc, MeetingTaskFailed))
-                async with runtimes.use(current['id'], wait_seconds=10) as rt:
+                sources = [row['id'] for row in meeting['sources']]
+
+                def keep_dialogue(rt):
                     fresh = rt.store.work_meeting(meeting_id)
-                    if fresh is None or [row['id'] for row in fresh['sources']] != [row['id'] for row in meeting['sources']]:
+                    if fresh is None or [row['id'] for row in fresh['sources']] != sources:
                         # A source was forgotten while the provider ran; never recreate it from audio.
                         rt.store.fail_work_transcription(meeting_id)
-                        return
+                        return None
                     if turns is not None and not rt.store.save_work_dialogue(meeting_id, turns):
-                        return
-                    meeting = rt.store.work_meeting(meeting_id)
+                        return None
+                    return rt.store.work_meeting(meeting_id)
+                _, meeting = await with_summary_lock(current, keep_dialogue)
+                if meeting is None:
+                    return
+            revision = meeting['revision_request']
+            revising = revision.get('status') == 'pending'
+            charge = lambda: accounts.consume('usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400)
             # The slot bounds concurrent minutes generation only. It must not span
-            # the provider transcription polling above, or two long meetings would
-            # starve every other account's summaries.
+            # the provider transcription polling above or the lock wait below, or
+            # long meetings and calls would starve every other account's summaries.
             async with work_summary_slots:
-                revision = meeting['revision_request']
-                if revision.get('status') == 'pending':
+                if revising:
                     store.work_summary_progress(meeting_id, 'analyzing', 0, 1)
-                    charge = lambda: accounts.consume('usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400)
                     try:
                         report = await MeetingRevisions(config, charge).generate(meeting['report'], revision['document'],
                             revision['id'], store.work_meeting_evidence(meeting))
                     except MinutesFailure as exc:
-                        if accounts.user(current['username']) is not None and Path(store.path).exists():
+                        if account_alive(current) and Path(store.path).exists():
                             store.fail_work_revision(meeting_id, exc.reason)
                         return
-                    found = accounts.user(current['username'])
-                    if found is None or found['id'] != current['id']:
+                else:
+                    rows = store.work_meeting_evidence(meeting)
+                    if not rows:
+                        store.fail_work_summary(meeting_id)
                         return
-                    async with runtimes.use(current['id'], wait_seconds=10) as rt:
-                        attach_times(report, meeting)
-                        report.update(meeting_id=meeting_id, started_at=meeting['started_at'], location=meeting['location'],
-                                      capture_status=meeting['status'], includes_demo=False)
-                        if not rt.store.finish_work_revision(meeting_id, revision['id'], report, [r['id'] for r in meeting['sources']]):
-                            rt.store.fail_work_summary(meeting_id)
-                    return
-                rows = store.work_meeting_evidence(meeting)
-                source_ids = [row['id'] for row in meeting['sources']]
-                if not rows:
-                    store.fail_work_summary(meeting_id)
-                    return
-                charge = lambda: accounts.consume('usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400)
-                report = await WorkMeetingMinutes(config, charge).generate(rows,
-                    lambda stage, done, total: store.work_summary_progress(meeting_id, stage, done, total))
-            if meeting['transcription_status'] == 'failed':
+                    report = await WorkMeetingMinutes(config, charge).generate(rows,
+                        lambda stage, done, total: store.work_summary_progress(meeting_id, stage, done, total))
+            if not revising and meeting['transcription_status'] == 'failed':
                 report['notice'] = '整场说话人识别未完成，以下基于实时或分段原文整理，编号可能跨段变化。' + report.get('notice', '')
+            source_ids = [row['id'] for row in meeting['sources']]
+
+            def save(rt):
+                attach_times(report, meeting)
+                report.update(meeting_id=meeting_id, started_at=meeting['started_at'], location=meeting['location'],
+                              capture_status=meeting['status'], includes_demo=False)
+                saved = (rt.store.finish_work_revision(meeting_id, revision['id'], report, source_ids) if revising
+                         else rt.store.save_work_summary(meeting_id, report, source_ids))
+                if not saved:
+                    rt.store.fail_work_summary(meeting_id)
             # The network work never holds the account's voice/control lock.
-            found = accounts.user(current['username'])
-            if found is None or found['id'] != current['id']:
-                return
-            for attempt in range(WORK_SUMMARY_SAVE_ATTEMPTS):
-                try:
-                    async with runtimes.use(current['id'], wait_seconds=WORK_SUMMARY_SAVE_LOCK_WAIT) as rt:
-                        attach_times(report, meeting)
-                        report['includes_demo'] = False
-                        report['meeting_id'] = meeting_id
-                        report['started_at'] = meeting['started_at']
-                        report['location'] = meeting['location']
-                        report['capture_status'] = meeting['status']
-                        if not rt.store.save_work_summary(meeting_id, report, source_ids):
-                            rt.store.fail_work_summary(meeting_id)
-                    break
-                except HTTPException as exc:
-                    if exc.status_code != 409:
-                        raise
-                    if attempt == WORK_SUMMARY_SAVE_ATTEMPTS - 1:
-                        # Lock contention must not discard generated minutes: the job
-                        # stays pending and the next page read resumes it.
-                        diagnostics.info('work meeting summary save deferred by account lock')
-                        return
-                    await asyncio.sleep(WORK_SUMMARY_SAVE_RETRY_DELAY)
+            await with_summary_lock(current, save)
         except asyncio.CancelledError:
             # Keep the persisted pending job; the next page read resumes it.
             raise
