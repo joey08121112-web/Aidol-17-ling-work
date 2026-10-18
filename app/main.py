@@ -1160,29 +1160,37 @@ def create_hosted_app(config=None, data_directory=None):
             revision = meeting['revision_request']
             revising = revision.get('status') == 'pending'
             charge = lambda: accounts.consume('usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400)
-            # The slot bounds concurrent minutes generation only. It must not span
-            # the provider transcription polling above or the lock wait below, or
-            # long meetings and calls would starve every other account's summaries.
-            async with work_summary_slots:
-                if revising:
-                    store.work_summary_progress(meeting_id, 'analyzing', 0, 1)
-                    try:
-                        report = await MeetingRevisions(config, charge).generate(meeting['report'], revision['document'],
-                            revision['id'], store.work_meeting_evidence(meeting))
-                    except MinutesFailure as exc:
-                        if account_alive(current) and Path(store.path).exists():
-                            store.fail_work_revision(meeting_id, exc.reason)
-                        return
-                else:
-                    rows = store.work_meeting_evidence(meeting)
-                    if not rows:
-                        store.fail_work_summary(meeting_id)
-                        return
-                    report = await WorkMeetingMinutes(config, charge).generate(rows,
-                        lambda stage, done, total: store.work_summary_progress(meeting_id, stage, done, total))
-            if not revising and meeting['transcription_status'] == 'failed':
-                report['notice'] = '整场说话人识别未完成，以下基于实时或分段原文整理，编号可能跨段变化。' + report.get('notice', '')
             source_ids = [row['id'] for row in meeting['sources']]
+            job = revision['id'] if revising else None
+            # A restart between generation and the locked save resumes from the
+            # checkpoint instead of paying for the same minutes again.
+            report = store.work_summary_checkpoint(meeting_id, source_ids, job)
+            if report is None:
+                # The slot bounds concurrent minutes generation only. It must not span
+                # the provider transcription polling above or the lock wait below, or
+                # long meetings and calls would starve every other account's summaries.
+                async with work_summary_slots:
+                    if revising:
+                        store.work_summary_progress(meeting_id, 'analyzing', 0, 1)
+                        try:
+                            report = await MeetingRevisions(config, charge).generate(meeting['report'], revision['document'],
+                                revision['id'], store.work_meeting_evidence(meeting))
+                        except MinutesFailure as exc:
+                            if account_alive(current) and Path(store.path).exists():
+                                store.fail_work_revision(meeting_id, exc.reason)
+                            return
+                    else:
+                        rows = store.work_meeting_evidence(meeting)
+                        if not rows:
+                            store.fail_work_summary(meeting_id)
+                            return
+                        report = await WorkMeetingMinutes(config, charge).generate(rows,
+                            lambda stage, done, total: store.work_summary_progress(meeting_id, stage, done, total))
+                if not revising and meeting['transcription_status'] == 'failed':
+                    report['notice'] = '整场说话人识别未完成，以下基于实时或分段原文整理，编号可能跨段变化。' + report.get('notice', '')
+                # Rule fallbacks are free to rebuild, and a restart should retry the model for them.
+                if (revising or report.get('extraction') == 'llm') and account_alive(current):
+                    store.checkpoint_work_summary(meeting_id, report, source_ids, job)
 
             def save(rt):
                 attach_times(report, meeting)
