@@ -305,14 +305,14 @@ public final class MainActivity extends Activity {
         meetingPlayback = new MeetingPlayback(this, headset::matchesOutput, this::meetingPlaybackChanged);
         headset.addListener(headsetListener);
         headset.addControlListener(headsetControlListener);
-        taskBoard = new ActionTaskBoard(this, () -> api, () -> !busy && session == null,
+        taskBoard = new ActionTaskBoard(this, () -> api, this::panelActionsAllowed,
             tasks -> { put(state, "tasks", tasks); }, message -> { lastNotice = message; updateStatus(); }, () -> {
                 if (Build.VERSION.SDK_INT >= 33 && !permissionPending && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                     permissionPending = true; requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 7);
                 }
             });
         connectBackend();
-        commutePanel = new CommutePanel(this, () -> api, () -> state, () -> !busy && session == null, () -> visible,
+        commutePanel = new CommutePanel(this, () -> api, () -> state, this::panelActionsAllowed, () -> visible,
             this::commutePermissions, () -> {
                 boolean changed = !"commute".equals(mode());
                 put(settings(), "mode", "commute"); put(settings(), "auto_mode", false);
@@ -2562,6 +2562,11 @@ public final class MainActivity extends Activity {
         });
     }
     private void signOut() { if (commutePanel != null) commutePanel.reset(); TaskReminders.clear(this); getSharedPreferences("meeting_edit_drafts", MODE_PRIVATE).edit().clear().apply(); clearVoicePreparation(); preparationAttemptAt = -60000; if (quickFeedback != null) quickFeedback.stop(); chatDraft = ""; stopLockScreenSession(); cancelSession(""); clearPrivateSnapshots(); api.vault.clear(); clearLocationCache(); syncHeadsetControls(); state = new JSONObject(); lastNotice = ""; showAuth(0); }
+    /**
+     * Task and commute panels write state on their own threads, outside the refresh generation:
+     * keep them waiting while a /v1/state snapshot is in flight so it cannot overwrite their change.
+     */
+    private boolean panelActionsAllowed() { return !busy && !refreshing && session == null; }
     private boolean canAct() { if (busy || session != null || locationListener != null) { feedback("上一项操作正在进行，请稍候", LocalCue.BUSY); return false; } return true; }
 
     private boolean lockScreenEnabled() { return voiceService != null && voiceService.enabled(); }

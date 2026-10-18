@@ -517,6 +517,33 @@ def test_mode_switch_waits_for_a_finishing_call_instead_of_409(client, runtime):
     assert not runtime.lock.locked()
 
 
+def test_requests_waiting_on_one_account_lock_do_not_starve_other_accounts(mobile):
+    # Queued settings writes wait up to SETTINGS_LOCK_WAIT; they must not hold the
+    # server-wide processing slots, or another account would get 503 meanwhile.
+    from concurrent.futures import ThreadPoolExecutor
+    alice, ah = register(mobile)
+    _, bh = register(mobile, "bob")
+    assert mobile.get("/v1/state", headers=ah).status_code == 200
+    runtime = mobile.app.state.runtimes.items[alice["user"]["id"]]
+    waiting = lambda: len(runtime.lock._waiters or ())
+    mobile.portal.call(runtime.lock.acquire)
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        try:
+            queued = [executor.submit(mobile.put, "/v1/settings", headers=ah, json={"auto_mode": False, "mode": "work"})
+                      for _ in range(10)]
+            deadline = time.monotonic() + 2
+            while mobile.portal.call(waiting) < 10 and not any(f.done() for f in queued) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            rejected = [f.result().status_code for f in queued if f.done()]
+            assert not rejected, "queued settings writes were rejected: %s" % rejected
+            assert mobile.portal.call(waiting) == 10, "settings writes did not queue on the account lock"
+            other = chat(mobile, bh)
+            assert other.status_code == 200, other.text
+        finally:
+            mobile.portal.call(runtime.lock.release)
+        assert [future.result(timeout=10).status_code for future in queued] == [200] * 10
+
+
 def test_mode_only_settings_change_skips_the_audio_retention_scan(client, runtime, monkeypatch):
     calls = []
     original = type(runtime.store).purge_work_audio

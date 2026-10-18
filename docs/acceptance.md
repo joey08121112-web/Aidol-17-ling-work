@@ -818,3 +818,4 @@ Android `testDebugUnitTest lintDebug assembleDebug` 成功：159项单测，零�
 - Android：切换乐观更新并立即播放本地模式耳标，失败/放弃/离开前台/会话取消时回滚；模式请求用独立线程，`/v1/state` 刷新改为独立线程与代次校验，不再设置 `busy`；工作↔通勤切换重建对话页。`ModeChangeRetry` 记录原模式并提供本地快照写入，新增2项单测。
 - 软件验证：Python `.venv` 离线测试 **625 passed**、compileall 通过；JBR 21.0.11、Android SDK 35 执行 `testDebugUnitTest lintDebug assembleDebug` 成功，Android **285 项单测零失败**，Lint **0 errors / 28 warnings**（既有类别）。
 - 未验证：本轮未安装 APK、未用 Rise 实测切换耗时与耳标听音；`ModeSwitchInstrumentation` 未运行，其“切换不重建页面”和“确认后才播放”断言已与当前约定不符（生活布局改版后已不成立），需要按新约定更新后再做真机复核。
+- 代码审查修正（PR #4 Codex 意见）：P1 `runtime()` 改为拿到账号锁后才计入全局8个处理名额，排队等锁的请求不再让其他账号收到503；新增测试：同一账号10个设置请求排队时另一账号请求仍返回200，修复前其中2个请求立即503。P2 后台刷新期间待办与通勤面板暂停操作（恢复改动前的保护），模式切换不受影响；该项为 Activity 接线，无 JVM 单测。合并最新 main（`9b4cc80`）后：Python 离线测试 **644 passed**、compileall 通过；Android **298 项单测零失败**，Lint **0 errors / 31 warnings**，assembleDebug 成功。仍未在 Rise 真机实测。

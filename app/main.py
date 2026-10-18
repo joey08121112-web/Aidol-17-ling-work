@@ -305,9 +305,13 @@ def create_hosted_app(config=None, data_directory=None):
         nonlocal active
         if active >= 8:
             raise HTTPException(503, '服务器正在处理较多请求，请稍后再试')
-        active += 1
-        try:
-            async with runtimes.use(current['id'], wait_seconds=wait_seconds) as value:
+        # Only the lock holder occupies a processing slot: requests queued behind the
+        # same account's call or segment must not starve other accounts with 503s.
+        async with runtimes.use(current['id'], wait_seconds=wait_seconds) as value:
+            if active >= 8:
+                raise HTTPException(503, '服务器正在处理较多请求，请稍后再试')
+            active += 1
+            try:
                 # Recheck after acquiring the per-account lock (password/logout races).
                 if not accounts.authenticate(digest(token(request))):
                     raise HTTPException(401, '登录已失效')
@@ -316,8 +320,8 @@ def create_hosted_app(config=None, data_directory=None):
                 value.agent.tool_charge = lambda: accounts.consume(
                     'usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400)
                 yield value
-        finally:
-            active -= 1
+            finally:
+                active -= 1
 
     @api.get('/healthz')
     async def hosted_health():

@@ -65,7 +65,7 @@ APK 默认本地基址 `http://127.0.0.1:8108`，可切换内置远端 `https://
 | 方法/路径 | 请求与响应 |
 | --- | --- |
 | `GET /v1/state` | 返回 `user/settings/capabilities/agent/transcripts/memories/tasks/drafts/meeting_report`；刷新时重新判断当前模式。`agent.commute` 为最近一次定位解析的通勤去向（`target=home/work/custom`、`name`、`basis=near_home/near_work/time_of_day/only_saved_place`；无可用去向时 `target=null` 并给出 `reason`），`agent.route.target` 与之对应 |
-| `PUT /v1/settings` | 完整 `Settings` JSON；返回保存后的设置。固定 `provider=cascade`、`life_poll_enabled=false`；目的地/交通参数变化清除旧路线与提醒节流。账号锁被占用（通话收尾、片段识别、纪要保存）时最多等待5秒再写入，仍占用返回409；仅 `work_audio_retention_days` 变化时当场清理过期会议录音，其余由会议读取时按保留期清理 |
+| `PUT /v1/settings` | 完整 `Settings` JSON；返回保存后的设置。固定 `provider=cascade`、`life_poll_enabled=false`；目的地/交通参数变化清除旧路线与提醒节流。账号锁被占用（通话收尾、片段识别、纪要保存）时最多等待5秒再写入，仍占用返回409；排队等锁不占用服务器8个并发处理名额（拿到账号锁后才计入）；仅 `work_audio_retention_days` 变化时当场清理过期会议录音，其余由会议读取时按保留期清理 |
 | `POST /v1/chat` | `{text,request_id,interaction_source?}`；text 1–6000 有效字符；返回 `text/mode/memories/response/extraction/interaction/speak/notice`，记忆操作另含 `citations/recall/deletion` 等回执 |
 | `POST /v1/voice?request_id=...&interaction_source=direct_question` | `Content-Type: audio/pcm`，16 kHz 单声道小端 PCM16 原始字节；不带 WAV 头；返回与 chat 相同结构，未识别时返回空 text、解释 response、`speak=false` |
 | `GET /v1/turns/{request_id}` | 同账号只读请求状态，不占业务锁、不计模型额度；`request_id/status/stage/retryable/result`；不存在 404 |
