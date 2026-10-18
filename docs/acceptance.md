@@ -776,3 +776,12 @@ Android `testDebugUnitTest lintDebug assembleDebug` 成功：159项单测，零�
 - 首次夹具启动阻塞，线程堆栈定位到基线 `AuthVault` 空偏好直接返回而未结束加载 latch，维护回调反复等待。保留首次日志和堆栈；仅在未登录 UI 夹具内结束内存中的空加载状态后重跑通过。没有修改正式账号加载逻辑；该基线问题仍需独立修复。通用历史 UI 夹具及需要 Rise 的硬件专项未重跑。
 - 证据和候选包：忽略目录 `artifacts/life-conversation-ui/`，包含 `android-build-final.log`、`pytest.log`、`compileall.log`、`visual-run-final.log`、`visual-run-320dp-font130.log`、`instrumentation-first-stack.txt`、`final/` 与 `narrow-final/` 截图。`aidol-life-conversation-debug.apk` 为 `com.aidol.app.debug` 开发包，默认本地 USB 服务，连接设置可切换已有远端。本地验收时未安装至 USB 真机、未更新公网 APK、未推送或部署；后续源码提交与合并状态以 Git 记录为准。
 - 待验：本轮真实登录、Rise 采音、语音转写／回复／人耳听音、锁屏与来电断连；Android 8–10 的兼容键盘分支未在旧系统实跑。模拟器与构建结果不替代这些验收。
+
+## 2026-10-18 修复普通回复关闭通话设置（P2）
+
+- 基于 `1ed2e63`，在独立工作区 `codex/life-settings-dialog` 修复；原目录中并行进行的模式切换／后端改动未带入。
+- 根因：生活通话设置复用 `sourceDialog`，普通结果在 `acceptBusinessResult()` 中清理回答来源时连带关闭设置。现在设置使用独立的 `lifeCallSettingsDialog`；重复打开复用当前窗口，完成／返回释放引用，重建账号页面或销毁 Activity 时关闭窗口。普通回复仍按原规则关闭过期回答来源。
+- 先加回归再修复，旧实现实际失败：`Ordinary reply dismissed the call settings dialog`。修复后在独立 API 36 模拟器及 `com.aidol.app.review` 合成夹具中通过：持续会话对象存在时连续两个普通结果保留设置，来源弹窗失效不关闭设置；返回、完成、重复打开、账号页面重建和 Activity 销毁清理正常。原生活页流式更新、草稿、未保存记录、键盘及结束按钮检查一并通过。
+- 检查返回／Activity 销毁时，首次夹具把异步窗口清理当成同步动作而过早断言；保留失败日志，改为有界等待真实 dismiss 回调后通过，未删除原断言。沿用已记录的未登录夹具空账号 latch 处理，不修改正式账号逻辑。
+- 软件验证：JBR 21.0.11／SDK 35 执行 Android `testDebugUnitTest lintDebug assembleDebug` 成功，283 项单测通过，Lint 0 errors／28 warnings；Python 离线 623 passed／1 warning，compileall 通过。证据及候选 APK 在忽略目录 `artifacts/life-settings-fix/`：`baseline-regression.log`、`fixed-regression-final.log`、`android-checks.log`、`pytest.log` 与 `screenshots/`。
+- 本轮仅离线结果注入及模拟器 UI；没有模型、录音或供应商 API 请求，没有安装至 USB 真机、更新公网 APK 或部署服务，Rise 听音／锁屏等硬件验收仍待实机完成。
