@@ -670,11 +670,38 @@ def test_meeting_people_events_and_conflicts_require_evidence():
         _validate_minutes(report, rows)
 
 
+def test_generated_minutes_wait_out_a_call_and_save_without_regenerating(work, monkeypatch):
+    import asyncio
+    from app import main as main_module
+    client, runtime, words, calls = work
+    monkeypatch.setattr(main_module, 'WORK_SUMMARY_SAVE_LOCK_WAIT', .05)
+    monkeypatch.setattr(main_module, 'WORK_SUMMARY_SAVE_RETRY_DELAY', .01)
+    meeting_id = start(client)
+    upload(client, meeting_id)
+    attempts = []
+
+    async def contended(self, rows, progress):
+        attempts.append(rows)
+        # The user leaves the page and starts a call that outlasts one lock wait.
+        await runtime.lock.acquire()
+        asyncio.get_running_loop().call_later(.3, runtime.lock.release)
+        return {'title': '设计稿讨论', 'summary': '采用蓝色方案，周五交设计稿。', 'topics': [],
+                'decisions': [], 'tasks': [], 'open_questions': [],
+                'source_ids': [row['id'] for row in rows], 'extraction': 'llm'}
+
+    monkeypatch.setattr(WorkMeetingMinutes, 'generate', contended)
+    finish(client, meeting_id)
+    meeting = runtime.store.work_meeting(meeting_id)
+    assert len(attempts) == 1 and meeting['summary_status'] == 'ready'
+    assert meeting['report']['title'] == '设计稿讨论'
+
+
 def test_locked_save_defers_generated_minutes_instead_of_failing(work, monkeypatch):
     from app import main as main_module
     client, runtime, words, calls = work
     monkeypatch.setattr(main_module, 'WORK_SUMMARY_SAVE_LOCK_WAIT', .05)
     monkeypatch.setattr(main_module, 'WORK_SUMMARY_SAVE_RETRY_DELAY', .01)
+    monkeypatch.setattr(main_module, 'WORK_SUMMARY_SAVE_PATIENCE', .2)
     meeting_id = start(client)
     upload(client, meeting_id)
     attempts = []
