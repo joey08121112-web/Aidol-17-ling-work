@@ -57,7 +57,7 @@ final class ActionTaskBoard implements AutoCloseable {
         sync(value, false);
     }
     Runnable preserveViewport() {
-        if (scroll == null || rows == null || !rows.isAttachedToWindow()) return () -> {};
+        if (scroll == null || rows == null || !rows.isAttachedToWindow() || !rows.isShown()) return () -> {};
         final ScrollView viewport = scroll;
         final LinearLayout list = rows;
         int[] screen = new int[2]; viewport.getLocationOnScreen(screen);
@@ -71,7 +71,10 @@ final class ActionTaskBoard implements AutoCloseable {
                         public boolean onPreDraw() {
                             if (viewport.getViewTreeObserver().isAlive()) viewport.getViewTreeObserver().removeOnPreDrawListener(this);
                             View anchor = list.findViewWithTag(id);
-                            if (anchor != null && anchor.isAttachedToWindow()) { int[] now = new int[2]; anchor.getLocationOnScreen(now); viewport.scrollBy(0, now[1] - top); }
+                            if (viewport == scroll && list == rows && list.isAttachedToWindow() && list.isShown()
+                                    && anchor != null && anchor.isAttachedToWindow() && anchor.isShown()) {
+                                int[] now = new int[2]; anchor.getLocationOnScreen(now); viewport.scrollBy(0, now[1] - top);
+                            }
                             return true;
                         }
                     });
@@ -114,14 +117,20 @@ final class ActionTaskBoard implements AutoCloseable {
         check.setOnClickListener(v -> {
             if (!allowed.getAsBoolean()) { check.setChecked("done".equals(task.optString("status"))); return; }
             mutationVersion++; mutations++;
-            boolean selected = check.isChecked(); int y = scroll == null ? 0 : scroll.getScrollY(); check.setEnabled(false);
+            final ScrollView viewport = scroll;
+            final LinearLayout list = rows;
+            boolean selected = check.isChecked(); int y = viewport == null ? 0 : viewport.getScrollY(); check.setEnabled(false);
             card.animate().alpha(.72f).setDuration(120).start();
             execute(c -> c.json("PATCH", "/v1/tasks/" + id, new JSONObject().put("status", selected ? "done" : "open")), r -> {
                 mutations--;
                 for (int i = 0; i < tasks.length(); i++) if (tasks.optJSONObject(i).optString("id").equals(id)) try { tasks.optJSONObject(i).put("status", selected ? "done" : "open"); } catch (JSONException ignored) {}
                 try { task.put("status", selected ? "done" : "open"); } catch (JSONException ignored) {}
                 paint(check, selected); check.setEnabled(true); card.animate().alpha(1).setDuration(180).start();
-                updateCount(); publish(); if (scroll != null) scroll.scrollTo(0, y);
+                updateCount(); publish();
+                // A delayed reply must not move another work section or a rebuilt page.
+                if (viewport != null && viewport == scroll && list != null && list == rows
+                        && viewport.isAttachedToWindow() && list.isAttachedToWindow() && list.isShown())
+                    viewport.scrollTo(0, y);
             }, () -> { mutations--; check.setChecked(!selected); check.setEnabled(true); card.animate().alpha(1).setDuration(180).start(); });
         });
         card.setOnLongClickListener(v -> { new AlertDialog.Builder(activity).setItems(new String[]{"编辑待办", "删除待办"}, (d, which) -> { if (which == 0) taskDialog(task); else remove(task, shell); }).show(); return true; });
@@ -227,7 +236,8 @@ final class ActionTaskBoard implements AutoCloseable {
             sync(latest, true);
             if (!latest.toString().equals(tasks.toString())) {
                 tasks = latest; changed.accept(tasks); updateCount();
-                if (rows != null && rows.isAttachedToWindow()) { Runnable restore = preserveTaskPosition ? preserveViewport() : () -> {}; rows.removeAllViews(); for (int i = 0; i < tasks.length(); i++) row(tasks.optJSONObject(i), false); emptyState(); restore.run(); }
+                // Detached rows may belong to a cached work tab that will be reattached unchanged.
+                if (rows != null) { Runnable restore = preserveTaskPosition ? preserveViewport() : () -> {}; rows.removeAllViews(); for (int i = 0; i < tasks.length(); i++) row(tasks.optJSONObject(i), false); emptyState(); restore.run(); }
             }
         }, () -> {}); }
     @Override public void close() { if (addDialog != null) addDialog.dismiss(); closed = true; worker.shutdownNow(); }

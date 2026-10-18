@@ -73,17 +73,21 @@ public final class AuthVault {
         this(context, "session");
     }
     public AuthVault(Context context, String namespace) {
-        prefs = context.getSharedPreferences(namespace, Context.MODE_PRIVATE);
-        background = Executors.newSingleThreadExecutor(runnable -> {
+        this(context.getSharedPreferences(namespace, Context.MODE_PRIVATE), Executors.newSingleThreadExecutor(runnable -> {
             Thread worker = new Thread(runnable, "aidol-auth-vault");
             worker.setDaemon(true);
             return worker;
-        });
+        }));
+    }
+    /** Injectable storage/worker for testing the real initial-load path without Android Keystore. */
+    AuthVault(SharedPreferences preferences, ExecutorService executor) {
+        prefs = preferences;
+        background = executor;
         final long loading = state.loadStarts();
         background.execute(() -> {
             try {
                 String saved = prefs.getString("encrypted", "");
-                if (saved.isEmpty()) return;
+                if (saved.isEmpty()) { state.loadCompletes(loading, "", ""); return; }
                 String[] parts = saved.split(":", 2);
                 Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
                 cipher.init(Cipher.DECRYPT_MODE, key(), new GCMParameterSpec(128, Base64.decode(parts[0], Base64.NO_WRAP)));
