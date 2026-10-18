@@ -313,6 +313,7 @@ public final class MainActivity extends Activity {
                     permissionPending = true; requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 7);
                 }
             });
+        taskBoard.onOpenMeeting(this::openWorkMeetingAt);
         connectBackend();
         commutePanel = new CommutePanel(this, () -> api, () -> state, () -> !busy && session == null, () -> visible,
             this::commutePermissions, () -> {
@@ -1318,7 +1319,14 @@ public final class MainActivity extends Activity {
         });
     }
     /** Full-screen meeting page: header, section navigation, one scrolling body and a persistent player bar. */
+    /** A task's source sentence to scroll to once its meeting's transcript is on screen; "" for none. */
+    private String pendingMeetingCitation = "";
+    private void openWorkMeetingAt(String meetingId, String citation) {
+        openWorkMeeting(meetingId);
+        pendingMeetingCitation = citation == null ? "" : citation;
+    }
     private void openWorkMeeting(String meetingId) {
+        pendingMeetingCitation = "";
         if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; }
         if (meetingPage != null) meetingPage.dismiss();
         openWorkMeetingId = meetingId; workMeetingDetailSnapshot = "";
@@ -1377,7 +1385,8 @@ public final class MainActivity extends Activity {
             // content changes) and detail fields the body branches on; ended_at backfills on finish.
             "transcription_status", meeting.optString("transcription_status"), "summary_stage", meeting.optString("summary_stage"),
             "processed_sections", meeting.optInt("processed_sections"), "total_sections", meeting.optInt("total_sections"),
-            "received_segments", meeting.optInt("received_segments"), "ended_at", meeting.optString("ended_at")).toString();
+            "received_segments", meeting.optInt("received_segments"), "ended_at", meeting.optString("ended_at"),
+            "action_tasks", array(meeting, "action_tasks")).toString();
     }
     private void renderWorkMeetingDetail(JSONObject meeting, String snapshot) {
         if (workMeetingDetail == null || !meeting.optString("id").equals(openWorkMeetingId)) return;
@@ -1461,7 +1470,7 @@ public final class MainActivity extends Activity {
             meetingSection("决策", "关键决策");
             meetingItems(workMeetingDetail, array(report, "decisions"), meeting, timeline, false);
             meetingSection("待办", "行动待办");
-            meetingItems(workMeetingDetail, array(report, "tasks"), meeting, timeline, true);
+            meetingActions(meeting, timeline, array(report, "tasks"));
         }
         meetingSection("重点", "重点");
         meetingMarks(meeting, timeline, report == null ? new JSONArray() : array(report, "highlights"));
@@ -1495,6 +1504,11 @@ public final class MainActivity extends Activity {
             }
         }
         meetingParagraphs(run, meeting, timeline, playable);
+        if (!pendingMeetingCitation.isEmpty() && !timeline.sentences().isEmpty()) {
+            MeetingTimeline.Entry cited = timeline.sentence(pendingMeetingCitation);
+            pendingMeetingCitation = "";
+            if (cited != null) scrollToSentence(cited.id);
+        }
         gap(workMeetingDetail, 12);
         if (raw.length() > 0) {
             button(workMeetingDetail, "保存为文件（纪要 + 原文）", true, this::saveMeetingFile);
@@ -1632,6 +1646,55 @@ public final class MainActivity extends Activity {
             if (tasks) label(parent, "负责人：" + fallback(item.optString("owner"), "未明确") + " · 截止：" + fallback(item.optString("due"), "未提及"), 12, MUTED);
             meetingEvidence(meeting, timeline, array(item, "source_ids"));
         }
+    }
+    /**
+     * The meeting's rows in the action list, with the same completion state: checking here or in the
+     * list changes one task. Generated items the user removed from the list are shown read-only.
+     */
+    private void meetingActions(JSONObject meeting, MeetingTimeline timeline, JSONArray generated) {
+        JSONArray actions = array(meeting, "action_tasks");
+        if (actions.length() == 0) {
+            if (generated.length() > 0) label(workMeetingDetail, "以下待办已不在行动清单中：", 12, MUTED);
+            meetingItems(workMeetingDetail, generated, meeting, timeline, true);
+            return;
+        }
+        label(workMeetingDetail, "已同步到工作页“行动清单”，在这里或清单里勾选都会同步。", 12, MUTED);
+        for (int i = 0; i < actions.length(); i++) {
+            JSONObject task = actions.optJSONObject(i); if (task == null) continue;
+            boolean done = "done".equals(task.optString("status"));
+            CheckBox check = new CheckBox(this); check.setText(task.optString("content")); check.setTextSize(15); check.setTextColor(done ? MUTED : INK);
+            check.setMinHeight(dp(48)); check.setChecked(done);
+            check.setButtonTintList(android.content.res.ColorStateList.valueOf(ACCENT));
+            check.setPaintFlags(done ? check.getPaintFlags() | Paint.STRIKE_THRU_TEXT_FLAG : check.getPaintFlags() & ~Paint.STRIKE_THRU_TEXT_FLAG);
+            workMeetingDetail.addView(check);
+            String due = task.optString("due_at").isEmpty() ? fallback(task.optString("due"), "未提及") : TimeFormat.format(task.optString("due_at"));
+            label(workMeetingDetail, "负责人：" + fallback(task.optString("owner"), "未明确") + " · 截止：" + due, 12, MUTED);
+            meetingEvidence(meeting, timeline, array(task, "source_ids"));
+            check.setOnClickListener(v -> toggleMeetingAction(task, check));
+        }
+    }
+    private void toggleMeetingAction(JSONObject task, CheckBox check) {
+        boolean selected = check.isChecked();
+        if (!canAct()) { check.setChecked(!selected); return; }
+        check.setEnabled(false);
+        ApiClient client = api;
+        worker.execute(() -> {
+            try {
+                client.json("PATCH", "/v1/tasks/" + Uri.encode(task.optString("id")), json("status", selected ? "done" : "open"));
+                runOnUiThread(() -> {
+                    if (isDestroyed() || client != api) return;
+                    put(task, "status", selected ? "done" : "open");
+                    check.setEnabled(true); check.setTextColor(selected ? MUTED : INK);
+                    check.setPaintFlags(selected ? check.getPaintFlags() | Paint.STRIKE_THRU_TEXT_FLAG : check.getPaintFlags() & ~Paint.STRIKE_THRU_TEXT_FLAG);
+                    if (taskBoard != null) taskBoard.refreshReminders();  // The action list and reminders follow.
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    check.setEnabled(true); check.setChecked(!selected);
+                    if (!isDestroyed()) showError(fallback(e.getMessage(), "待办状态未保存，请检查网络后重试"));
+                });
+            }
+        });
     }
     /** Compact "依据" links: the cited sentence's time and opening words; tap to jump (and play when saved). */
     private void meetingEvidence(JSONObject meeting, MeetingTimeline timeline, JSONArray ids) {

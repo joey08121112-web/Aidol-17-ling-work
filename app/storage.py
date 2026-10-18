@@ -177,7 +177,9 @@ class Store(CommuteStorage):
                 db.execute("ALTER TABLE memories ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
             db.execute("CREATE INDEX IF NOT EXISTS memory_pinned_created ON memories(pinned DESC, created_at DESC)")
             task_columns = {row['name'] for row in db.execute('PRAGMA table_info(action_tasks)')}
-            for name, definition in [('due_at', "TEXT NOT NULL DEFAULT ''"), ('reminder_hours', 'INTEGER NOT NULL DEFAULT 0')]:
+            for name, definition in [('due_at', "TEXT NOT NULL DEFAULT ''"), ('reminder_hours', 'INTEGER NOT NULL DEFAULT 0'),
+                                     # The work meeting an AI task came from; kept when the user edits the task.
+                                     ('meeting_id', "TEXT NOT NULL DEFAULT ''")]:
                 if name not in task_columns:
                     db.execute(f'ALTER TABLE action_tasks ADD COLUMN {name} {definition}')
             turn_columns = {row["name"] for row in db.execute("PRAGMA table_info(mobile_turns)")}
@@ -233,6 +235,8 @@ class Store(CommuteStorage):
                 db.execute("ALTER TABLE work_meetings ADD COLUMN audio_anchor_at TEXT")
             db.execute("CREATE TABLE IF NOT EXISTS work_meeting_events (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, "
                        "kind TEXT NOT NULL, offset_ms INTEGER NOT NULL, origin TEXT NOT NULL, created_at TEXT NOT NULL)")
+            if 'meeting_id' not in task_columns:
+                self._backfill_task_meetings(db)
             # One transactional migration indexes existing history, then triggers keep
             # updates/deletes in sync, including writes inside report transactions.
             indexed = db.execute("SELECT 1 FROM sqlite_master WHERE name='recall_index'").fetchone()
@@ -333,7 +337,9 @@ class Store(CommuteStorage):
             else:
                 order = "pinned DESC, created_at DESC" if table == "memories" else "created_at DESC"
                 rows = db.execute(f"SELECT * FROM {table} ORDER BY {order} LIMIT ?", (limit,)).fetchall()
-        result = [dict(r) for r in rows]
+            result = [dict(r) for r in rows]
+            if table == "action_tasks":
+                self._task_meetings(db, result)
         if table == "events":
             for row in result:
                 row["payload"] = json.loads(row["payload"])
@@ -398,6 +404,36 @@ class Store(CommuteStorage):
                     json.dumps(task["source_ids"]), "open", created))
         return {"id": report_id, "created_at": created, **payload}
 
+    @staticmethod
+    def _backfill_task_meetings(db):
+        """Link tasks saved before meeting_id existed: by their report, else by a cited sentence."""
+        reports = {row['id']: row['signature'].split(':')[1] for row in db.execute(
+            "SELECT id,signature FROM meeting_reports WHERE signature LIKE 'work-meeting:%'")}
+        for task in db.execute("SELECT id,report_id,source_ids FROM action_tasks WHERE meeting_id=''").fetchall():
+            meeting = reports.get(task['report_id'], '')
+            for source in json.loads(task['source_ids'] or '[]') if not meeting else ():
+                found = db.execute("SELECT meeting_id FROM work_utterances WHERE id=? OR transcript_id=? UNION ALL "
+                                   "SELECT meeting_id FROM work_meeting_segments WHERE transcript_id=? LIMIT 1",
+                                   (source, source.split('.', 1)[0], source.split('.', 1)[0])).fetchone()
+                if found:
+                    meeting = found[0]
+                    break
+            if meeting:
+                db.execute("UPDATE action_tasks SET meeting_id=? WHERE id=?", (meeting, task['id']))
+
+    def _task_meetings(self, db, rows):
+        """Each task's source meeting as {id, title, started_at}; None when it has none or it is gone."""
+        ids = sorted({row['meeting_id'] for row in rows if row.get('meeting_id')})
+        found = {}
+        if ids:
+            marks = ','.join('?' * len(ids))
+            for item in db.execute("SELECT m.id,m.started_at,json_extract(r.payload,'$.title') AS title FROM work_meetings m "
+                                   f"LEFT JOIN meeting_reports r ON r.id=m.report_id WHERE m.id IN ({marks})", ids):
+                found[item['id']] = {'id': item['id'], 'title': item['title'] or '会议记录', 'started_at': item['started_at']}
+        for row in rows:
+            row['meeting'] = found.get(row.get('meeting_id'))
+        return rows
+
     def action_task_status(self, task_id, status):
         if status not in {"open", "done"}:
             raise ValueError("invalid action task status")
@@ -429,7 +465,7 @@ class Store(CommuteStorage):
             if not task:
                 return None
             if (task['content'], task['owner'], task['due'], task['due_at'], task['reminder_hours']) == (content, owner, due_at or due, due_at, reminder_hours):
-                result = dict(task)
+                result = self._task_meetings(db, [dict(task)])[0]
                 result['source_ids'] = json.loads(result['source_ids'])
                 return result
             report = db.execute('SELECT payload FROM meeting_reports WHERE id=?', (task['report_id'],)).fetchone()
@@ -440,7 +476,7 @@ class Store(CommuteStorage):
                 db.execute('INSERT OR IGNORE INTO action_task_dismissals VALUES(?,?)', (scope, self.task_fingerprint(task)))
             db.execute("UPDATE action_tasks SET content=?,owner=?,due=?,due_at=?,reminder_hours=?,report_id='' WHERE id=?",
                        (content, owner, due_at or due, due_at, reminder_hours, task_id))
-            result = dict(db.execute('SELECT * FROM action_tasks WHERE id=?', (task_id,)).fetchone())
+            result = self._task_meetings(db, [dict(db.execute('SELECT * FROM action_tasks WHERE id=?', (task_id,)).fetchone())])[0]
             result['source_ids'] = json.loads(result['source_ids'])
             return result
 
@@ -771,6 +807,10 @@ class Store(CommuteStorage):
             audio = db.execute("SELECT count(*) AS total,COALESCE(sum(audio_bytes>0),0) AS kept,COALESCE(sum(audio_bytes),0) AS bytes "
                                "FROM work_meeting_segments WHERE meeting_id=?", (meeting_id,)).fetchone()
             report = db.execute("SELECT payload FROM meeting_reports WHERE id=?", (row['report_id'],)).fetchone()
+            # The action list's rows for this meeting, so the detail page shows and toggles the same completion state.
+            action_tasks = [{**dict(item), 'source_ids': json.loads(item['source_ids'])} for item in db.execute(
+                "SELECT id,content,owner,due,due_at,reminder_hours,status,source_ids FROM action_tasks WHERE meeting_id=? "
+                "ORDER BY created_at,rowid", (meeting_id,))]
         # Whole-meeting diarization gives one speaker namespace for the meeting; live/segment labels do not.
         meeting_scope = row['transcription_status'] == 'ready'
         for source in sources:
@@ -794,7 +834,7 @@ class Store(CommuteStorage):
                 'audio_started_at': row['audio_anchor_at'] or row['started_at'],
                 'audio': {'status': status, 'bytes': audio['bytes'], 'segments_with_audio': audio['kept'],
                           'retention_days': retention, 'expires_at': expires},
-                'report': json.loads(report['payload']) if report else None}
+                'report': json.loads(report['payload']) if report else None, 'action_tasks': action_tasks}
 
     @staticmethod
     def work_meeting_evidence(meeting):
@@ -1175,9 +1215,10 @@ class Store(CommuteStorage):
                               (meeting_id, self.task_fingerprint(task))).fetchone():
                     continue
                 old_task = old_tasks.get((task['content'], task['owner'], task['due'], tuple(sorted(task['source_ids']))), {})
-                db.execute('INSERT INTO action_tasks(id,report_id,content,owner,due,source_ids,status,created_at) VALUES(?,?,?,?,?,?,?,?)',
+                db.execute('INSERT INTO action_tasks(id,report_id,content,owner,due,source_ids,status,created_at,meeting_id) '
+                           'VALUES(?,?,?,?,?,?,?,?,?)',
                            (old_task.get('id', uuid4().hex), report_id, task['content'], task['owner'], task['due'],
-                            json.dumps(task['source_ids']), old_task.get('status', 'open'), old_task.get('created_at', created)))
+                            json.dumps(task['source_ids']), old_task.get('status', 'open'), old_task.get('created_at', created), meeting_id))
             db.execute("UPDATE work_meetings SET report_id=?,summary_status=?,summary_stage='done',revision_request=? WHERE id=?",
                        (report_id, 'ready' if payload['extraction'] == 'llm' else 'fallback',
                         json.dumps(revision, ensure_ascii=False) if revision is not None else fresh['revision_request'], meeting_id))

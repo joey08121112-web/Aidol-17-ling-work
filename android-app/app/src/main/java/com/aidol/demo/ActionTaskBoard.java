@@ -32,6 +32,7 @@ final class ActionTaskBoard implements AutoCloseable {
     private Dialog addDialog;
     private ApiClient sessionClient;
     private String sessionToken = "";
+    private BiConsumer<String, String> openMeeting = (meetingId, citation) -> {};
     private void observeSession() {
         ApiClient c = api.get(); String t = c == null ? "" : c.vault.token();
         if (c != sessionClient || !t.equals(sessionToken)) { sessionClient = c; sessionToken = t; mutations = 0; mutationVersion++; }
@@ -40,6 +41,8 @@ final class ActionTaskBoard implements AutoCloseable {
         this.activity = a; this.api = api; this.allowed = allowed; this.changed = changed; this.error = error; this.notificationPermission = permission;
     }
     private int dp(float n) { return EditorUi.dp(activity, n); }
+    /** Opens a task's source meeting at the sentence it cites (meeting id, first source id or ""). */
+    void onOpenMeeting(BiConsumer<String, String> open) { openMeeting = open; }
     static String account(ApiClient c) { return ServerEndpoint.sessionNamespace(c.serverUrl) + ":" + c.vault.username(); }
     void render(LinearLayout parent, JSONArray value, ScrollView scroll) {
         observeSession(); tasks = value; this.scroll = scroll;
@@ -114,6 +117,17 @@ final class ActionTaskBoard implements AutoCloseable {
         String detail = "负责人：" + (task.optString("owner").isEmpty() ? "待确认" : task.optString("owner")) + "\n截止：" + (deadline.isEmpty() ? "待确认" : deadline);
         if (task.optInt("reminder_hours") > 0) detail += " · 提前" + (task.optInt("reminder_hours") == 24 ? "1天" : task.optInt("reminder_hours") + "小时") + "提醒";
         card.addView(EditorUi.text(activity, detail, 11, EditorUi.MUTED));
+        JSONObject meeting = task.optJSONObject("meeting");
+        if (meeting != null) {
+            String title = meeting.optString("title", "会议记录"), when = TimeFormat.format(meeting.optString("started_at"));
+            TextView source = EditorUi.text(activity, "来自会议：" + title + (when == null || when.isEmpty() ? "" : " · " + when) + "  ›", 12, EditorUi.ACCENT);
+            source.setMinHeight(dp(40)); source.setGravity(Gravity.CENTER_VERTICAL); source.setClickable(true); source.setFocusable(true);
+            source.setContentDescription("查看来源会议：" + title + "，跳到对应原话");
+            JSONArray ids = task.optJSONArray("source_ids");
+            String meetingId = meeting.optString("id"), citation = ids == null || ids.length() == 0 ? "" : ids.optString(0);
+            source.setOnClickListener(v -> openMeeting.accept(meetingId, citation));
+            card.addView(source);
+        }
         check.setOnClickListener(v -> {
             if (!allowed.getAsBoolean()) { check.setChecked("done".equals(task.optString("status"))); return; }
             mutationVersion++; mutations++;

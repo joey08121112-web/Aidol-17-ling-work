@@ -839,3 +839,11 @@ Android `testDebugUnitTest lintDebug assembleDebug` 成功：159项单测，零�
 - 软件验证：JBR 21.0.11／SDK 35 执行 Android `testDebugUnitTest lintDebug assembleDebug` 成功，283 项单测通过，Lint 0 errors／28 warnings；Python 离线 623 passed／1 warning，compileall 通过。证据及候选 APK 在忽略目录 `artifacts/life-settings-fix/`：`baseline-regression.log`、`fixed-regression-final.log`、`android-checks.log`、`pytest.log` 与 `screenshots/`。
 - 合并前同步 `origin/main` 的工作／通勤更新 `9b4cc80`，保留双方交接文档后在组合版本复验：Android 296 项单测、Lint 0 errors／31 warnings、debug 构建通过；Python 641 passed／1 warning、compileall 通过；同一生活原生 UI 回归再次通过（`merged-regression.log`、`merged-screenshots/`）。本次修复相对于该主分支仍仅改两个 Android 文件及两份文档。
 - 本轮仅离线结果注入及模拟器 UI；没有模型、录音或供应商 API 请求，没有安装至 USB 真机、更新公网 APK 或部署服务，Rise 听音／锁屏等硬件验收仍待实机完成。
+
+## 2026-10-18 行动清单显示来源会议、与会议详情联动（本地，未上真机）
+
+- 分支 `feat/task-meeting-link`，基于 `origin/main` `edfdbca`。检查结论：会议结束→大模型纪要提取待办→保存纪要时写入 `action_tasks`→工作页行动清单显示，原链路已通；缺来源会议显示与详情联动，本轮补齐。
+- 后端：`action_tasks.meeting_id`（升级时按纪要签名或引用句子回填）、`/v1/tasks` 返回 `meeting_id`/`meeting`、会议详情返回 `action_tasks`。新增 2 项回归：来源会议字段、详情与清单共用完成状态、编辑后保留会议、手动任务无来源；旧任务按报告与按句子两种方式回填。全量 **645 passed**，compileall 通过。
+- Android：JBR 21 / SDK 35 `testDebugUnitTest lintDebug assembleDebug` 成功，315 项单测零失败，Lint 0 errors / 31 warnings（数量与基线相同）。卡片来源行、跳转原话、详情勾选为界面代码，无单测覆盖。
+- 未做：真机点按来源行跳转与高亮、详情勾选后返回清单的状态、离线勾选失败回滚。
+
