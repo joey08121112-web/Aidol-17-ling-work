@@ -32,6 +32,7 @@ from .services.qwen_voice import reply_qwen, realtime_instructions
 from .services.duplex_voice import duplex_call
 from .services.assistant_tools import AssistantTools
 from .services.commute import ROUTE_FIELDS, commute_destination
+from .services.map_preview import CommutePreview, MapSnapshot, preview as commute_preview
 from .services.commute_journeys import PlacePoint, SavedAddressInput, CommuteStart, CommuteRefresh, refresh_journey
 from .services.maps import MapService
 from .providers.bocha import BochaSearch
@@ -980,6 +981,30 @@ def create_hosted_app(config=None, data_directory=None):
             raise HTTPException(404, '地址不存在')
         return {'ok': True}
 
+    def charge_map_preview(current):
+        if not accounts.consume('usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400):
+            raise HTTPException(429, '今日地图查询额度已用完')
+
+    @api.post('/v1/commute/preview')
+    async def preview_commute(value: CommutePreview, current=Depends(user)):
+        # Viewing a plan never starts/stops a journey, changes settings or takes the voice lock.
+        charge_map_preview(current)
+        try:
+            return await asyncio.wait_for(commute_preview(MapService(config), value), 35)
+        except Exception:
+            raise HTTPException(502, '路线预览暂不可用，请稍后重试') from None
+
+    @api.post('/v1/maps/snapshot')
+    async def map_snapshot(value: MapSnapshot, current=Depends(user)):
+        charge_map_preview(current)
+        try:
+            image, content_type = await MapService(config).snapshot(value)
+            return Response(image, media_type=content_type)
+        except ValueError as exc:
+            raise HTTPException(502, str(exc)) from None
+        except Exception:
+            raise HTTPException(502, '地图暂不可用，请稍后重试') from None
+
     @api.get('/v1/commute')
     async def current_commute(current=Depends(user)):
         return commute_store(current).commute_journey()
@@ -1026,13 +1051,14 @@ def create_hosted_app(config=None, data_directory=None):
 
     @api.post('/v1/maps/weather-at')
     async def weather_at_address(value: PlacePoint, request: Request, forecast: bool = False, current=Depends(user)):
-        async with runtime(current, request, True) as rt:
-            try:
-                if value.adcode:
-                    return await rt.agent.maps.weather(value.adcode, forecast)
-                return await rt.agent.maps.weather_at(value.longitude, value.latitude, forecast)
-            except Exception:
-                raise HTTPException(502, '天气暂不可用，请稍后重试') from None
+        charge_map_preview(current)
+        maps = MapService(config)
+        try:
+            if value.adcode:
+                return await maps.weather(value.adcode, forecast)
+            return await maps.weather_at(value.longitude, value.latitude, forecast)
+        except Exception:
+            raise HTTPException(502, '天气暂不可用，请稍后重试') from None
 
     @api.get('/v1/maps/weather')
     async def mobile_weather(request: Request, city: str = Query(default='', pattern=r'^([0-9]{6})?$'), forecast: bool = False, current=Depends(user)):
