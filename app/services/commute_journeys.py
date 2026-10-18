@@ -85,3 +85,41 @@ async def refresh_journey(store, maps, journey_id, value, charge):
     except Exception:
         route = {'available': False, 'reason': '路线暂不可用，请检查网络后重试'}
     return store.finish_commute_refresh(journey_id, value.request_id, route)
+
+
+async def journey_briefing(store, maps, journey_id):
+    """One factual speech text; reuse this journey's route and fetch destination weather."""
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+    journey = store.commute_journey()
+    if journey.get('id') != journey_id or not journey.get('active'):
+        raise LookupError('通勤已结束或不存在')
+    destination = journey['destination']
+    try:
+        weather = await asyncio.wait_for(maps.weather(destination['adcode']) if destination.get('adcode')
+            else maps.weather_at(destination['longitude'], destination['latitude']), 12)
+    except Exception:
+        weather = {'available': False}
+    route = journey.get('route') or {}
+    text = '通勤已开启，目的地是' + destination['name'] + '。'
+    if route.get('available') and not journey.get('error') and time.time() - journey.get('last_attempt', 0) < 240:
+        seconds = max(0, route.get('eta_seconds', 0))
+        arrival = datetime.now(ZoneInfo(store.settings().timezone)) + timedelta(seconds=seconds)
+        text += f'路线估算约{max(1, round(seconds / 60))}分钟，预计{arrival:%H点%M分}抵达，全程约{route.get("distance_meters", 0) / 1000:.1f}公里。'
+        lines = [s.get('line', '') for s in route.get('steps', []) if s.get('type') == 'transit']
+        if lines:
+            text += '乘坐' + '，换乘'.join(lines[:4]) + '。公共交通时间为计划估算，上车后请点我已上车，校准站点提醒。'
+        if journey['origin_mode'] == 'fixed':
+            text += '以上从所选起点计算，实际抵达时间会随出发时间变化。'
+    else:
+        text += '暂时没有取得最新路线和到达时间，后台会继续重试。'
+    if weather.get('available'):
+        text += '目的地最近天气为' + weather.get('weather', '') + '，气温' + str(weather.get('temperature', '')) + '摄氏度。'
+    else:
+        text += '目的地天气暂时未取得。'
+    text += '即将打开高德地图。'
+    # A concurrent stop must not resurrect a speech/navigation action.
+    latest = store.commute_journey()
+    if latest.get('id') != journey_id or not latest.get('active'):
+        raise LookupError('通勤已结束或不存在')
+    return {'journey_id': journey_id, 'text': text, 'weather': weather, 'route': route}

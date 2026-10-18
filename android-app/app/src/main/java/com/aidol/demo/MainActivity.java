@@ -75,6 +75,8 @@ public final class MainActivity extends Activity {
     private String lastRenderedMeetingSnapshot = "";
     private ForegroundLocationMonitor locationMonitor;
     private CommutePanel commutePanel;
+    private JSONObject pendingCommutePlan;
+    private String pendingCommuteOwner = "";
     private TransientStatusPopup statusPopup;
     private TextView maintenanceStatus, meetingMaintenanceStatus;
     private String maintenanceLocationStatus = "定位：等待更新", maintenanceEntry = "app_open";
@@ -2646,7 +2648,7 @@ public final class MainActivity extends Activity {
             });
         });
     }
-    private void signOut() { meetingChanges.clear(); pendingOperations.clear(); stateRefreshing = false; stateRefreshAgain = false; ++stateRevision; if (commutePanel != null) commutePanel.reset(); TaskReminders.clear(this); getSharedPreferences("meeting_edit_drafts", MODE_PRIVATE).edit().clear().apply(); clearVoicePreparation(); preparationAttemptAt = -60000; if (quickFeedback != null) quickFeedback.stop(); chatDraft = ""; stopLockScreenSession(); cancelSession(""); clearPrivateSnapshots(); api.vault.clear(); clearLocationCache(); syncHeadsetControls(); state = new JSONObject(); lastNotice = ""; showAuth(0); }
+    private void signOut() { pendingCommutePlan = null; meetingChanges.clear(); pendingOperations.clear(); stateRefreshing = false; stateRefreshAgain = false; ++stateRevision; if (commutePanel != null) commutePanel.reset(); TaskReminders.clear(this); getSharedPreferences("meeting_edit_drafts", MODE_PRIVATE).edit().clear().apply(); clearVoicePreparation(); preparationAttemptAt = -60000; if (quickFeedback != null) quickFeedback.stop(); chatDraft = ""; stopLockScreenSession(); cancelSession(""); clearPrivateSnapshots(); api.vault.clear(); clearLocationCache(); syncHeadsetControls(); state = new JSONObject(); lastNotice = ""; showAuth(0); }
     private boolean canAct() { if (busy) { feedback("账号或模式设置正在保存，请稍候", LocalCue.BUSY); return false; } return true; }
     private boolean canUseAudio() {
         if (!canAct()) return false;
@@ -2879,6 +2881,9 @@ public final class MainActivity extends Activity {
                 if (value.has("meeting_id")) { turnHasResult = true; uncertainTurnId = ""; return; }
                 turnSucceeded = true;
                 acceptBusinessResult(value);
+                if ("commute_ready".equals(value.optString("interaction")) && "commute".equals(mode())) {
+                    pendingCommutePlan = value.optJSONObject("commute_plan"); pendingCommuteOwner = CommuteService.owner(api); stopRepeat();
+                }
                 if (value.optBoolean("voice_error")) { turnSucceeded = false; stopRepeat(); }
             }
             @Override public void transcript(String text) { if (!currentSession(generation)) return; liveTranscript = text; if (liveWords != null) liveWords.setText(text); if (submittedInteraction != VoiceInteraction.NOTES && conversationFeed.transcript(text)) renderLiveTurn(); }
@@ -2898,6 +2903,7 @@ public final class MainActivity extends Activity {
                 ++sessionGeneration;
                 if (voiceService != null) voiceService.release(session, repeatArmed && listenMode == VoiceInteraction.CALL && turnSucceeded);
                 session = null; recording = false;
+                handler.post(MainActivity.this::startPendingCommute);
                 releaseAutomaticWorkService();
                 if (!turnSucceeded) { deferredMode = null; deferredOpenConversation = false; }
                 if (deferredMode != null) {
@@ -2928,6 +2934,11 @@ public final class MainActivity extends Activity {
         if (lifeConversationLayout && callCaption != null) callCaption.setText("正在接通 AI…");
         if (cancelButton != null) cancelButton.setVisibility(View.VISIBLE); updateStatus();
     }
+    private void startPendingCommute() {
+        if (pendingCommutePlan == null || session != null || !visible || isDestroyed()) return;
+        JSONObject plan = pendingCommutePlan; pendingCommutePlan = null;
+        if ("commute".equals(mode()) && pendingCommuteOwner.equals(CommuteService.owner(api))) commutePanel.startFromConversation(plan);
+    }
     private boolean currentSession(long generation) { return !isDestroyed() && generation == sessionGeneration; }
     private boolean hasHeadsetBoundSession() { return modeCueActive() || session != null && (sessionUsesCapture || sessionIsReplay); }
     private void scheduleNextTurn() {
@@ -2937,6 +2948,7 @@ public final class MainActivity extends Activity {
         handler.removeCallbacks(repeatTick); handler.postDelayed(repeatTick, delay);
     }
     private void cancelSession(String reason) {
+        pendingCommutePlan = null;
         if (modeCuePlayer != null) modeCuePlayer.stop();
         callStartPending = false;
         audioPermissionGeneration = -1;
@@ -2996,7 +3008,7 @@ public final class MainActivity extends Activity {
         if (grants.length > 0 && visible) { if (code == 3) connectHeadset(); else startVoice(); }
     }
     @Override protected void onResume() {
-        super.onResume(); visible = true; syncHeadsetControls();
+        super.onResume(); visible = true; syncHeadsetControls(); handler.post(this::startPendingCommute);
         if (commutePanel != null) commutePanel.resume();
         automaticHeadsetSuppressed = false;
         enterMaintenance("app_open");

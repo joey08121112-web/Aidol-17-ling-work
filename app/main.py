@@ -1072,6 +1072,15 @@ def create_hosted_app(config=None, data_directory=None):
                 await rt.agent.decide()
             return journey
 
+    @api.get('/v1/commute/{journey_id}/briefing')
+    async def commute_briefing(journey_id: str, request: Request, current=Depends(user)):
+        from .services.commute_journeys import journey_briefing
+        async with independent_operation(current, request):
+            try:
+                return await journey_briefing(commute_store(current), MapService(config), journey_id)
+            except LookupError:
+                raise HTTPException(404, '通勤已结束或不存在') from None
+
     @api.post('/v1/commute/{journey_id}/refresh')
     async def update_commute(journey_id: str, value: CommuteRefresh, current=Depends(user)):
         try:

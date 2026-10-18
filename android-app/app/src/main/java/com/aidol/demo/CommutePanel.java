@@ -18,6 +18,12 @@ final class CommutePanel implements AutoCloseable {
     interface Permission { boolean ensure(boolean notifications); }
     private final Activity activity;
     private final CommuteMapPanel mapPanel;
+    private final CommuteSpeaker speaker;
+    // Package seam used by offline instrumentation; production always launches the foreground service.
+    BiConsumer<Context, JSONObject> journeyLauncher = CommuteService::start;
+    private String dialogueJourney = "";
+    private long briefingVersion;
+    private TextView stationStatus;
     private final Supplier<ApiClient> client;
     private final Supplier<JSONObject> appState;
     private final Supplier<ScrollView> viewport;
@@ -51,7 +57,7 @@ final class CommutePanel implements AutoCloseable {
     private interface Result { void accept(JSONObject result) throws Exception; }
     CommutePanel(Activity activity, Supplier<ApiClient> client, Supplier<JSONObject> state,
                  BooleanSupplier allowed, BooleanSupplier visible, Permission permission, Runnable started, Runnable runningChanged, Supplier<ScrollView> viewport) {
-        this.activity = activity; this.client = client;
+        this.activity = activity; this.client = client; this.speaker = new CommuteSpeaker(activity);
         this.mapPanel = new CommuteMapPanel(activity, client, visible, viewport); this.appState = state; this.allowed = allowed;
         this.viewport = viewport; this.visible = visible; this.permission = permission; this.started = started; this.runningChanged = runningChanged;
     }
@@ -74,6 +80,13 @@ final class CommutePanel implements AutoCloseable {
         Dialog dialog = EditorUi.dialog(activity, title, body, footer); track(dialog); dialog.show();
         dialog.getWindow().setLayout(activity.getResources().getDisplayMetrics().widthPixels - dp(28), Math.round(activity.getResources().getDisplayMetrics().heightPixels * .86f));
         return dialog;
+    }
+    private void compactSheet(Dialog dialog, LinearLayout body) {
+        if (body.getParent() instanceof ScrollView) {
+            ScrollView scroll = (ScrollView) body.getParent();
+            scroll.setLayoutParams(new LinearLayout.LayoutParams(-1, -2));
+        }
+        dialog.getWindow().setLayout(activity.getResources().getDisplayMetrics().widthPixels - dp(28), -2);
     }
     private void track(Dialog dialog) {
         ScrollView page = viewport.get();
@@ -134,7 +147,7 @@ final class CommutePanel implements AutoCloseable {
         if (!client.get().vault.token().isEmpty() && !loaded && !loading) load();
         ui.removeCallbacks(tick); ui.post(tick);
     }
-    void pause() { ui.removeCallbacks(tick); mapPanel.pause(); }
+    void pause() { ui.removeCallbacks(tick); mapPanel.pause(); speaker.stop(); briefingVersion++; }
     void pauseMap() { mapPanel.pause(); }
     boolean hasPendingMutations() { return mutating || addressWrites > 0; }
     private void load() {
@@ -207,6 +220,13 @@ final class CommutePanel implements AutoCloseable {
         endButton = button(plan, "结束通勤", false, this::stop);
         status = text(plan, "", 12, EditorUi.MUTED);
         text(plan, "开始后每 3 分钟更新定位与路线，锁屏也继续；可从通知结束。固定起点保留原地址，仅更新路线耗时估算。", 12, EditorUi.MUTED);
+        LinearLayout stations = card(parent);
+        text(stations, "站点提醒", 18, EditorUi.INK);
+        stationStatus = text(stations, CommuteService.reminderStatus(client.get()), 13, EditorUi.MUTED);
+        text(stations, "根据定位识别上车；定位不足时点“我已上车”校准。每 3 分钟语音播报进度，换乘或下车前一站发送 App 通知并播报。地下定位不足时使用计划时间估算，以车内报站为准。", 12, EditorUi.MUTED);
+        button(stations, "我已上车", false, () -> { stationStatus.setText(CommuteService.boarded(client.get())); });
+        button(stations, "提醒设置", false, this::reminderSettings);
+        button(stations, "测试站点提醒", false, this::testStationReminder);
         summary = card(parent);
         mapPanel.renderWeather(parent);
         lastRender = ""; update();
@@ -221,6 +241,7 @@ final class CommutePanel implements AutoCloseable {
     }
     private boolean editable() { if (journey.optBoolean("active")) { notice = "请先结束本次通勤，再修改起终点"; update(); return false; } return !mutating; }
     private void update() {
+        if (stationStatus != null) stationStatus.setText(CommuteService.reminderStatus(client.get()));
         if (originButton == null) return;
         originButton.setText("起点  ·  " + ("gps".equals(originMode) ? "当前位置" : origin == null ? "选择自定义起点" : origin.optString("name")));
         destinationButton.setText("终点  ·  " + (destination == null ? "选择目的地" : destination.optString("name")));
@@ -270,7 +291,7 @@ final class CommutePanel implements AutoCloseable {
             : "transit".equals(journey.optString("transport")) ? "带入目的地，在高德选择公交或地铁乘车方案。"
             : "从当前位置出发，其他偏好沿用高德设置。");
     }
-    private void openNavigation() {
+    void openNavigation() {
         if (closed || mutating || !visible.getAsBoolean() || !allowed.getAsBoolean()) return;
         ApiClient api = client.get();
         JSONObject active = CommuteService.current(api);
@@ -322,7 +343,7 @@ final class CommutePanel implements AutoCloseable {
             if (journey.optBoolean("active")) { launch(journey); return; }
             if (mutating) return;
             mutating = true; long version = ++journeyVersion;
-            pendingJourneyId = UUID.randomUUID().toString();
+            pendingJourneyId = dialogueJourney.isEmpty() ? UUID.randomUUID().toString() : dialogueJourney;
             JSONObject body = new JSONObject(); put(body, "journey_id", pendingJourneyId); put(body, "origin_mode", originMode);
             put(body, "origin", "fixed".equals(originMode) ? copy(origin) : JSONObject.NULL); put(body, "destination", copy(destination)); put(body, "transport", transport); update();
             execute("commute", api -> {
@@ -337,15 +358,77 @@ final class CommutePanel implements AutoCloseable {
                 () -> { mutating = false; pendingJourneyId = ""; journeyVersion++; }, () -> version == journeyVersion);
         });
     }
+    void startFromConversation(JSONObject plan) {
+        if (closed || !visible.getAsBoolean() || !allowed.getAsBoolean() || mutating) return;
+        resume();
+        ApiClient api = client.get();
+        String id = plan.optString("journey_id");
+        if (!id.matches("[a-zA-Z0-9-]{16,64}") || plan.optJSONObject("destination") == null) return;
+        android.content.SharedPreferences consumed = activity.getSharedPreferences("commute_dialogue_actions", Context.MODE_PRIVATE);
+        String key = CommuteService.owner(api);
+        if (id.equals(consumed.getString(key, ""))) return;
+        if (CommuteService.running(api) || journey.optBoolean("active")) { information("通勤正在进行", "请先结束当前通勤，再开始新的行程。"); return; }
+        String method = plan.optString("transport"), from = plan.optString("origin_mode");
+        if (!Arrays.asList("driving", "walking", "transit", "bicycling").contains(method)
+                || !Arrays.asList("gps", "fixed").contains(from) || "fixed".equals(from) && plan.optJSONObject("origin") == null) return;
+        consumed.edit().putString(key, id).apply();
+        journeyVersion++; originMode = from; origin = plan.optJSONObject("origin"); destination = copy(plan.optJSONObject("destination")); transport = method;
+        dialogueJourney = id; update(); start();
+    }
+    private boolean briefingCurrent(ApiClient api, String token, String id, long version) {
+        JSONObject live = CommuteService.current(api);
+        return !closed && visible.getAsBoolean() && version == briefingVersion && client.get() == api && token.equals(api.vault.token())
+            && live != null && id.equals(live.optString("id")) && live.optBoolean("active");
+    }
+    private void prepareBriefing(String id, long version, long deadline) {
+        ApiClient api = client.get(); String token = api.vault.token();
+        if (!briefingCurrent(api, token, id, version)) return;
+        JSONObject live = CommuteService.current(api), route = live.optJSONObject("route");
+        if ((route == null || !route.optBoolean("available")) && SystemClock.elapsedRealtime() < deadline) {
+            ui.postDelayed(() -> prepareBriefing(id, version, deadline), 1000); return;
+        }
+        BooleanSupplier relevant = () -> briefingCurrent(api, token, id, version);
+        query(c -> c.json("GET", "/v1/commute/" + id + "/briefing", null), result -> {
+            String announcement = result.optString("text");
+            if (announcement.isEmpty()) { information("通勤已开启", "语音信息暂未取得，可在通勤页打开高德导航。"); return; }
+            speaker.speak(api, announcement, relevant, played -> {
+                if (!relevant.getAsBoolean()) return;
+                if (played) openNavigation();
+                else information("通勤已开启", "语音未能播放，可能音频正忙或网络不可用。可在通勤页点击高德导航。\n\n" + announcement);
+            });
+        }, null, relevant);
+    }
+    private void reminderSettings() {
+        LinearLayout body = EditorUi.column(activity), footer = EditorUi.column(activity);
+        android.widget.Switch enabled = new android.widget.Switch(activity); enabled.setText("语音和 App 站点提醒"); enabled.setChecked(CommuteService.remindersEnabled(activity, client.get())); body.addView(enabled);
+        text(body, "提醒发到本机通知栏，不使用手机号和短信。通知权限被关闭时，可在系统设置中开启。", 14, EditorUi.MUTED);
+        Dialog dialog = sheet("站点提醒设置", body, footer); compactSheet(dialog, body);
+        button(footer, "保存", true, () -> { CommuteService.setReminders(activity, client.get(), enabled.isChecked()); dialog.dismiss(); });
+        button(footer, "打开系统通知设置", false, () -> { activity.startActivity(new Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, activity.getPackageName())); });
+        button(footer, "取消", false, dialog::dismiss);
+    }
+    private void testStationReminder() {
+        if (!visible.getAsBoolean() || !allowed.getAsBoolean() || speaker.busy()) return;
+        String message = TransitProgress.testMessage();
+        boolean notified = CommuteService.showReminder(activity, message);
+        LinearLayout body = EditorUi.column(activity), footer = EditorUi.column(activity);
+        text(body, message, 15, EditorUi.INK);
+        TextView result = text(body, notified ? "测试通知已提交 · 正在准备语音" : "通知未开启，请在提醒设置中允许通知 · 正在准备语音", 13, EditorUi.MUTED);
+        Dialog dialog = sheet("测试站点提醒", body, footer); compactSheet(dialog, body); button(footer, "完成", true, dialog::dismiss);
+        ApiClient api = client.get(); String token = api.vault.token();
+        speaker.speak(api, message, () -> !closed && visible.getAsBoolean() && client.get() == api && token.equals(api.vault.token()),
+            success -> result.setText((notified ? "测试通知已提交" : "通知未开启") + (success ? " · 语音播放完成" : " · 语音未播放，请检查网络或等待其他音频结束")));
+    }
     private void launch(JSONObject value) {
         if (!visible.getAsBoolean()) { notice = "请回到 App 后点击继续通勤"; update(); return; }
         ApiClient api = client.get(); String token = api.vault.token(); long current = generation, version = journeyVersion;
-        try { CommuteService.start(activity, value); notice = "正在开启通勤服务…"; ui.postDelayed(() -> { if (!current(api, token, current) || version != journeyVersion) return; notice = CommuteService.running(client.get()) ? "" : "请检查系统定位开关和权限，再继续通勤"; update(); runningChanged.run(); }, 1000); }
+        try { journeyLauncher.accept(activity, value); notice = "正在开启通勤服务…"; ui.postDelayed(() -> { if (!current(api, token, current) || version != journeyVersion) return; notice = CommuteService.running(client.get()) ? "" : "请检查系统定位开关和权限，再继续通勤"; update(); runningChanged.run(); if (CommuteService.running(client.get()) && value.optString("id").equals(dialogueJourney)) { dialogueJourney = ""; prepareBriefing(value.optString("id"), ++briefingVersion, SystemClock.elapsedRealtime() + 45000); } }, 1000); }
         catch (RuntimeException error) { notice = "通勤服务未能启动，请检查定位权限后重试"; update(); }
     }
     void stop() {
         if (stopping || closed || client.get() == null) return;
         if (navigationFallback != null) navigationFallback.dismiss();
+        speaker.stop(); briefingVersion++; dialogueJourney = "";
         notice = "通勤已结束";
         if (CommuteService.running(client.get())) CommuteService.stop(activity);
         String id = pendingJourneyId.isEmpty() ? journey.optString("id") : pendingJourneyId;
@@ -363,7 +446,7 @@ final class CommutePanel implements AutoCloseable {
         }
         runningChanged.run();
     }
-    void modeChanged(String mode) { if (!"commute".equals(mode) && (journey.optBoolean("active") || !pendingJourneyId.isEmpty() || CommuteService.running(client.get()))) stop(); }
+    void modeChanged(String mode) { if (!"commute".equals(mode)) { speaker.stop(); briefingVersion++; dialogueJourney = ""; } if (!"commute".equals(mode) && (journey.optBoolean("active") || !pendingJourneyId.isEmpty() || CommuteService.running(client.get()))) stop(); }
     void addressBook() {
         resume(); LinearLayout body = EditorUi.column(activity), footer = EditorUi.column(activity);
         text(body, "家、公司、学校和自定义地点。地址定位一次后保存坐标，下次直接选用。", 13, EditorUi.MUTED);
@@ -569,10 +652,10 @@ final class CommutePanel implements AutoCloseable {
         }
     }
     private void resetViews() {
-        mapPanel.reset(); navigationOpenedAt = -2000;
+        speaker.stop(); briefingVersion++; dialogueJourney = ""; mapPanel.reset(); navigationOpenedAt = -2000;
         generation++; addressesVersion++; journeyVersion++; addressWrites = 0; addressesNeedReload = addressRefreshInFlight = false; pendingJourneyId = ""; loaded = loading = mutating = stopping = false; addresses = new JSONArray(); journey = new JSONObject(); origin = destination = null; originMode = "gps"; transport = "driving"; notice = ""; permissionAction = null; lastRender = "";
         for (Dialog dialog : new ArrayList<>(dialogs)) dialog.dismiss(); addressRows = null;
     }
     void reset() { CommuteService.stop(activity); resetViews(); account = ""; }
-    @Override public void close() { closed = true; pause(); mapPanel.close(); for (Dialog dialog : new ArrayList<>(dialogs)) dialog.dismiss(); network.shutdownNow(); queries.shutdownNow(); }
+    @Override public void close() { closed = true; pause(); speaker.close(); mapPanel.close(); for (Dialog dialog : new ArrayList<>(dialogs)) dialog.dismiss(); network.shutdownNow(); queries.shutdownNow(); }
 }

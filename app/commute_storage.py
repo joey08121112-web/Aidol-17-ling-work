@@ -77,6 +77,14 @@ class CommuteStorage:
                              tag + '_city': address['city'] if address else ''})
         db.execute('INSERT INTO settings VALUES(1,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value', (json.dumps(settings, ensure_ascii=False),))
 
+    def commute_dialogue(self):
+        with self.connect() as db:
+            return self._commute_read(db, 'dialogue', {})
+
+    def save_commute_dialogue(self, value):
+        with self.connect() as db:
+            self._commute_write(db, 'dialogue', value)
+
     def commute_journey(self):
         with self.connect() as db:
             return self._commute_read(db, 'journey', {})

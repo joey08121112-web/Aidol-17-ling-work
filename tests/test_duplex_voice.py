@@ -605,3 +605,29 @@ def test_backlogged_sentences_are_rejected_but_the_call_survives(client, config,
         ws.send_json({'type': 'end'})
         assert ws.receive_json()['type'] == 'call.done'
     assert len(results) == 5 and native.closed
+
+
+def test_commute_ready_completes_call_without_starting_a_second_reply(client, config, runtime, monkeypatch):
+    from app.domain import Settings
+    runtime.store.save_settings(Settings(auto_mode=False, mode='commute'))
+    point = dict(name='公司', address='北京市测试路1号', city='北京', longitude=116.4, latitude=39.9, tag='work', adcode='110101')
+    runtime.store.save_address('work', point)
+    class TravelNative(Native):
+        async def append(self, pcm):
+            for event in [{'type':'input_audio_buffer.speech_started','item_id':'travel'},
+                          {'type':'input_audio_buffer.speech_stopped','item_id':'travel'},
+                          {'type':'conversation.item.input_audio_transcription.completed','item_id':'travel','transcript':'从当前位置去公司，坐地铁'}]:
+                await self.inputs.put(event)
+    native = TravelNative(); setup(client, config, monkeypatch, native)
+    with client.websocket_connect(endpoint()) as ws:
+        assert ws.receive_json()['type'] == 'ready'
+        ws.send_bytes(b'\x01\x00' * 100)
+        messages = []
+        for _ in range(15):
+            message = ws.receive_json(); messages.append(message)
+            if message['type'] == 'call.done': break
+        assert messages[-1]['type'] == 'call.done'
+        result = next(m['result'] for m in messages if m['type'] == 'result')
+        assert result['interaction'] == 'commute_ready' and result['speak'] is False
+        assert result['commute_plan']['transport'] == 'transit'
+        assert native.replies == 0

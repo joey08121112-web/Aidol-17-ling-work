@@ -536,7 +536,7 @@ class Store(CommuteStorage):
 
     def clear(self):
         with self.connect() as db:
-            db.execute("DELETE FROM commute_data WHERE key='journey'")
+            db.execute("DELETE FROM commute_data WHERE key IN ('journey', 'dialogue')")
             for table in ("work_meeting_deletions", "action_task_dismissals", "location_records", "work_audio_uploads", "work_utterances", "work_meeting_events", "work_meeting_segments", "work_meetings", "memories", "transcripts", "events", "drafts", "processed", "meeting_reports", "action_tasks", "mobile_turns", "recall_exclusions"):
                 db.execute(f"DELETE FROM {table}")
         shutil.rmtree(self.audio_root, ignore_errors=True)

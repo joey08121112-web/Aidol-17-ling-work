@@ -870,3 +870,12 @@ Android `testDebugUnitTest lintDebug assembleDebug` 成功：159项单测，零�
 - Honor ANN-AN00安装启动成功，已安装base.apk与构建SHA256一致：`6589b1ec2ee3ad8a90f61c68c814ac3f1ebfa222385f3d06ae48eb4074f75285`。设备显示固件确认触控开启，左耳已佩戴，未检测到通话。
 - 实物配合：用户确认“上滑动下滑动对应的都是对的操作，直接按照现在的情况跟进”。观察6次实际触控，末次SLIDE_BACKWARD (0x94) #6；蓝牙媒体音量从7到5。因用户执行了多次上下滑动，未逐次隔离计量，不能排除固件也调节音量。未测试长捏ANC切换，不等同已支持。
 - 安装前确认App工作模式待机且无录音/通勤服务，并备份2个本地用户库。安装后原有受保护记录未删除或修改；其中一个库transcripts新增2条，未读出内容、未删除，来源未归因。其他保护表保持一致。未清除手机数据、未主动开始录音、未重启服务器，未提交或推送Git。保留此前viaim字标改动。
+
+### 2026-10-18 对话启动通勤、站点 App 通知
+
+- 用户已纠正通知渠道：使用 App 通知，不是手机号短信。未添加 SEND_SMS 权限、号码配置或短信调用。
+- 本地离线回归：`pytest tests -q` **687 passed**；`compileall app` 通过。包含缺少必填信息、跨轮补齐、地址候选确认、保存地址复用、模型不能虚构起点、取消、清除草稿、权限前不启动、天气与路线播报、连续语音正常 `call.done` 等用例。
+- Android：`testDebugUnitTest lintDebug assembleDebug assembleDebugAndroidTest` 通过，**321 tests / 0 failures**；Lint **0 errors / 34 warnings**（现有风格警告及新增文字国际化提示）。计时估算、GPS 前一站、移动定位识别上车、重复提醒抑制、进度恢复、过期定位、错过时刻、坐标转换有离线用例。
+- 荣耀 ANN-AN00 / Android 15，隔离 `.review` 真机 `CommuteDialogueInstrumentation` **PASS**：完整参数带入一次启动请求、合并 TTS 静音 WAV 完成后才打开拦截的高德 Intent、重复计划不重复启动、测试 App 通知已发布。使用模拟服务/路线/音频；不是真实供应商语音、真实通勤服务或乘车验证，不操作主 App 账号数据。测试包已卸载。
+- 随后的短弹窗布局与自动上车识别调整已构建并通过单元测试；第二次真机复查遇到手机锁屏，未执行完成，已停止并清理隔离测试包。此前真机证据仅覆盖已列流程，不证明地下定位、耳机实际听感、锁屏全程或高德实时站点同步。
+- 安装包已输出 `outputs/aidol-commute-dialogue.apk`，SHA-256 `26e74c67c7bd475b37b3607d52c3b84524cc7756cd8d48ea5acea9d98f377b2f`。主 App 未覆盖安装；本机服务未因本次改动重启。用户随后明确暂停安装与服务更新，先将本地验证版本提交 GitHub；远端服务未部署。
