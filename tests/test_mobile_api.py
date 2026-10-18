@@ -480,6 +480,23 @@ def test_active_turn_blocks_destructive_actions_but_not_another_account(mobile, 
         assert pending.result(timeout=10).status_code == 200
 
 
+def test_state_snapshot_read_bypasses_the_account_lock_but_writes_keep_409(client, runtime):
+    # A live turn or duplex call holds the account lock for seconds; the client's
+    # state poll is a lock-free SQLite snapshot and must never queue behind it.
+    client.portal.call(runtime.lock.acquire)
+    try:
+        state = client.get("/v1/state")
+        assert state.status_code == 200
+        body = state.json()
+        assert body["user"]["id"] and body["agent"]["mode"] and body["settings"]["auto_mode"] is False
+        assert client.get("/v1/work-meetings").status_code == 200
+        # Write paths keep their fast-fail conflict semantics.
+        assert client.put("/v1/settings", json={"auto_mode": False, "mode": "life"}).status_code == 409
+        assert chat(client, dict(client.headers)).status_code == 409
+    finally:
+        client.portal.call(runtime.lock.release)
+
+
 def test_voice_no_speech_and_provider_failure_are_safe(mobile, monkeypatch):
     _, headers = register(mobile)
     headers = {**headers, "Content-Type": "audio/pcm"}

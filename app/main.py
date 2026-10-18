@@ -36,6 +36,12 @@ from .services.commute_journeys import PlacePoint, SavedAddressInput, CommuteSta
 from .services.maps import MapService
 from .providers.bocha import BochaSearch
 
+# Persisting finished minutes defers under account-lock contention instead of
+# discarding the generated report; tests shorten the waits.
+WORK_SUMMARY_SAVE_ATTEMPTS = 3
+WORK_SUMMARY_SAVE_LOCK_WAIT = 10
+WORK_SUMMARY_SAVE_RETRY_DELAY = 2
+
 
 def create_hosted_app(config=None, data_directory=None):
     """Public Android API. Never mounts the unauthenticated single-user API/web UI."""
@@ -393,17 +399,23 @@ def create_hosted_app(config=None, data_directory=None):
 
     @api.get('/v1/state')
     async def mobile_state(request: Request, background: BackgroundTasks, current=Depends(user)):
-        async with runtime(current, request, wait_seconds=5) as rt:
-            await rt.agent.decide()
-            meetings = rt.store.work_meetings()
-            resume_work_summaries(background, current, meetings)
-            meeting_addresses.schedule(background, rt.store, meetings)
-            return {'user': current, 'settings': rt.store.settings().model_dump(),
-                    'capabilities': config.capabilities(), 'agent': rt.agent.snapshot(),
-                    'transcripts': list(reversed(rt.store.list('transcripts', 100))),
-                    'memories': rt.store.list('memories', 300), 'tasks': rt.store.list('action_tasks', 300),
-                    'drafts': rt.store.list('drafts', 30),
-                    'meeting_report': rt.store.meeting_report(), 'work_meetings': meetings}
+        # Aggregate snapshot read. It never acquires the account's business lock:
+        # a duplex call or long ASR turn must not hold the client's poll hostage.
+        # SQLite WAL keeps the reads consistent; write paths keep their 409 semantics.
+        rt = runtimes.obtain(current['id'])
+        # The lock-free read still adopts passive location records; the swap is
+        # in-memory and timestamp-guarded, so it cannot race a locked turn badly.
+        rt.apply_passive_location()
+        await rt.agent.decide()
+        meetings = rt.store.work_meetings()
+        resume_work_summaries(background, current, meetings)
+        meeting_addresses.schedule(background, rt.store, meetings)
+        return {'user': current, 'settings': rt.store.settings().model_dump(),
+                'capabilities': config.capabilities(), 'agent': rt.agent.snapshot(),
+                'transcripts': list(reversed(rt.store.list('transcripts', 100))),
+                'memories': rt.store.list('memories', 300), 'tasks': rt.store.list('action_tasks', 300),
+                'drafts': rt.store.list('drafts', 30),
+                'meeting_report': rt.store.meeting_report(), 'work_meetings': meetings}
 
     @api.put('/v1/settings')
     async def mobile_settings(value: Settings, request: Request, current=Depends(user)):
@@ -731,7 +743,7 @@ def create_hosted_app(config=None, data_directory=None):
             status = error.status_code if isinstance(error, HTTPException) else 502
             logging.getLogger('uvicorn.error.aidol.mobile').warning(
                 'voice_session request_id=%s failure=%s status=%d', request_id, type(error).__name__, status)
-            detail = error.detail if isinstance(error, HTTPException) else '实时语音中断，请检查网络并查询本轮状态后重试'
+            detail = error.detail if isinstance(error, HTTPException) else '实时语音中断，已完成的回复可在历史记录中查看'
             try:
                 await socket.send_json({'type': 'error', 'status': status, 'detail': detail})
             except (WebSocketDisconnect, RuntimeError):
@@ -1050,15 +1062,44 @@ def create_hosted_app(config=None, data_directory=None):
         key = (current['id'], meeting_id)
         store = None
         try:
-            async with work_summary_slots:
-                found = accounts.user(current['username'])
-                if found is None or found['id'] != current['id']:
+            found = accounts.user(current['username'])
+            if found is None or found['id'] != current['id']:
+                return
+            async with runtimes.use(current['id'], wait_seconds=10) as rt:
+                store = rt.store
+                meeting = store.work_meeting(meeting_id)
+                if meeting is None or meeting['summary_status'] != 'pending':
                     return
+            if meeting['transcription_status'] == 'pending':
+                # Whole-meeting diarization from the saved audio: one speaker namespace for the meeting.
+                import tempfile
+                store.work_summary_progress(meeting_id, 'transcribing', 0, 1)
+                turns = None
+                try:
+                    if not meeting['asr_task_id'] and not accounts.consume('usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400):
+                        raise SpeechProviderError('Meeting transcription quota reached')
+                    with tempfile.TemporaryFile(suffix='.wav') as wav:
+                        if not meeting['asr_task_id']:
+                            await run_in_threadpool(store.write_work_wav, meeting_id, wav)
+                        wav.seek(0)
+                        turns = await api.state.meeting_asr.transcribe(wav, meeting['asr_task_id'],
+                            lambda task_id: store.work_asr_task(meeting_id, task_id))
+                except (SpeechProviderError, ValueError) as exc:
+                    # Keep the live sentences; a later retry can submit a new task.
+                    store.fail_work_transcription(meeting_id, reset_task=isinstance(exc, MeetingTaskFailed))
                 async with runtimes.use(current['id'], wait_seconds=10) as rt:
-                    store = rt.store
-                    meeting = store.work_meeting(meeting_id)
-                    if meeting is None or meeting['summary_status'] != 'pending':
+                    fresh = rt.store.work_meeting(meeting_id)
+                    if fresh is None or [row['id'] for row in fresh['sources']] != [row['id'] for row in meeting['sources']]:
+                        # A source was forgotten while the provider ran; never recreate it from audio.
+                        rt.store.fail_work_transcription(meeting_id)
                         return
+                    if turns is not None and not rt.store.save_work_dialogue(meeting_id, turns):
+                        return
+                    meeting = rt.store.work_meeting(meeting_id)
+            # The slot bounds concurrent minutes generation only. It must not span
+            # the provider transcription polling above, or two long meetings would
+            # starve every other account's summaries.
+            async with work_summary_slots:
                 revision = meeting['revision_request']
                 if revision.get('status') == 'pending':
                     store.work_summary_progress(meeting_id, 'analyzing', 0, 1)
@@ -1080,32 +1121,6 @@ def create_hosted_app(config=None, data_directory=None):
                         if not rt.store.finish_work_revision(meeting_id, revision['id'], report, [r['id'] for r in meeting['sources']]):
                             rt.store.fail_work_summary(meeting_id)
                     return
-                if meeting['transcription_status'] == 'pending':
-                    # Whole-meeting diarization from the saved audio: one speaker namespace for the meeting.
-                    import tempfile
-                    store.work_summary_progress(meeting_id, 'transcribing', 0, 1)
-                    turns = None
-                    try:
-                        if not meeting['asr_task_id'] and not accounts.consume('usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400):
-                            raise SpeechProviderError('Meeting transcription quota reached')
-                        with tempfile.TemporaryFile(suffix='.wav') as wav:
-                            if not meeting['asr_task_id']:
-                                await run_in_threadpool(store.write_work_wav, meeting_id, wav)
-                            wav.seek(0)
-                            turns = await api.state.meeting_asr.transcribe(wav, meeting['asr_task_id'],
-                                lambda task_id: store.work_asr_task(meeting_id, task_id))
-                    except (SpeechProviderError, ValueError) as exc:
-                        # Keep the live sentences; a later retry can submit a new task.
-                        store.fail_work_transcription(meeting_id, reset_task=isinstance(exc, MeetingTaskFailed))
-                    async with runtimes.use(current['id'], wait_seconds=10) as rt:
-                        fresh = rt.store.work_meeting(meeting_id)
-                        if fresh is None or [row['id'] for row in fresh['sources']] != [row['id'] for row in meeting['sources']]:
-                            # A source was forgotten while the provider ran; never recreate it from audio.
-                            rt.store.fail_work_transcription(meeting_id)
-                            return
-                        if turns is not None and not rt.store.save_work_dialogue(meeting_id, turns):
-                            return
-                        meeting = rt.store.work_meeting(meeting_id)
                 rows = store.work_meeting_evidence(meeting)
                 source_ids = [row['id'] for row in meeting['sources']]
                 if not rows:
@@ -1114,21 +1129,33 @@ def create_hosted_app(config=None, data_directory=None):
                 charge = lambda: accounts.consume('usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400)
                 report = await WorkMeetingMinutes(config, charge).generate(rows,
                     lambda stage, done, total: store.work_summary_progress(meeting_id, stage, done, total))
-                if meeting['transcription_status'] == 'failed':
-                    report['notice'] = '整场说话人识别未完成，以下基于实时或分段原文整理，编号可能跨段变化。' + report.get('notice', '')
-                # The network work never holds the account's voice/control lock.
-                found = accounts.user(current['username'])
-                if found is None or found['id'] != current['id']:
-                    return
-                async with runtimes.use(current['id'], wait_seconds=10) as rt:
-                    attach_times(report, meeting)
-                    report['includes_demo'] = False
-                    report['meeting_id'] = meeting_id
-                    report['started_at'] = meeting['started_at']
-                    report['location'] = meeting['location']
-                    report['capture_status'] = meeting['status']
-                    if not rt.store.save_work_summary(meeting_id, report, source_ids):
-                        rt.store.fail_work_summary(meeting_id)
+            if meeting['transcription_status'] == 'failed':
+                report['notice'] = '整场说话人识别未完成，以下基于实时或分段原文整理，编号可能跨段变化。' + report.get('notice', '')
+            # The network work never holds the account's voice/control lock.
+            found = accounts.user(current['username'])
+            if found is None or found['id'] != current['id']:
+                return
+            for attempt in range(WORK_SUMMARY_SAVE_ATTEMPTS):
+                try:
+                    async with runtimes.use(current['id'], wait_seconds=WORK_SUMMARY_SAVE_LOCK_WAIT) as rt:
+                        attach_times(report, meeting)
+                        report['includes_demo'] = False
+                        report['meeting_id'] = meeting_id
+                        report['started_at'] = meeting['started_at']
+                        report['location'] = meeting['location']
+                        report['capture_status'] = meeting['status']
+                        if not rt.store.save_work_summary(meeting_id, report, source_ids):
+                            rt.store.fail_work_summary(meeting_id)
+                    break
+                except HTTPException as exc:
+                    if exc.status_code != 409:
+                        raise
+                    if attempt == WORK_SUMMARY_SAVE_ATTEMPTS - 1:
+                        # Lock contention must not discard generated minutes: the job
+                        # stays pending and the next page read resumes it.
+                        diagnostics.info('work meeting summary save deferred by account lock')
+                        return
+                    await asyncio.sleep(WORK_SUMMARY_SAVE_RETRY_DELAY)
         except asyncio.CancelledError:
             # Keep the persisted pending job; the next page read resumes it.
             raise
@@ -1146,6 +1173,10 @@ def create_hosted_app(config=None, data_directory=None):
                 work_summaries_running.add(key)
                 background.add_task(summarize_work, current, meeting['id'])
 
+    # One lock-free reader per account: a fresh Store re-runs the migration script
+    # on every poll (~1 ms each); a kept object skips that and holds no connection.
+    work_read_stores = {}
+
     def read_work_store(current):
         # SQLite snapshot reads need not wait for ASR's account lock. This lets the
         # progress page remain usable while another segment is being transcribed.
@@ -1153,7 +1184,13 @@ def create_hosted_app(config=None, data_directory=None):
         if existing is not None:
             return existing.store
         path = directory / 'users' / (current['id'] + '.sqlite3')
-        return Store(str(path)) if path.exists() else None
+        if not path.exists():
+            work_read_stores.pop(current['id'], None)  # The account data was deleted.
+            return None
+        store = work_read_stores.get(current['id'])
+        if store is None:
+            store = work_read_stores[current['id']] = Store(str(path))
+        return store
 
     @api.post('/v1/work-meetings')
     async def start_work_meeting(value: WorkMeetingStart, request: Request, background: BackgroundTasks, current=Depends(user)):

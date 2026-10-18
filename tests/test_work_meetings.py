@@ -565,6 +565,27 @@ def test_segment_fallback_recognition_replaces_live_sentences_in_its_range(live,
     assert texts == ['完整的第一段。', '下一段的话']
 
 
+def test_live_queue_backpressure_closes_with_error_instead_of_buffering(live, monkeypatch):
+    import asyncio
+    from app.services.work_live import RUN_QUEUE_FRAMES
+    client, runtime, plans, runs, calls = live
+    monkeypatch.setattr('app.services.work_live.RUN_QUEUE_PUT_TIMEOUT', .1)
+    meeting_id = start(client)
+
+    async def stalled(chunks, **_):
+        await asyncio.sleep(30)  # An upstream that consumes nothing.
+        yield AsrResult('', final=True)
+
+    monkeypatch.setattr(client.app.state.speech, 'stream_asr', stalled)
+    headers = {'Authorization': client.headers['Authorization']}
+    with client.websocket_connect(f'/v1/work-meetings/{meeting_id}/live?offset_ms=0', headers=headers) as ws:
+        assert ws.receive_json() == {'type': 'ready', 'offset_ms': 0}
+        for _ in range(RUN_QUEUE_FRAMES + 1):
+            ws.send_bytes(b'\0' * 3200)
+        message = ws.receive_json()
+        assert message == {'type': 'error', 'message': '实时字幕中断，这段录音会改用整段识别'}
+
+
 def test_live_socket_rejects_bad_auth_ended_meetings_and_reports_provider_failure(live, monkeypatch):
     client, runtime, plans, runs, calls = live
     from starlette.websockets import WebSocketDisconnect
@@ -647,6 +668,108 @@ def test_meeting_people_events_and_conflicts_require_evidence():
     report['conflicts'][0]['source_ids'] = ['other-meeting']
     with pytest.raises(ValueError):
         _validate_minutes(report, rows)
+
+
+def test_locked_save_defers_generated_minutes_instead_of_failing(work, monkeypatch):
+    from app import main as main_module
+    client, runtime, words, calls = work
+    monkeypatch.setattr(main_module, 'WORK_SUMMARY_SAVE_LOCK_WAIT', .05)
+    monkeypatch.setattr(main_module, 'WORK_SUMMARY_SAVE_RETRY_DELAY', .01)
+    meeting_id = start(client)
+    upload(client, meeting_id)
+    attempts = []
+
+    async def contended(self, rows, progress):
+        attempts.append(rows)
+        if len(attempts) == 1:
+            # A duplex call takes over the account right after the model answered.
+            await runtime.lock.acquire()
+        return {'title': '设计稿讨论', 'summary': '采用蓝色方案，周五交设计稿。', 'topics': [],
+                'decisions': [], 'tasks': [], 'open_questions': [],
+                'source_ids': [row['id'] for row in rows], 'extraction': 'llm'}
+
+    monkeypatch.setattr(WorkMeetingMinutes, 'generate', contended)
+    finish(client, meeting_id)
+    # The minutes were generated; account-lock contention must leave the job
+    # pending and resumable, not mark the finished report failed.
+    assert len(attempts) == 1
+    assert runtime.store.work_meeting(meeting_id)['summary_status'] == 'pending'
+    client.portal.call(runtime.lock.release)
+    client.get('/v1/work-meetings/' + meeting_id)  # the next page read resumes and saves it
+    meeting = runtime.store.work_meeting(meeting_id)
+    assert len(attempts) == 2 and meeting['summary_status'] == 'ready'
+    assert meeting['report']['title'] == '设计稿讨论'
+
+
+def test_transcription_polling_does_not_hold_summary_slots(work, monkeypatch):
+    import asyncio
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    client, runtime, words, calls = work
+    client.app.state.work_asr.config.api_key = 'offline-only'
+    gates = []
+
+    async def stalled(wav, task_id, on_task):
+        gate = asyncio.Event()
+        gates.append(gate)
+        await gate.wait()
+        return [{'text': '整场内容。', 'speaker': '发言人 1', 'begin_time': 0, 'end_time': 1000}]
+
+    monkeypatch.setattr(client.app.state.meeting_asr, 'transcribe', stalled)
+    whole = []
+    for _ in range(2):
+        meeting_id = uuid4().hex
+        assert client.post('/v1/work-meetings', json={'meeting_id': meeting_id, 'whole_audio': True}).status_code == 200
+        assert client.post('/v1/work-meetings/' + meeting_id + '/audio', params={'upload_index': 0,
+            'request_id': uuid4().hex}, content=b'\0' * 3200, headers={'Content-Type': 'audio/pcm'}).status_code == 200
+        whole.append(meeting_id)
+    # Segment uploads need speech ASR only; keeping work ASR off leaves the third
+    # meeting on the already-transcribed path.
+    client.app.state.work_asr.config.api_key = ''
+    third = start(client)
+    upload(client, third)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        transcribing = [pool.submit(finish, client, meeting_id) for meeting_id in whole]
+        try:
+            deadline = time.time() + 5
+            while len(gates) < 2 and time.time() < deadline:
+                time.sleep(.02)
+            assert len(gates) == 2, 'both whole-meeting transcriptions should be polling'
+            summary = pool.submit(finish, client, third)
+            # With the slots held only by minutes generation, this completes while
+            # both provider transcription polls are still running.
+            summary.result(timeout=15)
+            assert runtime.store.work_meeting(third)['summary_status'] == 'ready'
+        finally:
+            for gate in gates:
+                client.portal.call(gate.set)
+            for pending_job in transcribing:
+                pending_job.result(timeout=15)
+    assert all(runtime.store.work_meeting(meeting_id)['summary_status'] == 'ready' for meeting_id in whole)
+
+
+def test_progress_reads_build_one_store_per_account(config, tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import storage
+    from app.main import create_hosted_app
+    built = []
+
+    class Counting(storage.Store):
+        def __init__(self, path):
+            built.append(path)
+            super().__init__(path)
+
+    monkeypatch.setattr(storage, 'Store', Counting)
+    with TestClient(create_hosted_app(config, tmp_path / 'hosted')) as client:
+        registered = client.post('/auth/register', json={'username': 'storeuser', 'password': 'test-password-123'})
+        assert registered.status_code == 201, registered.text
+        headers = {'Authorization': 'Bearer ' + registered.json()['token']}
+        assert client.put('/v1/settings', json={'auto_mode': False, 'mode': 'work'}, headers=headers).status_code == 200
+        client.app.state.runtimes.items.clear()  # Simulate eviction: only the SQLite file remains.
+        for _ in range(3):
+            assert client.get('/v1/work-meetings', headers=headers).status_code == 200
+    # Three polls, one migration run: repeated Store construction is cached away.
+    assert built == [str(tmp_path / 'hosted' / 'users' / (registered.json()['user']['id'] + '.sqlite3'))]
 
 
 def test_whole_audio_waits_until_end_then_keeps_one_speaker_namespace(work, monkeypatch):

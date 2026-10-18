@@ -14,11 +14,13 @@ from ..storage import speaker_label
 PCM_BYTES_PER_MS = 32
 MAX_FRAME_BYTES = 64000
 MAX_RUN_MS = 10 * 60 * 1000  # Start a fresh upstream run before any provider session limit.
+RUN_QUEUE_FRAMES = 32        # Explicit backpressure budget: never buffer unbounded audio.
+RUN_QUEUE_PUT_TIMEOUT = 3
 
 
 class _Run:
     def __init__(self, base_ms):
-        self.base_ms, self.queue = base_ms, asyncio.Queue()
+        self.base_ms, self.queue = base_ms, asyncio.Queue(maxsize=RUN_QUEUE_FRAMES)
         self.saved, self.audio_ms, self.partial = 0, 0, ''
 
 
@@ -80,7 +82,9 @@ async def live_captions(socket, speech, store, meeting_id, offset_ms):
             return
         current, running = run, task
         run = task = None
-        await current.queue.put(None)
+        # The sentinel obeys the same budget: a stuck consumer surfaces as a
+        # timeout here instead of hanging the pause/end control path.
+        await asyncio.wait_for(current.queue.put(None), RUN_QUEUE_PUT_TIMEOUT)
         await running  # Saves the last sentences; raises if the provider failed.
         if current.partial:
             await send({'type': 'partial', 'text': '', 'start_ms': position})
@@ -101,7 +105,7 @@ async def live_captions(socket, speech, store, meeting_id, offset_ms):
                     store.anchor_work_audio(meeting_id, position)
                     run = _Run(position)
                     task = asyncio.create_task(consume(run))
-                await run.queue.put(data)
+                await asyncio.wait_for(run.queue.put(data), RUN_QUEUE_PUT_TIMEOUT)
                 elapsed = len(data) // PCM_BYTES_PER_MS
                 position += elapsed
                 run.audio_ms += elapsed
