@@ -2650,7 +2650,28 @@ public final class MainActivity extends Activity {
     }
 
     private void changeMode(String mode) { changeMode(mode, false); }
+    /** Leaving commute mode ends a running commute, so a tap asks first; see applyModeChange. */
     private void changeMode(String mode, boolean openConversation) {
+        if (!"commute".equals(mode) && modeChange == null && commutePanel != null && commutePanel.inProgress()) {
+            if (!canAct()) return;
+            new AlertDialog.Builder(this).setTitle("结束通勤并切换？")
+                .setMessage("切换到" + ModeCopy.name(mode) + "会结束本次通勤，后台定位和到站提醒也会停止。")
+                .setNegativeButton("继续通勤", null)
+                .setPositiveButton("结束并切换", (d, w) -> applyModeChange(mode, openConversation)).show();
+            return;
+        }
+        applyModeChange(mode, openConversation);
+    }
+    /** A headset gesture cannot be confirmed on screen, so it never ends a running commute. */
+    private void changeModeFromHeadset(String mode) {
+        if (!"commute".equals(mode) && commutePanel != null && commutePanel.inProgress()) {
+            String message = "通勤进行中，模式未切换。需要切换时，请先在通勤页结束通勤";
+            if (visible) feedback(message, LocalCue.BUSY); else pendingHeadsetNotice = message;
+            return;
+        }
+        applyModeChange(mode, false);
+    }
+    private void applyModeChange(String mode, boolean openConversation) {
         // A repeated tap during the settings request must not introduce a progress/error banner.
         if (modeChange != null) return;
         if (busy || locationListener != null || permissionPending) { feedback("上一项操作正在进行，请稍后切换模式", LocalCue.BUSY); return; }
@@ -2715,7 +2736,7 @@ public final class MainActivity extends Activity {
                     JSONObject agent = state.optJSONObject("agent"); if (agent == null) agent = new JSONObject();
                     put(agent, "mode", appliedMode); put(state, "agent", agent);
                     diagnosticError = "无";
-                    if (commutePanel != null) commutePanel.modeChanged(appliedMode);
+                    if (commutePanel != null && commutePanel.modeChanged(appliedMode)) lastNotice = "已切换到" + ModeCopy.name(appliedMode) + "，本次通勤已结束";
                     listenMode = "work".equals(appliedMode) ? VoiceInteraction.NOTES : VoiceInteraction.CALL;
                     boolean navigate = openConversation && tab != 0;
                     if (openConversation) tab = 0;
@@ -3108,7 +3129,7 @@ public final class MainActivity extends Activity {
                     if (busy || permissionPending || locationListener != null) {
                         stopRepeat(); lastNotice = "另一项操作尚未完成，场景未切换；请完成后重新接通"; updateStatus(); return;
                     }
-                    changeMode(nextMode, open); return;
+                    applyModeChange(nextMode, open); return;
                 }
                 if (!isDestroyed()) {
                     if (!turnSucceeded || !sessionAvailable() || (!visible && listenMode != VoiceInteraction.CALL) || (listenMode == 2 && !"life".equals(mode()))) stopRepeat();
@@ -3272,8 +3293,8 @@ public final class MainActivity extends Activity {
                 case CANCEL:
                     endVoice();
                     break;
-                case CHANGE_MODE: changeMode(decision.mode); break;
-                case DEFER_MODE: changeMode(decision.mode); break;
+                case CHANGE_MODE: changeModeFromHeadset(decision.mode); break;
+                case DEFER_MODE: changeModeFromHeadset(decision.mode); break;
                 case START:
                     if (modeCuePlayer != null) modeCuePlayer.stop();
                     stopRepeat();

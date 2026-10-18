@@ -48,6 +48,9 @@ final class CommutePanel implements AutoCloseable {
     private Runnable permissionAction;
     private LinearLayout summary, addressRows;
     private TextView originButton, destinationButton, transportButton, startButton, endButton, navigationButton, navigationHint, status;
+    /** While a commute runs, its state and the only in-app end control stay above the fold. */
+    private LinearLayout activeBar;
+    private TextView activeTitle;
     private ScrollView pageScroll;
     private String lastRender = "";
     private Dialog navigationFallback;
@@ -203,6 +206,15 @@ final class CommutePanel implements AutoCloseable {
     }};
     void render(LinearLayout parent, ScrollView scroll) {
         pageScroll = scroll; resume();
+        activeBar = card(parent); activeBar.setOrientation(LinearLayout.HORIZONTAL); activeBar.setGravity(Gravity.CENTER_VERTICAL);
+        activeBar.setPadding(dp(16), dp(10), dp(10), dp(10));
+        activeBar.setBackground(EditorUi.shape(activity, 0xfff3f7ff, 22, 0xffd0dfff));
+        activeTitle = EditorUi.text(activity, "", 15, EditorUi.INK);
+        activeBar.addView(activeTitle, new LinearLayout.LayoutParams(0, -2, 1));
+        endButton = EditorUi.button(activity, "结束通勤", false, this::stop);
+        endButton.setTextColor(EditorUi.RED); endButton.setBackground(EditorUi.shape(activity, 0xffffffff, 16, EditorUi.RED));
+        endButton.setMinWidth(dp(112)); endButton.setMinHeight(dp(48)); endButton.setContentDescription("结束本次通勤");
+        activeBar.addView(endButton, new LinearLayout.LayoutParams(-2, -2));
         mapPanel.renderMap(parent);
         LinearLayout plan = card(parent);
         originButton = compactButton(plan, "", () -> { if (editable()) choosePlace(true, p -> { journeyVersion++; origin = p; originMode = p == null ? "gps" : "fixed"; update(); }); });
@@ -217,7 +229,6 @@ final class CommutePanel implements AutoCloseable {
         navigationHint = text(plan, "", 12, EditorUi.MUTED);
         startButton = button(plan, "开始通勤", true, this::start);
         navigationPrimary = null;
-        endButton = button(plan, "结束通勤", false, this::stop);
         status = text(plan, "", 12, EditorUi.MUTED);
         text(plan, "开始后每 3 分钟更新路线，锁屏也会继续。随时可以在本页结束通勤；部分手机需要长按通知才会出现操作按钮。", 12, EditorUi.MUTED);
         LinearLayout stations = card(parent);
@@ -248,8 +259,13 @@ final class CommutePanel implements AutoCloseable {
         transportButton.setText("出行方式  ·  " + methodName(transport));
         boolean running = CommuteService.running(client.get()), active = journey.optBoolean("active");
         startButton.setText(running ? "立即更新路线" : active ? "继续通勤" : "开始通勤"); startButton.setEnabled(!mutating);
-        endButton.setVisibility(active || running || !pendingJourneyId.isEmpty() ? View.VISIBLE : View.GONE);
-        endButton.setEnabled(!stopping);
+        activeBar.setVisibility(active || running || !pendingJourneyId.isEmpty() ? View.VISIBLE : View.GONE);
+        endButton.setEnabled(!stopping); endButton.setText(stopping ? "正在结束…" : "结束通勤");
+        JSONObject activeRoute = journey.optJSONObject("route");
+        activeTitle.setText(!running && active ? "通勤已暂停\n可继续或结束"
+            : activeRoute != null && activeRoute.optBoolean("available")
+            ? "通勤进行中\n预计还需 " + Math.max(1, Math.round(activeRoute.optDouble("eta_seconds") / 60)) + " 分钟"
+            : "通勤进行中\n正在获取路线…");
         updateNavigation(active, running);
         status.setText(!notice.isEmpty() ? notice : running ? CommuteService.status(client.get()) : active ? "后台定位已暂停，请点继续通勤" : "选择起终点后开始通勤");
         mapPanel.update(originMode, origin, destination, transport, journey);
@@ -446,7 +462,14 @@ final class CommutePanel implements AutoCloseable {
         }
         runningChanged.run();
     }
-    void modeChanged(String mode) { if (!"commute".equals(mode)) { speaker.stop(); briefingVersion++; dialogueJourney = ""; } if (!"commute".equals(mode) && (journey.optBoolean("active") || !pendingJourneyId.isEmpty() || CommuteService.running(client.get()))) stop(); }
+    boolean inProgress() { return journey.optBoolean("active") || !pendingJourneyId.isEmpty() || CommuteService.running(client.get()); }
+    /** Leaving commute mode ends the journey; returns whether one was running. */
+    boolean modeChanged(String mode) {
+        if ("commute".equals(mode)) return false;
+        speaker.stop(); briefingVersion++; dialogueJourney = "";
+        if (!inProgress()) return false;
+        stop(); return true;
+    }
     void addressBook() {
         resume(); LinearLayout body = EditorUi.column(activity), footer = EditorUi.column(activity);
         text(body, "家、公司、学校和自定义地点。地址定位一次后保存坐标，下次直接选用。", 13, EditorUi.MUTED);
