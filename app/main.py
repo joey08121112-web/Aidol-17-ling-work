@@ -69,6 +69,10 @@ def create_hosted_app(config=None, data_directory=None):
             yield
         finally:
             await meeting_addresses.close()
+            # One pool per config object; close all three so no shared connections leak at shutdown.
+            await config.http_pool.aclose()
+            await config.speech.http_pool.aclose()
+            await config.work_asr.http_pool.aclose()
     api = FastAPI(title='Aidol Android API', version='0.2.0', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     api.state.accounts, api.state.runtimes, api.state.speech = accounts, runtimes, speech
     api.state.qwen = QwenRealtimeProvider(config.qwen)
