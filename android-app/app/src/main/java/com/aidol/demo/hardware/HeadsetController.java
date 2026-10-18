@@ -119,6 +119,12 @@ public final class HeadsetController implements FusionDevice, AutoCloseable {
                 "SDK=6.7 not_initialized", false, controlsState, controlsSummary, lastControlEvent, 0);
     }
     public Snapshot snapshot() { return snapshot; }
+    /** Read-only confirmation for UI end animations; a stop request alone is not release. Call on main. */
+    public boolean isCaptureReleased() {
+        if (closed || !snapshot.ready() || captureOwner != null || localRecordingStopPending) return false;
+        try { return !HeadsetManager.isFusionRecordBusy(); }
+        catch (RuntimeException | LinkageError unavailable) { return false; }
+    }
     public void addListener(Listener listener) {
         listeners.addIfAbsent(listener);
         main.post(() -> { if (!closed && listeners.contains(listener)) listener.changed(snapshot); });

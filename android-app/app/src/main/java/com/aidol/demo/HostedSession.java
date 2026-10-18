@@ -17,6 +17,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Predicate;
 import java.util.function.BooleanSupplier;
 import okhttp3.Call;
@@ -34,6 +35,8 @@ public final class HostedSession {
         default void reply(String text) {}
         default void idle() {}
         default void processing() {}
+        default void visualPhase(CompanionPhase phase) {}
+        default void playbackLevel(double rms) {}
         default void submitted(String requestId) {}
         default void meeting(JSONObject meeting) {}
         /** Live captions: final sentences (saved by the server) and the current interim text. */
@@ -54,6 +57,8 @@ public final class HostedSession {
     private final AudioManager audioManager;
     private final Handler ui;
     private final SessionEvents events = new SessionEvents();
+    private final AtomicLong visualVersion = new AtomicLong();
+    private final Object visualLock = new Object();
     private final AtomicBoolean cancelled = new AtomicBoolean(), launched = new AtomicBoolean();
     private final CapturePromptSequence prompts = new CapturePromptSequence(cancelled::get);
     private final AtomicBoolean firstPcm = new AtomicBoolean();
@@ -207,6 +212,7 @@ public final class HostedSession {
             workArrived.signal();
             WorkLiveCaptions current = live; if (current != null) current.pause();
             postWorkEvent("pause", offset, "app");
+            visualPhase(CompanionPhase.PAUSED);
             status("已暂停 · 不记录、不上传；点“继续”恢复");
             return true;
         } catch (IOException error) { workFailure(error.getMessage()); return false; }
@@ -219,6 +225,7 @@ public final class HostedSession {
         if (offset < 0) return false;
         WorkLiveCaptions current = live; if (current != null) current.resume(offset);
         postWorkEvent("resume", offset, "app");
+        visualPhase(CompanionPhase.RECORDING);
         status("已继续记录");
         return true;
     }
@@ -277,6 +284,7 @@ public final class HostedSession {
         VoiceUpload active = upload;
         if (active != null) active.interruptReply();
         cancelPlayer();
+        visualPhase(CompanionPhase.CONNECTING);
         status("已打断回复，正在接续聆听…");
         return true;
     }
@@ -303,6 +311,8 @@ public final class HostedSession {
     public void announceMode(String businessMode) { launch(null, null, LocalCue.forMode(businessMode), "aidol-mode-cue"); }
     private void launch(String text, String playback, LocalCue modeCue, String name) {
         if (!launched.compareAndSet(false, true)) throw new IllegalStateException("每个会话只能启动一次");
+        visualPhase(modeCue != null ? CompanionPhase.IDLE
+            : text != null || playback != null ? CompanionPhase.THINKING : CompanionPhase.CONNECTING);
         worker = new Thread(() -> run(text, playback, modeCue), name); worker.start();
     }
     private void run(String text, String playback, LocalCue modeCue) {
@@ -317,8 +327,8 @@ public final class HostedSession {
                 }
                 return;
             }
-            if (playback != null) { play(playback); return; }
-            if (qwenRealtime && callTurn && text == null) { runDuplex(); return; }
+            if (playback != null) { play(playback); visualPhase(CompanionPhase.COMPLETE); return; }
+            if (qwenRealtime && callTurn && text == null) { runDuplex(); visualPhase(CompanionPhase.COMPLETE); return; }
             if (workRecording && text == null) { runWorkRecording(); return; }
             JSONObject result;
             if (text == null) {
@@ -365,6 +375,7 @@ public final class HostedSession {
                 }
                 if (callTurn && !qwenRealtime && !endpoint.heardSpeech()) {
                     if (upload != null) upload.cancel();
+                    visualPhase(CompanionPhase.LISTENING);
                     status("我在，想说的时候直接说"); post(listener::idle); return;
                 }
                 if (pcm.length < 3200) throw new IOException("聆听太短，请重新聆听");
@@ -382,6 +393,7 @@ public final class HostedSession {
                 } else result = new JSONObject(new String(request("/v1/voice?request_id=" + requestId + "&interaction_source=" + interactionSource,
                     pcm, "audio/pcm"), StandardCharsets.UTF_8));
             } else {
+                visualPhase(CompanionPhase.THINKING);
                 status("正在思考…");
                 result = new JSONObject(new String(request("/v1/chat", new JSONObject().put("text", text)
                     .put("interaction_source", interactionSource)
@@ -399,6 +411,7 @@ public final class HostedSession {
                 }
             }
             String notice = result.optString("notice").isEmpty() ? "我在，接着说" : result.optString("notice");
+            visualPhase(CompanionPhase.COMPLETE);
             status(notice + (promptNotice.isEmpty() ? "" : "；" + promptNotice));
         } catch (Exception e) {
             if (!cancelled.get()) {
@@ -421,16 +434,20 @@ public final class HostedSession {
     }
     private void runDuplex() throws Exception {
         DuplexVoice.Listener events = new DuplexVoice.Listener() {
+            public void playbackStopped() { cancelPlayer(); }
             public void speechStart() {
                 cancelPlayer();
+                visualPhase(CompanionPhase.LISTENING);
                 post(() -> { listener.recording(); listener.status("正在听你说 · 播报时说“小万”可打断"); });
             }
-            public void thinking() { post(listener::processing); }
+            public void listening() { speechStart(); }
+            public void thinking() { visualPhase(CompanionPhase.THINKING); post(listener::processing); }
             public void transcript(String text) { post(() -> listener.transcript(text)); }
             public void reply(String text) { post(() -> listener.reply(text)); }
             public void result(JSONObject value) { post(() -> listener.result(value)); }
             public void playback(LiveReplyAudio audio) {
                 cancelPlayer();
+                visualPhase(CompanionPhase.THINKING);
                 // Install on the socket callback thread so a later interruption cannot
                 // race with an old worker installing its player after the cancellation.
                 ReplyPlayer segment = new ReplyPlayer(context, mode, outputIdentity);
@@ -439,7 +456,8 @@ public final class HostedSession {
                     try (PlaybackLease ignored = PlaybackLease.acquireDuplex(
                             () -> cancelled.get() || !duplex.current(audio), 4000)) {
                         check();
-                        segment.playStream(audio, HostedSession.this::status, description -> post(() -> listener.output(description)));
+                        segment.playStream(audio, HostedSession.this::status, description -> post(() -> listener.output(description)),
+                            playbackVisuals(segment, () -> duplex.currentPresentation(audio), false));
                         duplex.playbackDone(audio);
                     }
                     catch (Exception error) {
@@ -472,7 +490,7 @@ public final class HostedSession {
             public void recording() {
                 ui.removeCallbacks(startupTimeout);
                 diagnostic("SDK采音就绪");
-                if (!cancelled.get()) post(listener::recording);
+                if (!cancelled.get()) { visualPhase(CompanionPhase.LISTENING); post(listener::recording); }
             }
             public void pcm(byte[] pcm) {
                 if (cancelled.get() || !captureActive) return;
@@ -530,6 +548,7 @@ public final class HostedSession {
         }
         if (finished == null || !"saved".equals(finished.optString("status")))
             throw new IOException(finished == null ? "会议保存未确认，请查看工作页" : finished.optString("error", "工作记录未完整保存"));
+        visualPhase(CompanionPhase.COMPLETE);
         status("pending".equals(finished.optString("transcription_status"))
             ? "会议录音已保存，正在识别整场发言人；完成后自动总结"
             : "会议原文已保存，正在后台整理摘要；可在工作页查看进度");
@@ -561,7 +580,11 @@ public final class HostedSession {
             public void input(String value) { post(() -> listener.input(value)); }
             public void recording() {
                 ui.removeCallbacks(startupTimeout);
-                if (!cancelled.get() && captureActive) post(listener::recording);
+                if (!cancelled.get() && captureActive) {
+                    visualPhase(workStopping.get() ? CompanionPhase.SAVING
+                        : workPaused() ? CompanionPhase.PAUSED : CompanionPhase.RECORDING);
+                    post(listener::recording);
+                }
             }
             public void pcm(byte[] pcm) {
                 if (cancelled.get() || !captureActive) return;
@@ -696,7 +719,7 @@ public final class HostedSession {
             public void recording() {
                 if (cancelled.get() || !captureActive || !turn.recording(SystemClock.elapsedRealtime())) return;
                 ui.removeCallbacks(startupTimeout);
-                diagnostic("聆听就绪"); post(listener::recording);
+                diagnostic("聆听就绪"); visualPhase(CompanionPhase.LISTENING); post(listener::recording);
                 ui.postDelayed(limit, turn.recordingBudgetMillis());
             }
             public void error(String value) { failCapture(value); }
@@ -735,6 +758,7 @@ public final class HostedSession {
     public void stopRecording() {
         if (workRecording) {
             if (cancelled.get() || !workStopping.compareAndSet(false, true)) return;
+            visualPhase(CompanionPhase.SAVING);
             if (!captureActive) return;
             post(listener::processing);
             ui.postDelayed(stopTimeout, 12000);
@@ -755,7 +779,9 @@ public final class HostedSession {
         long now = SystemClock.elapsedRealtime();
         if (!turn.requestStop(now)) return;
         ui.removeCallbacks(limit);
-        if (!callTurn || endpoint.heardSpeech()) { post(listener::processing); status("正在思考…"); }
+        if (!callTurn || endpoint.heardSpeech()) {
+            visualPhase(CompanionPhase.THINKING); post(listener::processing); status("正在思考…");
+        }
         diagnostic("请求停止");
         ui.postDelayed(stopTimeout, turn.remainingStopMillis(now));
         try {
@@ -825,7 +851,7 @@ public final class HostedSession {
                 .toString().getBytes(StandardCharsets.UTF_8), "application/json");
             stage = "音频输出"; diagnostic("TTS 响应"); check();
             status("正在回答…");
-            playAudio(WavAudio.pcm(wav));
+            playAudio(WavAudio.pcm(wav), true);
             check(); diagnostic("播放完成（听音待人工确认）");
         } catch (Exception e) {
             check();
@@ -848,7 +874,8 @@ public final class HostedSession {
             try (PlaybackLease ignored = PlaybackLease.acquire(cancelled::get, 4000);
                  PcmFrameInputStream stream = new PcmFrameInputStream(response.body().byteStream())) {
                 check();
-                segment.playStream(stream, this::status, description -> post(() -> listener.output(description)));
+                segment.playStream(stream, this::status, description -> post(() -> listener.output(description)),
+                    playbackVisuals(segment, () -> !skipReply.get(), true));
                 check();
             } finally {
                 segment.cancel();
@@ -861,7 +888,8 @@ public final class HostedSession {
         player = segment;
         try (PlaybackLease ignored = PlaybackLease.acquire(cancelled::get, 4000)) {
             check(); if (skipReply.get()) return;
-            segment.playStream(stream, this::status, description -> post(() -> listener.output(description)));
+            segment.playStream(stream, this::status, description -> post(() -> listener.output(description)),
+                playbackVisuals(segment, () -> !skipReply.get(), true));
             check();
         } finally { segment.cancel(); if (player == segment) player = null; }
     }
@@ -881,17 +909,21 @@ public final class HostedSession {
         diagnostic("操作提示播放完成（听音待人工确认）");
     }
     private void playAudio(byte[] pcm) throws Exception {
+        playAudio(pcm, false);
+    }
+    private void playAudio(byte[] pcm, boolean speech) throws Exception {
         // Focus/route loss cancels a ReplyPlayer permanently. Give each segment its own player,
         // so a failed END cue cannot silently suppress the subsequent business reply.
         ReplyPlayer segment = openingPlayer;
         openingPlayer = null;
         if (segment == null) segment = new ReplyPlayer(context, mode, outputIdentity);
         player = segment;
+        ReplyPlayer active = segment;
         try (PlaybackLease ignored = PlaybackLease.acquire(cancelled::get, 4000)) {
             check();
             segment.play(pcm, this::status, description -> {
                 post(() -> listener.output(description)); diagnostic("实际输出已核验");
-            });
+            }, speech ? playbackVisuals(active, () -> !skipReply.get(), true) : new ReplyPlayer.PlaybackListener() {});
             check();
         } finally {
             segment.cancel();
@@ -906,6 +938,36 @@ public final class HostedSession {
         if (prepared != null) prepared.cancel();
         ReplyPlayer active = player;
         if (active != null) active.cancel();
+    }
+    private ReplyPlayer.PlaybackListener playbackVisuals(ReplyPlayer segment, BooleanSupplier current, boolean finishThinking) {
+        BooleanSupplier valid = () -> !cancelled.get() && player == segment && current.getAsBoolean();
+        return new ReplyPlayer.PlaybackListener() {
+            public void started() { visualPhase(CompanionPhase.SPEAKING, valid); }
+            public void level(double rms) {
+                if (!valid.getAsBoolean()) return;
+                long version = visualVersion.get();
+                post(() -> { if (version == visualVersion.get() && valid.getAsBoolean()) listener.playbackLevel(rms); });
+            }
+            public void finished() {
+                // Duplex completion is sent by playbackDone only after the current audio drains.
+                // The segment is released immediately after this callback; don't require its
+                // ownership to remain live until the UI receives the completed transition.
+                if (finishThinking && valid.getAsBoolean()) visualPhase(CompanionPhase.THINKING);
+            }
+        };
+    }
+    private void visualPhase(CompanionPhase phase) { visualPhase(phase, () -> true); }
+    private void visualPhase(CompanionPhase phase, BooleanSupplier current) {
+        final long version;
+        synchronized (visualLock) {
+            if (cancelled.get() || !current.getAsBoolean()) return;
+            version = visualVersion.incrementAndGet();
+        }
+        post(() -> {
+            if (version != visualVersion.get() || !current.getAsBoolean()) return;
+            listener.visualPhase(phase);
+            if (phase != CompanionPhase.SPEAKING) listener.playbackLevel(0);
+        });
     }
     private void post(Runnable event) {
         if (cancelled.get()) return;
@@ -925,6 +987,7 @@ public final class HostedSession {
         post(() -> listener.status(message));
     }
     private void fail(String text) {
+        visualPhase(CompanionPhase.ERROR);
         String message = text.replace("录音", "语音");
         post(() -> listener.failure(message));
     }

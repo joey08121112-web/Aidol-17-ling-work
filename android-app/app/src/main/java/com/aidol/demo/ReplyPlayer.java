@@ -16,12 +16,59 @@ import android.os.SystemClock;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.ByteArrayInputStream;
+import java.util.ArrayDeque;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 
 /** Plays a short reply using the same routing policy as the capture source. */
 public final class ReplyPlayer {
+    interface PlaybackListener {
+        default void started() {}
+        default void level(double rms) {}
+        default void finished() {}
+    }
+    private static final PlaybackListener NO_PLAYBACK_LISTENER = new PlaybackListener() {};
+
+    /** Maps the real playback head to written speech, excluding the silent route primer. */
+    static final class PlaybackProgress {
+        private static final class Part {
+            final long end;
+            final double rms;
+            Part(long end, double rms) { this.end = end; this.rms = rms; }
+        }
+        private final PlaybackListener listener;
+        private final long primerFrames;
+        private final ArrayDeque<Part> parts = new ArrayDeque<>();
+        private long writtenFrames;
+        private boolean started, closed;
+        PlaybackProgress(long primerFrames, PlaybackListener listener) {
+            this.primerFrames = primerFrames; this.listener = listener;
+        }
+        synchronized void written(byte[] pcm, int offset, int count) {
+            if (closed || count <= 0) return;
+            double sum = 0;
+            for (int i = offset; i + 1 < offset + count; i += 2) {
+                int sample = (short) ((pcm[i] & 255) | (pcm[i + 1] << 8));
+                sum += (double) sample * sample;
+            }
+            writtenFrames += count / 2;
+            parts.addLast(new Part(writtenFrames, Math.sqrt(sum / (count / 2)) / 32768.0));
+        }
+        synchronized void advanced(long playbackHead) {
+            long heard = playbackHead - primerFrames;
+            if (closed || heard <= 0 || writtenFrames == 0) return;
+            if (!started) { started = true; listener.started(); }
+            while (!parts.isEmpty() && parts.peekFirst().end < heard) parts.removeFirst();
+            listener.level(parts.isEmpty() ? 0 : parts.peekFirst().rms);
+        }
+        synchronized void finish() {
+            if (closed) return;
+            closed = true; parts.clear();
+            if (started) { listener.level(0); listener.finished(); }
+        }
+        synchronized void cancel() { closed = true; parts.clear(); }
+    }
     private final AudioManager manager;
     private final AudioMode mode;
     private final Predicate<AudioDeviceInfo> outputIdentity;
@@ -89,12 +136,19 @@ public final class ReplyPlayer {
     }
 
     public void play(byte[] pcm, Consumer<String> log, Consumer<String> output) throws Exception {
+        play(pcm, log, output, NO_PLAYBACK_LISTENER);
+    }
+    void play(byte[] pcm, Consumer<String> log, Consumer<String> output, PlaybackListener playback) throws Exception {
         if (pcm.length == 0 || (pcm.length & 1) != 0 || pcm.length > 6 * 1024 * 1024)
             throw new IOException("回复音频为空或格式不正确");
-        playStream(new ByteArrayInputStream(pcm), log, output);
+        playStream(new ByteArrayInputStream(pcm), log, output, playback);
     }
 
     public void playStream(InputStream stream, Consumer<String> log, Consumer<String> output) throws Exception {
+        playStream(stream, log, output, NO_PLAYBACK_LISTENER);
+    }
+    void playStream(InputStream stream, Consumer<String> log, Consumer<String> output, PlaybackListener playback) throws Exception {
+        PlaybackProgress progress = new PlaybackProgress(PRIMER_BYTES / 2, playback);
         AudioDeviceInfo target = null;
         if (mode.requiresVerifiedHeadsetOutput()) {
             long routeDeadline = SystemClock.elapsedRealtime() + 4000;
@@ -166,6 +220,19 @@ public final class ReplyPlayer {
                 log.accept("系统未接受首选设备，正在核验实际蓝牙输出…");
             track.addOnRoutingChangedListener(routeListener, new Handler(Looper.getMainLooper()));
             routeObserved = true;
+            marker = new AudioTrack.OnPlaybackPositionUpdateListener() {
+                private void observe(AudioTrack changed) {
+                    try {
+                        if (!cancelled) progress.advanced(Integer.toUnsignedLong(changed.getPlaybackHeadPosition()));
+                    } catch (RuntimeException released) { /* A queued notification can outlive release(). */ }
+                    waitEvents.signal();
+                }
+                @Override public void onMarkerReached(AudioTrack changed) { observe(changed); }
+                @Override public void onPeriodicNotification(AudioTrack changed) { observe(changed); }
+            };
+            track.setPlaybackPositionUpdateListener(marker, new Handler(Looper.getMainLooper()));
+            // Observe output even while the network input blocks waiting for another PCM chunk.
+            track.setPositionNotificationPeriod(Math.max(1, sampleRate / 20));
             // Prime with silence: never play private speech before proving a Bluetooth route.
             track.setVolume(0);
             byte[] silence = new byte[PRIMER_BYTES];
@@ -210,7 +277,11 @@ public final class ReplyPlayer {
                     if (count == 0) {
                         if (SystemClock.elapsedRealtime() >= writeDeadline) throw new IOException("回复音频写入超时");
                         Thread.sleep(20);
-                    } else { offset += count; writeDeadline = SystemClock.elapsedRealtime() + 5000; }
+                    } else {
+                        progress.written(pcm, offset, count);
+                        if (!cancelled) progress.advanced(Integer.toUnsignedLong(track.getPlaybackHeadPosition()));
+                        offset += count; writeDeadline = SystemClock.elapsedRealtime() + 5000;
+                    }
                 }
             }
             if (!cancelled && total == 0) throw new IOException("语音为空");
@@ -230,11 +301,6 @@ public final class ReplyPlayer {
             long deadline = SystemClock.elapsedRealtime() + total * 500 / sampleRate + 5000;
             long expectedFrames = (total + silence.length) / 2L;
             // The playback-head wait wakes on the reach-the-end marker instead of polling.
-            marker = new AudioTrack.OnPlaybackPositionUpdateListener() {
-                @Override public void onMarkerReached(AudioTrack changed) { waitEvents.signal(); }
-                @Override public void onPeriodicNotification(AudioTrack changed) { waitEvents.signal(); }
-            };
-            track.setPlaybackPositionUpdateListener(marker, new Handler(Looper.getMainLooper()));
             track.setNotificationMarkerPosition((int) Math.min(Integer.MAX_VALUE, expectedFrames));
             long markerSeen = waitEvents.version();
             while (!cancelled && Integer.toUnsignedLong(track.getPlaybackHeadPosition()) < expectedFrames) {
@@ -245,7 +311,12 @@ public final class ReplyPlayer {
                 markerSeen = waitEvents.version();
             }
             interrupted();
+            if (!cancelled) {
+                progress.advanced(Integer.toUnsignedLong(track.getPlaybackHeadPosition()));
+                progress.finish();
+            }
         } finally {
+            progress.cancel();
             activeTrack = null;
             if (track != null) {
                 if (marker != null) track.setPlaybackPositionUpdateListener(null);

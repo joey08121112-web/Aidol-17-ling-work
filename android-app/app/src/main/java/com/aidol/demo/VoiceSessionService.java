@@ -17,6 +17,7 @@ import android.os.PowerManager;
 
 /** Explicit, non-restoring lock-screen lease. It never starts the microphone itself. */
 public final class VoiceSessionService extends Service {
+    enum StopCause { USER, SYSTEM }
     private static final String CHANNEL = "headset_session";
     private static final String STOP = "com.aidol.demo.STOP_HEADSET_SESSION";
     private static final int NOTIFICATION = 31;
@@ -49,7 +50,7 @@ public final class VoiceSessionService extends Service {
         }
     };
     private HostedSession session;
-    private java.util.function.Consumer<String> stopped;
+    private java.util.function.BiConsumer<String, StopCause> stopped;
     private PowerManager.WakeLock wakeLock;
     private AudioManager audioManager;
     private AudioManager.OnModeChangedListener modeListener;
@@ -122,7 +123,9 @@ public final class VoiceSessionService extends Service {
         if (intent == null || STOP.equals(intent.getAction())) {
             if (intent != null && session != null && session.recordsWorkCalls()) {
                 session.stopRecording(); updateNotification("正在结束并保存工作记录…");
-            } else stopSession("已从通知停止耳机会话；已提交内容请查看历史");
+            } else if (intent != null) {
+                stopSession("已从通知停止耳机会话；已提交内容请查看历史", StopCause.USER);
+            } else stopSession("耳机会话已停止，请回到 App 重新开启");
         }
         return START_NOT_STICKY;
     }
@@ -134,7 +137,7 @@ public final class VoiceSessionService extends Service {
     }
     @Override public IBinder onBind(Intent intent) { return binder; }
     boolean enabled() { return enabled; }
-    void onStopped(java.util.function.Consumer<String> callback) { stopped = callback; }
+    void onStopped(java.util.function.BiConsumer<String, StopCause> callback) { stopped = callback; }
 
     void own(HostedSession active) {
         if (!enabled) throw new IllegalStateException("耳机会话已停止，请回到 App 重新开启");
@@ -168,6 +171,9 @@ public final class VoiceSessionService extends Service {
         if (!continuingCall && enabled) handler.postDelayed(expiry, 60 * 60 * 1000L);
     }
     void stopSession(String reason) {
+        stopSession(reason, StopCause.SYSTEM);
+    }
+    private void stopSession(String reason, StopCause cause) {
         if (!enabled) return;
         enabled = false;
         handler.removeCallbacks(expiry);
@@ -180,10 +186,10 @@ public final class VoiceSessionService extends Service {
         HostedSession active = session; session = null;
         if (active != null) active.cancel();
         if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
-        java.util.function.Consumer<String> callback = stopped; stopped = null;
+        java.util.function.BiConsumer<String, StopCause> callback = stopped; stopped = null;
         stopForeground(STOP_FOREGROUND_REMOVE);
         stopSelf();
-        if (callback != null) callback.accept(reason);
+        if (callback != null) callback.accept(reason, cause);
     }
     @Override public void onTaskRemoved(Intent rootIntent) { stopSession("App 已关闭，耳机会话已停止"); super.onTaskRemoved(rootIntent); }
     @Override public void onDestroy() { stopSession("耳机会话已停止，请回到 App 重新开启"); super.onDestroy(); }
