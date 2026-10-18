@@ -1,6 +1,10 @@
 package com.aidol.demo;
 
+import android.content.SharedPreferences;
+import java.lang.reflect.Proxy;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -8,6 +12,26 @@ import org.junit.Test;
 import static org.junit.Assert.*;
 
 public class VaultStateTest {
+    @Test public void emptyStoredSessionSettlesRepeatedReadsAfterInitialization() throws Exception {
+        SharedPreferences preferences = (SharedPreferences) Proxy.newProxyInstance(
+            SharedPreferences.class.getClassLoader(), new Class<?>[]{SharedPreferences.class}, (proxy, method, args) -> {
+                if ("getString".equals(method.getName()) && "encrypted".equals(args[0])) return "";
+                throw new AssertionError("Empty session must not decrypt or write storage: " + method.getName());
+            });
+        ExecutorService loader = Executors.newSingleThreadExecutor();
+        ExecutorService reader = Executors.newSingleThreadExecutor();
+        try {
+            AuthVault vault = new AuthVault(preferences, loader);
+            // The barrier runs after the constructor's real background initialization.
+            loader.submit(() -> {}).get(2, TimeUnit.SECONDS);
+            assertEquals("", reader.submit(() -> {
+                StringBuilder values = new StringBuilder();
+                for (int i = 0; i < 3; i++) values.append(vault.token()).append(vault.username());
+                return values.toString();
+            }).get(1, TimeUnit.SECONDS));
+        } finally { reader.shutdownNow(); loader.shutdownNow(); }
+    }
+
     @Test public void readsBlockUntilTheInitialLoadCompletes() throws Exception {
         AuthVault.VaultState state = new AuthVault.VaultState();
         long loading = state.loadStarts();
