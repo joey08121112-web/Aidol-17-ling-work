@@ -294,4 +294,37 @@ public class VendorCaptureSourceTest {
             assertEquals(first.length + 2, result.audio.size());
         }
     }
+    @Test public void workCaptureSwitchesChannelsAndOrdersBoundariesWithoutRestartingSdk() throws Exception {
+        Device device = new Device(); java.util.List<String> order = new java.util.ArrayList<>();
+        Result result = new Result() {
+            @Override public synchronized void pcm(byte[] data) { super.pcm(data); order.add("pcm"); }
+            @Override public synchronized void callRecording(boolean active) { order.add(active ? "start" : "end"); }
+        };
+        try (VendorCaptureSource source = new VendorCaptureSource(device, 2500, 256000, 0, true)) {
+            source.start(result); assertTrue(device.listener.recordsPhoneCalls());
+            device.listener.state("recording", 1);
+            device.listener.pcm(1, WorkCaptureRouterTest.pcm(30000));
+            device.listener.pcm(2, WorkCaptureRouterTest.pcm(123));
+            source.phoneAudioState(1); device.listener.phoneCall(true);
+            device.listener.pcm(2, WorkCaptureRouterTest.pcm(30000));
+            device.listener.state("recording", 0); source.phoneAudioState(2);
+            device.listener.pcm(1, WorkCaptureRouterTest.pcm(1000)); device.listener.pcm(2, WorkCaptureRouterTest.pcm(3000));
+            source.phoneAudioState(0); device.listener.phoneCall(false); device.listener.state("recording", 1);
+            device.listener.pcm(1, WorkCaptureRouterTest.pcm(30000)); device.listener.pcm(2, WorkCaptureRouterTest.pcm(456));
+            source.stop(result); device.listener.state("idle", 1); result.await();
+            assertNull(result.error); assertEquals(0, device.recoveries); assertEquals(1, device.stops);
+            assertArrayEquals(WorkCaptureRouterTest.pcm(123, 2000, 456), result.audio.toByteArray());
+            assertEquals(java.util.Arrays.asList("pcm", "start", "pcm", "end", "pcm"), order);
+        }
+    }
+    @Test public void staleWorkCallbacksCannotRecordAfterCancellation() throws Exception {
+        Device device = new Device(); Result result = new Result();
+        try (VendorCaptureSource source = new VendorCaptureSource(device, 2500, 256000, 0, true)) {
+            source.start(result); FusionDevice.Listener old = device.listener; source.cancel();
+            source.phoneAudioState(2); old.phoneCall(true); old.state("recording", 0);
+            old.pcm(1, WorkCaptureRouterTest.pcm(1000)); old.pcm(2, WorkCaptureRouterTest.pcm(1000));
+            Thread.sleep(300); assertEquals(0, result.audio.size()); assertFalse(result.recording);
+            assertEquals(1, device.cancels); assertNull(result.error);
+        }
+    }
 }

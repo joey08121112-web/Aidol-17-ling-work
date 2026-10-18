@@ -49,9 +49,10 @@ def start(client):
     return meeting_id
 
 
-def test_start_snapshot_survives_retries_and_summary(work, monkeypatch):
+def test_start_snapshot_survives_retries_and_summary(work, config, monkeypatch):
     from datetime import datetime, timezone
     client, runtime, words, calls = work
+    config.amap_key = 'offline-only'
     async def reverse(self, location):
         return {'available': True, 'address': '测试会议地点'}
     monkeypatch.setattr('app.services.maps.MapService.reverse', reverse)
@@ -59,7 +60,8 @@ def test_start_snapshot_survives_retries_and_summary(work, monkeypatch):
     started_at = datetime.now(timezone.utc).isoformat()
     body = {'meeting_id': meeting_id, 'started_at': started_at,
             'location': {'longitude': 116.4, 'latitude': 39.9, 'accuracy': 30}}
-    first = client.post('/v1/work-meetings', json=body).json()
+    assert client.post('/v1/work-meetings', json=body).status_code == 200
+    first = client.get('/v1/work-meetings/' + meeting_id).json()
     assert first['location']['address'] == '测试会议地点'
     again = client.post('/v1/work-meetings', json={'meeting_id': meeting_id}).json()
     assert again['started_at'] == started_at and again['location'] == first['location']
@@ -299,9 +301,10 @@ async def test_minutes_model_payload_and_unsupported_citations_fall_back_to_visi
     finish_reason = 'stop'
     assert '后来的更正或撤销优先' in payloads[0]['messages'][0]['content']
     output['tasks'][0]['owner'] = '不存在的人'
-    fallback = await WorkMeetingMinutes(config).generate(rows)
-    assert fallback['extraction'] == 'rules_fallback'
-    assert '原文' in fallback['notice'] and fallback['source_ids'] == ['0']
+    repaired = await WorkMeetingMinutes(config).generate(rows)
+    assert repaired['extraction'] == 'llm' and repaired['tasks'][0]['owner'] == ''
+    assert repaired['metadata_omissions'] == ['task_owner']
+    assert '原文' in repaired['notice'] and repaired['source_ids'] == ['0']
     output['tasks'][0]['owner'] = '小林'
     output['open_questions'][0]['source_ids'] = ['other-meeting']
     assert (await WorkMeetingMinutes(config).generate(rows))['extraction'] == 'rules_fallback'
@@ -975,3 +978,65 @@ def test_pending_sqlite_audio_from_previous_main_migrates_without_losing_bytes(w
     assert result['status'] == 'saved' and result['summary_status'] == 'ready'
     assert result['sources'][0]['text'] == '从旧录音恢复'
     assert len(summaries) == 1
+
+
+def test_call_boundaries_are_ordered_idempotent_and_independent_of_manual_pause(work):
+    client, runtime, words, calls = work
+    meeting_id = start(client)
+    url = '/v1/work-meetings/' + meeting_id + '/events'
+    def event(kind, offset=0):
+        return {'event_id': uuid4().hex, 'kind': kind, 'offset_ms': offset, 'origin': 'headset'}
+    assert client.post(url, json=event('call_end')).status_code == 409
+    begin = event('call_start', 100)
+    assert client.post(url, json=begin).status_code == 200
+    assert client.post(url, json=begin).status_code == 200
+    assert client.post(url, json=event('call_start', 100)).status_code == 409
+    assert client.post(url, json=event('pause', 200)).status_code == 200
+    assert client.post(url, json=event('call_end', 200)).status_code == 200
+    assert client.post(url, json=event('resume', 200)).status_code == 200
+    assert client.post(url, json=event('call_start', 300)).status_code == 200
+    assert client.post(url, json=event('call_end', 400)).status_code == 200
+    upload(client, meeting_id)
+    detail = finish(client, meeting_id)
+    assert [e['kind'] for e in detail['events']] == ['call_start', 'pause', 'call_end', 'resume', 'call_start', 'call_end']
+    assert client.post(url, json=event('call_start', 500)).status_code == 409
+    assert client.post('/v1/work-meetings/' + uuid4().hex + '/events', json=event('call_start')).status_code == 404
+
+
+@pytest.mark.parametrize('cached', [False, True])
+def test_observed_location_metadata_survives_address_summary_and_export(work, config, monkeypatch, cached):
+    from datetime import datetime, timezone, timedelta
+    client, runtime, _, _ = work
+    config.amap_key = 'offline-only'
+    async def reverse(self, location):
+        return {'available': True, 'address': '测试会议地点'}
+    monkeypatch.setattr('app.services.maps.MapService.reverse', reverse)
+    observed = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    meeting_id = uuid4().hex
+    point = {'longitude': 116.4, 'latitude': 39.9, 'accuracy': 30, 'source': 'gps',
+             'cached': cached, 'observed_at': observed}
+    response = client.post('/v1/work-meetings', json={'meeting_id': meeting_id, 'location': point})
+    assert response.status_code == 200, response.text
+    assert upload(client, meeting_id).status_code == 200
+    finish(client, meeting_id)
+    saved = client.get('/v1/work-meetings/' + meeting_id).json()
+    for location in [saved['location'], saved['report']['location'],
+                     client.get('/v1/state').json()['work_meetings'][0]['location'],
+                     client.get('/v1/export').json()['work_meetings'][0]['location']]:
+        assert location['cached'] is cached
+        assert location['observed_at'] == observed
+        assert location['address'] == '测试会议地点'
+    assert runtime.store.work_meeting(meeting_id)['location'] == saved['location']
+
+
+@pytest.mark.parametrize('extra', [
+    {'cached': True}, {'cached': 'true', 'observed_at': '2026-10-18T01:00:00Z'},
+    {'cached': True, 'observed_at': '2026-10-18T01:00:00'},
+    {'cached': True, 'observed_at': '2099-01-01T01:00:00Z'},
+])
+def test_invalid_meeting_cache_metadata_is_rejected(work, extra):
+    client, runtime, _, _ = work
+    response = client.post('/v1/work-meetings', json={'meeting_id': uuid4().hex,
+        'location': {'longitude': 116.4, 'latitude': 39.9, **extra}})
+    assert response.status_code == 422
+    assert not runtime.store.work_meetings()

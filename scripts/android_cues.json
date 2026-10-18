@@ -1,9 +1,8 @@
 {
-  "voice": "Microsoft Huihui Desktop",
   "sample_rate": 24000,
   "channels": 1,
   "bits_per_sample": 16,
-  "phrases": {
+  "labels": {
     "cue_life": "生活模式",
     "cue_work": "工作模式",
     "cue_commute": "通勤模式",
@@ -28,5 +27,36 @@
     "cue_browser": "无法打开网页",
     "cue_battery": "耳机电量低",
     "cue_ready": "耳机已佩戴"
+  },
+  "tones": {
+    "cue_life": {
+      "duration_ms": 340,
+      "start_hz": 659.25,
+      "end_hz": 698.46,
+      "gain": 0.5334838230116768,
+      "repetitions": 2,
+      "gap_ms": 85
+    },
+    "cue_work": {
+      "duration_ms": 320,
+      "start_hz": 440,
+      "end_hz": 440,
+      "gain": 0.5334838230116768,
+      "repetitions": 2,
+      "gap_ms": 85
+    },
+    "cue_commute": {
+      "duration_ms": 360,
+      "start_hz": 783.99,
+      "end_hz": 880,
+      "gain": 0.5334838230116768,
+      "repetitions": 2,
+      "gap_ms": 85
+    },
+    "default": {
+      "duration_ms": 280,
+      "start_hz": 587.33,
+      "end_hz": 554.37
+    }
   }
 }

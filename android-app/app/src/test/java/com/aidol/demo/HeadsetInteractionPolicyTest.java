@@ -380,4 +380,11 @@ public class HeadsetInteractionPolicyTest {
         assertEquals(Arrays.asList(CHANGE_MODE), decision.actions);
         assertEquals("commute", decision.mode);
     }
+    @Test public void workCallCaptureKeepsCallButStillStopsForDisconnectAndRemoval() {
+        HeadsetInteractionPolicy p = new HeadsetInteractionPolicy();
+        assertNull(p.device(device(true, true, true, false, 80), true, true).stopReason);
+        assertNotNull(p.device(device(true, true, false, false, 80), true, true).stopReason);
+        assertNotNull(p.device(device(false, true, true, true, 80), true, true).stopReason);
+        assertNotNull(p.device(device(true, true, true, true, 80), true, false).stopReason);
+    }
 }
