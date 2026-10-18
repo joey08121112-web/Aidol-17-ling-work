@@ -5,7 +5,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 
-/** Fixed public product prompts; no text, account data or provider request is accepted. */
+/** Fixed nonverbal product earcons; labels are display-only. No speech or provider request. */
 enum LocalCue {
     LIFE(ModeCopy.LIFE, R.raw.cue_life),
     WORK(ModeCopy.WORK, R.raw.cue_work),

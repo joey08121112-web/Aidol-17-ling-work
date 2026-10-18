@@ -8,6 +8,8 @@ public interface FusionDevice {
         void state(String state, int scene);
         void pcm(int channel, byte[] bytes);
         void error(String message);
+        default boolean recordsPhoneCalls() { return false; }
+        default void phoneCall(boolean active) {}
     }
     void startFusion(Listener listener);
     void stopFusion(Listener owner);

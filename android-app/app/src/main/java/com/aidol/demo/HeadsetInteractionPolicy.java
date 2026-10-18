@@ -151,6 +151,9 @@ final class HeadsetInteractionPolicy {
     void clearPending() { pendingActionAt = -1; pendingAction = null; pendingMode = null; pendingSessionGeneration = -1; }
 
     DeviceUpdate device(Device device, boolean active) {
+        return device(device, active, false);
+    }
+    DeviceUpdate device(Device device, boolean active, boolean workCalls) {
         List<String> notices = new ArrayList<>();
         String stop = null;
         WearState wear = WearState.from(device.leftWorn, device.rightWorn);
@@ -160,7 +163,7 @@ final class HeadsetInteractionPolicy {
         if (!device.ready) {
             clearPending();
             if (active) stop = "耳机连接已中断，通话已结束；重连后单击重新接通";
-        } else if (device.inCall) {
+        } else if (device.inCall && !workCalls) {
             clearPending();
             if (active) stop = "检测到手机通话，AI 通话已结束；来电结束后单击重新接通";
         } else if (device.ready && bothOut && active) {

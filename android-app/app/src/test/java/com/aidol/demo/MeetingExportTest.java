@@ -41,6 +41,18 @@ public class MeetingExportTest {
         assertEquals("会议纪要-2026-10-17-140300.md", MeetingExport.fileName(meeting(), SHANGHAI));
     }
 
+    @Test public void userAddedMinutesAreLabeledWithoutInventingRecordingTimes() throws Exception {
+        JSONObject value = meeting(), report = value.getJSONObject("report");
+        JSONArray ids = new JSONArray().put("user-edit:revision:new-item");
+        report.put("chapters", new JSONArray().put(new JSONObject().put("title", "新增章节").put("summary", "会后补充")
+            .put("start_ms", JSONObject.NULL).put("source_ids", ids)));
+        report.getJSONArray("tasks").getJSONObject(0).put("source_ids", ids);
+        String text = MeetingExport.markdown(value, SHANGHAI);
+        assertTrue(text.contains("- 新增章节：会后补充（用户修正）"));
+        assertTrue(text.contains("通知测试（负责人：未明确；截止：未提及）（用户修正）"));
+        assertFalse(text.contains("[14:03:05] 新增章节"));
+    }
+
     @Test public void meetingWithoutMinutesOrSpeakersStillExports() throws Exception {
         JSONObject plain = meeting(); plain.remove("report");
         plain.getJSONArray("utterances").getJSONObject(0).put("speaker", "").put("wall_at", "");

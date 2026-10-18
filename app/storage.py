@@ -14,6 +14,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from .domain import Settings
+from .commute_storage import CommuteStorage
 from .search import index_text, query_terms, is_non_assertion
 
 
@@ -115,7 +116,7 @@ def _wall_clock(anchor, events):
                               + sum((length for at, length in pauses if at <= offset_ms), timedelta(0))).isoformat(timespec='seconds')
 
 
-class Store:
+class Store(CommuteStorage):
     def __init__(self, path: str):
         self.path = path
         # users/<uuid>.sqlite3 keeps its meeting audio in users/<uuid>/work-audio/<meeting>/.
@@ -124,6 +125,7 @@ class Store:
         with self.connect() as db:
             db.executescript("""
                 PRAGMA journal_mode=WAL;
+                CREATE TABLE IF NOT EXISTS commute_data (key TEXT PRIMARY KEY, payload TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS memories (
                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, content TEXT NOT NULL,
@@ -145,6 +147,8 @@ class Store:
                   id TEXT PRIMARY KEY, report_id TEXT NOT NULL, content TEXT NOT NULL,
                   owner TEXT NOT NULL, due TEXT NOT NULL, source_ids TEXT NOT NULL,
                   status TEXT NOT NULL DEFAULT 'open', created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS action_task_dismissals (
+                  scope TEXT NOT NULL, fingerprint TEXT NOT NULL, PRIMARY KEY(scope,fingerprint));
                 CREATE INDEX IF NOT EXISTS memory_created ON memories(created_at);
                 CREATE INDEX IF NOT EXISTS transcript_created ON transcripts(created_at);
                 CREATE TABLE IF NOT EXISTS mobile_turns (
@@ -158,6 +162,10 @@ class Store:
                   meeting_id TEXT NOT NULL, segment_index INTEGER NOT NULL,
                   request_id TEXT NOT NULL UNIQUE, transcript_id TEXT,
                   PRIMARY KEY(meeting_id, segment_index));
+                CREATE TABLE IF NOT EXISTS work_meeting_deletions (
+                  id TEXT PRIMARY KEY, task_ids TEXT NOT NULL DEFAULT '[]');
+                CREATE TABLE IF NOT EXISTS location_records (
+                  id TEXT PRIMARY KEY, observed_at TEXT NOT NULL, payload TEXT NOT NULL);
             """)
             # Preserve existing local databases; serialize schema checks and ALTERs
             # so two startup instances cannot both add the same missing column.
@@ -168,6 +176,10 @@ class Store:
             if "updated_at" not in memory_columns:
                 db.execute("ALTER TABLE memories ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
             db.execute("CREATE INDEX IF NOT EXISTS memory_pinned_created ON memories(pinned DESC, created_at DESC)")
+            task_columns = {row['name'] for row in db.execute('PRAGMA table_info(action_tasks)')}
+            for name, definition in [('due_at', "TEXT NOT NULL DEFAULT ''"), ('reminder_hours', 'INTEGER NOT NULL DEFAULT 0')]:
+                if name not in task_columns:
+                    db.execute(f'ALTER TABLE action_tasks ADD COLUMN {name} {definition}')
             turn_columns = {row["name"] for row in db.execute("PRAGMA table_info(mobile_turns)")}
             if "status" not in turn_columns:
                 db.execute("ALTER TABLE mobile_turns ADD COLUMN status TEXT NOT NULL DEFAULT 'processing'")
@@ -181,7 +193,11 @@ class Store:
             meeting_columns = {row['name'] for row in db.execute('PRAGMA table_info(work_meetings)')}
             for name, definition in (('whole_audio', 'INTEGER NOT NULL DEFAULT 0'),
                                      ('transcription_status', "TEXT NOT NULL DEFAULT 'legacy'"),
-                                     ('asr_task_id', "TEXT NOT NULL DEFAULT ''")):
+                                     ('asr_task_id', "TEXT NOT NULL DEFAULT ''"),
+                                     ('address_attempts', 'INTEGER NOT NULL DEFAULT 0'),
+                                     ('address_retry_at', 'REAL'),
+                                     ('revision_request', "TEXT NOT NULL DEFAULT '{}'"),
+                                     ('pinned', 'INTEGER NOT NULL DEFAULT 0')):
                 if name not in meeting_columns:
                     db.execute(f'ALTER TABLE work_meetings ADD COLUMN {name} {definition}')
             db.execute('CREATE TABLE IF NOT EXISTS work_audio_uploads (meeting_id TEXT NOT NULL, '
@@ -274,7 +290,16 @@ class Store:
     def settings(self) -> Settings:
         with self.connect() as db:
             row = db.execute("SELECT value FROM settings WHERE id=1").fetchone()
-        return Settings.model_validate_json(row[0]) if row else Settings()
+            addresses = self._commute_read(db, 'addresses', None)
+        value = Settings.model_validate_json(row[0]) if row else Settings()
+        if addresses is not None:
+            for key in ['home', 'work']:
+                place = next((a for a in addresses if a['tag'] == key), None)
+                setattr(value, key + '_lon', place['longitude'] if place else None)
+                setattr(value, key + '_lat', place['latitude'] if place else None)
+                setattr(value, key + '_name', place['name'] if place else ('家' if key == 'home' else '公司'))
+                setattr(value, key + '_city', place['city'] if place else '')
+        return value
 
     def save_settings(self, value: Settings):
         with self.connect() as db:
@@ -368,7 +393,7 @@ class Store:
                                         (task["content"], task["owner"], task["due"])).fetchall()
                 if any(set(json.loads(row["source_ids"])) & set(task["source_ids"]) for row in candidates):
                     continue
-                db.execute("INSERT INTO action_tasks VALUES(?,?,?,?,?,?,?,?)", (
+                db.execute("INSERT INTO action_tasks(id,report_id,content,owner,due,source_ids,status,created_at) VALUES(?,?,?,?,?,?,?,?)", (
                     uuid4().hex, report_id, task["content"], task["owner"], task["due"],
                     json.dumps(task["source_ids"]), "open", created))
         return {"id": report_id, "created_at": created, **payload}
@@ -378,6 +403,61 @@ class Store:
             raise ValueError("invalid action task status")
         with self.connect() as db:
             return db.execute("UPDATE action_tasks SET status=? WHERE id=?", (status, task_id)).rowcount > 0
+
+    def create_action_task(self, task_id, content, owner, due_at, reminder_hours):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute("SELECT 1 FROM action_task_dismissals WHERE scope='manual' AND fingerprint=?", (task_id,)).fetchone():
+                raise ValueError('该待办已删除，请重新添加')
+            previous = db.execute('SELECT * FROM action_tasks WHERE id=?', (task_id,)).fetchone()
+            if previous:
+                if (previous['content'], previous['owner'], previous['due_at'], previous['reminder_hours']) != (content, owner, due_at, reminder_hours):
+                    raise ValueError('待办编号已存在且内容不同')
+            else:
+                db.execute("INSERT INTO action_tasks(id,report_id,content,owner,due,source_ids,status,created_at,due_at,reminder_hours) "
+                           "VALUES(?,'',?,?,?,'[]','open',?,?,?)", (task_id, content, owner, due_at, now(), due_at, reminder_hours))
+        return next(row for row in self.list('action_tasks', 10000) if row['id'] == task_id)
+
+    @staticmethod
+    def task_fingerprint(task):
+        return hashlib.sha256(json.dumps([task['content'], task['owner'], task['due']], ensure_ascii=False).encode()).hexdigest()
+
+    def edit_action_task(self, task_id, content, owner, due, due_at, reminder_hours):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            task = db.execute('SELECT * FROM action_tasks WHERE id=?', (task_id,)).fetchone()
+            if not task:
+                return None
+            if (task['content'], task['owner'], task['due'], task['due_at'], task['reminder_hours']) == (content, owner, due_at or due, due_at, reminder_hours):
+                result = dict(task)
+                result['source_ids'] = json.loads(result['source_ids'])
+                return result
+            report = db.execute('SELECT payload FROM meeting_reports WHERE id=?', (task['report_id'],)).fetchone()
+            if report:
+                # A user-edited action is independent of the report's generated snapshot.
+                # Retain source_ids so forgetting source evidence still removes the action.
+                scope = json.loads(report['payload']).get('meeting_id') or task['report_id']
+                db.execute('INSERT OR IGNORE INTO action_task_dismissals VALUES(?,?)', (scope, self.task_fingerprint(task)))
+            db.execute("UPDATE action_tasks SET content=?,owner=?,due=?,due_at=?,reminder_hours=?,report_id='' WHERE id=?",
+                       (content, owner, due_at or due, due_at, reminder_hours, task_id))
+            result = dict(db.execute('SELECT * FROM action_tasks WHERE id=?', (task_id,)).fetchone())
+            result['source_ids'] = json.loads(result['source_ids'])
+            return result
+
+    def delete_action_task(self, task_id):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            task = db.execute('SELECT * FROM action_tasks WHERE id=?', (task_id,)).fetchone()
+            if not task:
+                return False
+            report = db.execute('SELECT payload FROM meeting_reports WHERE id=?', (task['report_id'],)).fetchone()
+            if report:
+                scope = json.loads(report['payload']).get('meeting_id') or task['report_id']
+                db.execute('INSERT OR IGNORE INTO action_task_dismissals VALUES(?,?)', (scope, self.task_fingerprint(task)))
+            if not task['report_id']:
+                db.execute("INSERT OR IGNORE INTO action_task_dismissals VALUES('manual',?)", (task_id,))
+            db.execute('DELETE FROM action_tasks WHERE id=?', (task_id,))
+        return True
 
     def all_meeting_reports(self):
         with self.connect() as db:
@@ -444,7 +524,8 @@ class Store:
 
     def clear(self):
         with self.connect() as db:
-            for table in ("work_audio_uploads", "work_utterances", "work_meeting_events", "work_meeting_segments", "work_meetings", "memories", "transcripts", "events", "drafts", "processed", "meeting_reports", "action_tasks", "mobile_turns", "recall_exclusions"):
+            db.execute("DELETE FROM commute_data WHERE key='journey'")
+            for table in ("work_meeting_deletions", "action_task_dismissals", "location_records", "work_audio_uploads", "work_utterances", "work_meeting_events", "work_meeting_segments", "work_meetings", "memories", "transcripts", "events", "drafts", "processed", "meeting_reports", "action_tasks", "mobile_turns", "recall_exclusions"):
                 db.execute(f"DELETE FROM {table}")
         shutil.rmtree(self.audio_root, ignore_errors=True)
 
@@ -540,6 +621,9 @@ class Store:
 
     def start_work_meeting(self, meeting_id, started_at=None, location=None, whole_audio=False):
         with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute('SELECT 1 FROM work_meeting_deletions WHERE id=?', (meeting_id,)).fetchone():
+                raise ValueError('这场会议已删除，请开始新的会议')
             db.execute("INSERT OR IGNORE INTO work_meetings(id,started_at,location,whole_audio,transcription_status) VALUES(?,?,?,?,?)",
                        (meeting_id, started_at or now(), json.dumps(location or {}, ensure_ascii=False),
                         int(whole_audio), 'recording' if whole_audio else 'legacy'))
@@ -547,13 +631,123 @@ class Store:
 
     def work_meetings(self, limit=100):
         with self.connect() as db:
-            return [{**dict(row), 'whole_audio': bool(row['whole_audio']), 'location': json.loads(row['location'])} for row in db.execute(
+            return [{**dict(row), 'pinned': bool(row['pinned']), 'whole_audio': bool(row['whole_audio']), 'location': json.loads(row['location']), 'revision_request': {k: v for k, v in json.loads(row['revision_request']).items() if k != 'document'}} for row in db.execute(
                 "SELECT m.*,json_extract(r.payload,'$.title') AS title,json_extract(r.payload,'$.summary') AS summary, "
                 "(SELECT count(*) FROM work_meeting_segments s JOIN transcripts t ON t.id=s.transcript_id "
                 "WHERE s.meeting_id=m.id) + (SELECT count(DISTINCT u.transcript_id) FROM work_utterances u JOIN transcripts t ON t.id=u.transcript_id WHERE u.meeting_id=m.id AND u.segment_index=-1) AS transcript_count, "
                 "(SELECT COALESCE(max(COALESCE(s.offset_ms,s.segment_index*?)+s.duration_ms),0) FROM work_meeting_segments s "
                 "WHERE s.meeting_id=m.id) AS duration_ms FROM work_meetings m LEFT JOIN meeting_reports r ON r.id=m.report_id "
-                "ORDER BY m.started_at DESC LIMIT ?", (WORK_SEGMENT_MS, limit))]
+                "ORDER BY m.pinned DESC,julianday(m.started_at) DESC,m.id DESC LIMIT ?", (WORK_SEGMENT_MS, limit))]
+
+    def pin_work_meeting(self, meeting_id, pinned):
+        with self.connect() as db:
+            return db.execute('UPDATE work_meetings SET pinned=? WHERE id=?', (int(pinned), meeting_id)).rowcount > 0
+
+    def delete_work_meeting(self, meeting_id):
+        """Delete one ended meeting; durable receipts reject late start/upload/model results."""
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            receipt = db.execute('SELECT task_ids FROM work_meeting_deletions WHERE id=?', (meeting_id,)).fetchone()
+            if receipt:
+                return json.loads(receipt['task_ids'])
+            meeting = db.execute('SELECT status,report_id FROM work_meetings WHERE id=?', (meeting_id,)).fetchone()
+            if meeting is None:
+                return None
+            if meeting['status'] == 'recording':
+                raise ValueError('请先结束会议，再删除会议记录')
+            sources = {row[0] for row in db.execute('SELECT transcript_id FROM work_meeting_segments WHERE meeting_id=? '
+                       'UNION SELECT transcript_id FROM work_utterances WHERE meeting_id=?', (meeting_id, meeting_id)) if row[0]}
+            cites = lambda ids: any(item.split('.', 1)[0] in sources for item in ids)
+            removed_tasks = []
+            for task in db.execute('SELECT id,report_id,source_ids FROM action_tasks').fetchall():
+                if (meeting['report_id'] and task['report_id'] == meeting['report_id']) or cites(json.loads(task['source_ids'])):
+                    removed_tasks.append(task['id'])
+                    db.execute('DELETE FROM action_tasks WHERE id=?', (task['id'],))
+                    db.execute("INSERT OR IGNORE INTO action_task_dismissals VALUES('manual',?)", (task['id'],))
+            # Invalidate derived history snapshots that cite removed evidence. Independently
+            # saved memories and unrelated actions remain available in their own collections.
+            for report in db.execute('SELECT id,payload FROM meeting_reports').fetchall():
+                payload = json.loads(report['payload'])
+                if report['id'] == meeting['report_id'] or payload.get('meeting_id') == meeting_id or cites(payload.get('source_ids', [])):
+                    db.execute("UPDATE action_tasks SET report_id='' WHERE report_id=?", (report['id'],))
+                    db.execute('DELETE FROM meeting_reports WHERE id=?', (report['id'],))
+            for source in sources:
+                db.execute('DELETE FROM transcripts WHERE id=?', (source,))
+                db.execute('DELETE FROM recall_exclusions WHERE transcript_id=?', (source,))
+            for table in ('work_audio_uploads', 'work_utterances', 'work_meeting_events', 'work_meeting_segments'):
+                db.execute(f'DELETE FROM {table} WHERE meeting_id=?', (meeting_id,))
+            db.execute('DELETE FROM work_meetings WHERE id=?', (meeting_id,))
+            db.execute('DELETE FROM action_task_dismissals WHERE scope=?', (meeting_id,))
+            db.execute('INSERT INTO work_meeting_deletions VALUES(?,?)', (meeting_id, json.dumps(removed_tasks)))
+            if sources or meeting['report_id']:
+                self._invalidate_recall(db, keep_conversation=True)
+        shutil.rmtree(self._work_audio_dir(meeting_id), ignore_errors=True)
+        return removed_tasks
+
+    def save_work_meeting_address(self, meeting_id, expected_location, address):
+        """Enrich the original snapshot, never recreate a deleted or replaced meeting."""
+        if not Path(self.path).exists():
+            return False
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT location,report_id FROM work_meetings WHERE id=?', (meeting_id,)).fetchone()
+            if row is None:
+                return False
+            location = json.loads(row['location'] or '{}')
+            if location != expected_location or location.get('address'):
+                return False
+            location['address'] = address
+            encoded = json.dumps(location, ensure_ascii=False)
+            db.execute('UPDATE work_meetings SET location=?,address_retry_at=NULL WHERE id=?', (encoded, meeting_id))
+            if row['report_id']:
+                db.execute("UPDATE meeting_reports SET payload=json_set(payload,'$.location',json(?)) WHERE id=?",
+                           (encoded, row['report_id']))
+        return True
+
+    def claim_meeting_address(self, meeting_id, expected_location, stamp):
+        """Persist an attempt before the request; one initial attempt plus three retries."""
+        if not Path(self.path).exists():
+            return None
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT location,address_attempts,address_retry_at FROM work_meetings WHERE id=?', (meeting_id,)).fetchone()
+            if row is None or json.loads(row['location'] or '{}') != expected_location:
+                return None
+            if row['address_retry_at'] is not None and row['address_retry_at'] > stamp:
+                return {'wait': row['address_retry_at'] - stamp}
+            if row['address_attempts'] >= 4:
+                # A crash during the final request must not leave the UI pending forever.
+                db.execute('UPDATE work_meetings SET address_retry_at=NULL WHERE id=?', (meeting_id,))
+                return None
+            attempt = row['address_attempts'] + 1
+            # A restart during a request keeps both the consumed attempt and its bounded lease.
+            db.execute('UPDATE work_meetings SET address_attempts=?,address_retry_at=? WHERE id=?', (attempt, stamp + 42, meeting_id))
+            return {'attempt': attempt}
+
+    def finish_meeting_address_attempt(self, meeting_id, expected_location, attempt, retry_at):
+        if not Path(self.path).exists():
+            return False
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT location,address_attempts FROM work_meetings WHERE id=?', (meeting_id,)).fetchone()
+            if row is None or row['address_attempts'] != attempt or json.loads(row['location'] or '{}') != expected_location:
+                return False
+            return db.execute('UPDATE work_meetings SET address_retry_at=? WHERE id=?', (retry_at, meeting_id)).rowcount > 0
+
+    def save_location_record(self, record_id, observed_at, point):
+        encoded = json.dumps(point, ensure_ascii=False, sort_keys=True)
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            existing = db.execute('SELECT observed_at,payload FROM location_records WHERE id=?', (record_id,)).fetchone()
+            if existing and (existing['observed_at'] != observed_at or existing['payload'] != encoded):
+                raise ValueError('位置记录标识已存在且内容不同')
+            db.execute('INSERT OR IGNORE INTO location_records VALUES(?,?,?)', (record_id, observed_at, encoded))
+        return {'id': record_id, 'observed_at': observed_at, **point}
+
+    def location_records(self, limit=100):
+        with self.connect() as db:
+            return [{'id': row['id'], 'observed_at': row['observed_at'], **json.loads(row['payload'])}
+                    for row in db.execute('SELECT * FROM location_records ORDER BY observed_at DESC,id DESC LIMIT ?', (limit,))]
 
     def work_meeting(self, meeting_id):
         retention = self.settings().work_audio_retention_days
@@ -591,7 +785,8 @@ class Store:
         expires = None
         if status in ('saved', 'partial') and row['ended_at']:
             expires = (datetime.fromisoformat(row['ended_at']) + timedelta(days=retention)).isoformat()
-        return {**dict(row), 'whole_audio': bool(row['whole_audio']), 'location': json.loads(row['location'] or '{}'),
+        return {**dict(row), 'pinned': bool(row['pinned']), 'whole_audio': bool(row['whole_audio']), 'location': json.loads(row['location'] or '{}'),
+                'revision_request': json.loads(row['revision_request']),
                 'sources': sources, 'transcript_count': len(sources),
                 'received_segments': audio['total'], 'utterances': utterances, 'events': events,
                 'speakers': sorted({item['speaker'] for item in utterances if item['speaker']},
@@ -785,7 +980,7 @@ class Store:
         return len(expired)
 
     def add_work_event(self, meeting_id, event_id, kind, offset_ms, origin):
-        """Idempotent pause/resume/mark on the audio timeline; only while the meeting is recording."""
+        """Idempotent pause/resume/mark/call boundaries; only while the meeting is recording."""
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             meeting = db.execute("SELECT status FROM work_meetings WHERE id=?", (meeting_id,)).fetchone()
@@ -803,6 +998,11 @@ class Store:
                                   "ORDER BY rowid DESC LIMIT 1", (meeting_id,)).fetchone()
                 if (kind == 'pause') == bool(last and last['kind'] == 'pause'):
                     raise ValueError('录音已经暂停' if kind == 'pause' else '录音没有暂停')
+            if kind in ('call_start', 'call_end'):
+                last = db.execute("SELECT kind FROM work_meeting_events WHERE meeting_id=? AND kind IN ('call_start','call_end') "
+                                  "ORDER BY rowid DESC LIMIT 1", (meeting_id,)).fetchone()
+                if (kind == 'call_start') == bool(last and last['kind'] == 'call_start'):
+                    raise ValueError('已经在记录通话' if kind == 'call_start' else '没有正在记录的通话')
             row = {'id': event_id, 'meeting_id': meeting_id, 'kind': kind, 'offset_ms': offset_ms,
                    'origin': origin, 'created_at': now()}
             db.execute("INSERT INTO work_meeting_events VALUES(?,?,?,?,?,?)", tuple(row.values()))
@@ -945,16 +1145,25 @@ class Store:
             self.delete_work_audio(meeting_id)
         return True
 
-    def save_work_summary(self, meeting_id, payload, source_ids):
+    def save_work_summary(self, meeting_id, payload, source_ids, revision=None):
         # Called while the account runtime lock is held. Never resurrect forgotten evidence.
         current = self.work_meeting(meeting_id)
         if current is None or [row['id'] for row in current['sources']] != source_ids:
             return False
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
+            # Address enrichment may finish while the model is generating the report.
+            fresh = db.execute('SELECT location,report_id,revision_request FROM work_meetings WHERE id=?', (meeting_id,)).fetchone()
+            if fresh is None:
+                return False
+            if revision is not None:
+                pending = json.loads(fresh['revision_request'])
+                if pending.get('id') != revision['id'] or pending.get('status') != 'pending' or fresh['report_id'] != revision['base_report_id']:
+                    return False
+            payload = {**payload, 'location': json.loads(fresh['location'] or '{}')}
             old_id = current['report_id']
             old_tasks = { (task['content'], task['owner'], task['due'], tuple(sorted(json.loads(task['source_ids'])))): dict(task)
-                          for task in db.execute('SELECT * FROM action_tasks WHERE report_id=?', (old_id,)) }
+                          for task in db.execute("SELECT * FROM action_tasks WHERE report_id=? AND report_id!=''", (old_id,)) }
             if old_id:
                 db.execute('DELETE FROM action_tasks WHERE report_id=?', (old_id,))
                 db.execute('DELETE FROM meeting_reports WHERE id=?', (old_id,))
@@ -962,12 +1171,16 @@ class Store:
             db.execute('INSERT INTO meeting_reports VALUES(?,?,?,?)',
                        (report_id, 'work-meeting:' + meeting_id + ':' + report_id, json.dumps(payload, ensure_ascii=False), created))
             for task in payload.get('tasks', []):
+                if db.execute('SELECT 1 FROM action_task_dismissals WHERE scope=? AND fingerprint=?',
+                              (meeting_id, self.task_fingerprint(task))).fetchone():
+                    continue
                 old_task = old_tasks.get((task['content'], task['owner'], task['due'], tuple(sorted(task['source_ids']))), {})
-                db.execute('INSERT INTO action_tasks VALUES(?,?,?,?,?,?,?,?)',
+                db.execute('INSERT INTO action_tasks(id,report_id,content,owner,due,source_ids,status,created_at) VALUES(?,?,?,?,?,?,?,?)',
                            (old_task.get('id', uuid4().hex), report_id, task['content'], task['owner'], task['due'],
                             json.dumps(task['source_ids']), old_task.get('status', 'open'), old_task.get('created_at', created)))
-            db.execute("UPDATE work_meetings SET report_id=?,summary_status=?,summary_stage='done' WHERE id=?",
-                       (report_id, 'ready' if payload['extraction'] == 'llm' else 'fallback', meeting_id))
+            db.execute("UPDATE work_meetings SET report_id=?,summary_status=?,summary_stage='done',revision_request=? WHERE id=?",
+                       (report_id, 'ready' if payload['extraction'] == 'llm' else 'fallback',
+                        json.dumps(revision, ensure_ascii=False) if revision is not None else fresh['revision_request'], meeting_id))
         return True
 
     def work_summary_progress(self, meeting_id, stage, processed=0, total=0):
@@ -982,7 +1195,36 @@ class Store:
                               "WHERE id=? AND status!='recording' "
                               "AND summary_status IN ('fallback','failed','ready')", (meeting_id,)).rowcount > 0
 
+    def queue_work_revision(self, meeting_id, base_report_id, revision):
+        with self.connect() as db:
+            return db.execute("UPDATE work_meetings SET revision_request=?,summary_status='pending',summary_stage='queued' "
+                              "WHERE id=? AND report_id=? AND summary_status!='pending' AND status!='recording'",
+                              (json.dumps(revision, ensure_ascii=False), meeting_id, base_report_id)).rowcount > 0
+
+    def finish_work_revision(self, meeting_id, revision_id, payload, source_ids):
+        meeting = self.work_meeting(meeting_id)
+        revision = meeting['revision_request'] if meeting else {}
+        if revision.get('id') != revision_id or revision.get('status') != 'pending' or meeting['report_id'] != revision['base_report_id']:
+            return False
+        revision['status'] = 'done'
+        return self.save_work_summary(meeting_id, payload, source_ids, revision=revision)
+
+    def fail_work_revision(self, meeting_id, reason):
+        meeting = self.work_meeting(meeting_id)
+        if not meeting:
+            return
+        revision = meeting['revision_request']
+        revision.update(status='failed', error=reason)
+        status = 'ready' if (meeting['report'] or {}).get('extraction') == 'llm' else 'fallback'
+        with self.connect() as db:
+            db.execute("UPDATE work_meetings SET revision_request=?,summary_status=?,summary_stage='done' WHERE id=?",
+                       (json.dumps(revision, ensure_ascii=False), status, meeting_id))
+
     def fail_work_summary(self, meeting_id):
+        meeting = self.work_meeting(meeting_id)
+        if meeting and meeting['revision_request'].get('status') == 'pending':
+            self.fail_work_revision(meeting_id, 'provider_error')
+            return
         with self.connect() as db:
             db.execute("UPDATE work_meetings SET summary_status='failed' WHERE id=? AND summary_status='pending'", (meeting_id,))
 
@@ -992,12 +1234,13 @@ class Store:
         return dict(row) if row else None
 
     @staticmethod
-    def _invalidate_recall(db):
+    def _invalidate_recall(db, *, keep_conversation=False):
         # Keep identities so a retry cannot execute an old mutation a second time.
         withdrawn = json.dumps({'text': '', 'response': '记录已变更，请重新查询。', 'speak': False,
                                 'invalidated': True}, ensure_ascii=False)
         db.execute("UPDATE mobile_turns SET result=? WHERE result IS NOT NULL", (withdrawn,))
-        db.execute("DELETE FROM transcripts WHERE speaker='assistant'")
+        if not keep_conversation:
+            db.execute("DELETE FROM transcripts WHERE speaker='assistant'")
 
     def correct_memory(self, memory_id, content):
         if not isinstance(content, str) or not 1 <= len(content.strip()) <= 6000:
@@ -1037,7 +1280,7 @@ class Store:
                     payload = json.loads(report['payload'])
                     source_ids = set(payload.get('source_ids', [])) | {s['id'] for s in payload.get('sources', [])}
                     if cites(source_ids):
-                        db.execute("UPDATE work_meetings SET report_id=NULL,summary_status='failed',summary_stage='done' WHERE report_id=?", (report['id'],))
+                        db.execute("UPDATE work_meetings SET report_id=NULL,summary_status='failed',summary_stage='done',revision_request='{}' WHERE report_id=?", (report['id'],))
                         removed_reports += db.execute('DELETE FROM meeting_reports WHERE id=?', (report['id'],)).rowcount
             self._invalidate_recall(db)
             return {'memories': removed_memories, 'transcripts': removed_transcripts,
