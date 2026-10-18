@@ -1,5 +1,6 @@
 package com.aidol.demo;
 
+import com.aidol.demo.hardware.HeadsetController;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -7,10 +8,24 @@ import java.util.List;
 
 /** Gesture decisions within a visible or explicitly enabled foreground-service session. */
 final class HeadsetInteractionPolicy {
-    enum Gesture { TOGGLE, NEXT_MODE, CANCEL, DISCARD_COMBINATION, IGNORE }
-    enum Action { START, STOP_AND_SEND, INTERRUPT, CANCEL, CHANGE_MODE, DEFER_MODE, MARK }
+    enum Gesture { TOGGLE, NEXT_MODE, CANCEL, STEM_HOLD, VOLUME_UP, VOLUME_DOWN, DISCARD_COMBINATION, IGNORE }
+    enum Action { START, STOP_AND_SEND, INTERRUPT, CANCEL, CHANGE_MODE, DEFER_MODE, MARK, VOLUME_UP, VOLUME_DOWN }
     static final long GESTURE_SETTLE_MS = 400;
     private static final long DEBOUNCE_MS = 800, MAX_EVENT_AGE_MS = 1500;
+
+    /** SDK forward/backward direction must be confirmed on the physical stem. */
+    static Gesture gesture(HeadsetController.ControlKind kind) {
+        switch (kind) {
+            case TAP: case PRESS_SINGLE: return Gesture.TOGGLE;
+            case DOUBLE_TAP: case PRESS_DOUBLE: return Gesture.NEXT_MODE;
+            case TRIPLE_TAP: case PRESS_TRIPLE: return Gesture.DISCARD_COMBINATION;
+            case LONG_PRESS: return Gesture.CANCEL; // Logo touch, not a stem pinch.
+            case PRESS_LONG: case PRESS_CLICK_HOLD: return Gesture.STEM_HOLD;
+            case SLIDE_FORWARD: return Gesture.VOLUME_UP;
+            case SLIDE_BACKWARD: return Gesture.VOLUME_DOWN;
+            default: return Gesture.IGNORE;
+        }
+    }
 
     static final class Context {
         final boolean foreground, controlsEnabled, loggedIn, ready, inCall, busy, active, recording, notWorn;
@@ -69,6 +84,7 @@ final class HeadsetInteractionPolicy {
         DeviceUpdate(String stopReason, List<String> notices) { this.stopReason = stopReason; this.notices = notices; }
     }
     private long lastSequence = -1, lastAcceptedAt = -1, pendingActionAt = -1;
+    private long lastVolumeAt = -1;
     private long pendingSessionGeneration = -1;
     private Action pendingAction;
     private String pendingMode;
@@ -82,6 +98,16 @@ final class HeadsetInteractionPolicy {
         lastSequence = sequence;
         if (gesture == Gesture.IGNORE || receivedAt > now || now - receivedAt > MAX_EVENT_AGE_MS) return Decision.none();
         if (!context.enabled()) { clearPending(); return Decision.none(); }
+        // Never end a meeting or claim an ANC change on a stem hold. SDK 6.7
+        // has no verified ANC command; firmware remains responsible for it.
+        if (gesture == Gesture.STEM_HOLD) { clearPending(); return Decision.none(); }
+        if (gesture == Gesture.VOLUME_UP || gesture == Gesture.VOLUME_DOWN) {
+            if (context.notWorn) return Decision.none();
+            if (lastVolumeAt >= 0 && now - lastVolumeAt < 150) return Decision.none();
+            lastVolumeAt = now;
+            // Volume is independent of recording, network work and pending mode changes.
+            return new Decision(null, "", gesture == Gesture.VOLUME_UP ? Action.VOLUME_UP : Action.VOLUME_DOWN);
+        }
         if (gesture == Gesture.DISCARD_COMBINATION) { clearPending(); return Decision.none(); }
         if (lastAcceptedAt >= 0 && now - lastAcceptedAt < DEBOUNCE_MS && gesture == lastGesture) return Decision.none();
         lastGesture = gesture; lastAcceptedAt = now;

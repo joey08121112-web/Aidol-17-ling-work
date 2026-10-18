@@ -277,7 +277,7 @@ async def duplex_call(socket, runtime, native, speech, request_id, charge):
                     child_id, 'interrupted' if stop.is_set() else 'done', audio_bytes, input_bytes - (mic_at_reply if mic_at_reply is not None else input_bytes))
                 last_result = result
                 await send({'type': 'result', 'result': result, 'turn': current})
-                if result.get('interaction') == 'mode_switch':
+                if result.get('interaction') in {'mode_switch', 'commute_ready'}:
                     return
                 # Apply current account preferences to future automatic responses.
                 if not stop.is_set():

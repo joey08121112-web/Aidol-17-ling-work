@@ -87,7 +87,8 @@ async def test_route_shortcut_uses_saved_places_and_transport(agent, store, monk
     assert '25分钟' in result['response'] and '4.2公里' in result['response'] and '家' in result['response']
     assert calls == ['driving']  # 未说出行方式时沿用用户设置
     result = await agent.ingest(TextInput(text='骑车回家'), directed=True)
-    assert calls == ['driving', 'bicycling'] and '骑行' in result['response']
+    assert calls == ['driving']  # Actual travel now requires explicit origin; route questions remain read-only.
+    assert result['interaction'] == 'commute_collect' and '起点' in result['response']
 
 
 @pytest.mark.asyncio

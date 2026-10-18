@@ -1,5 +1,14 @@
 # 需求、实现与验收证据
 
+## 2026-10-18 会议地址与整场纪要失败恢复（本地服务）
+
+- 手机当前连接本地8108转发至本任务8109，定位权限与系统定位已开启。真实失败会议保存了原始坐标和录音，但地址首次加3次重试耗尽，整场转写未提交成功、总结failed。根因为共享HTTP池将 `httpx.USE_CLIENT_DEFAULT` 传给AsyncClient构造器的verify，实际HTTPS请求报 `set_alpn_protocols` 属性异常；地图、文字模型和千问HTTP转写默认路径均受影响。
+- 池默认改为正常验证证书的 `verify=True`，兼容规范化旧哨兵参数，保留显式SSLContext、代理和连接复用。新增6项本地真实TLS/HTTP CONNECT/HTTPS代理回归；旧实现6项失败，修复后全部通过，不可信证书仍被拒绝。后端全量 **647 passed / 1条既有弃用警告**，compileall通过；Android **296项单测通过**，Lint **0错误/31警告**。
+- 会议详情快照补上location/address_attempts/address_retry_at；仅地址变化时更新原TextView和导出对象，不重建正文并保持滚动。荣耀Android15隔离真机检查PASS：通过MockWebServer GET和原有轮询依次验证待解析、重试耗尽、成功补址，以及报告location同步；原弹窗、详情、正文、地址控件与滚动均保留。工作分区、地图天气及缓存页面回归一并通过。
+- 真实高德公开地标反查成功后，重启本任务8109实例；对用户要求修复的单场会议，用其原坐标补地址并通过既有处理流程重试。最终整场ASR ready、总结ready、extraction=llm，原16条分段转写正常替换为12条整场转写，新增1报告和2行动项；未伪造地址或用当前坐标替换会议地点。手机界面已核对地址和总结完成状态。
+- 修复前私有SQLite与音频备份，恢复后独立核对其他两场会议、2报告、22条转写/话语、3行动项及相关事件均未改变。全部11个PCM文件共6090240字节逐文件SHA256一致。最终手机APK与构建一致：`7e24965253d693d6f3338252f723810e07110f26d92fcf0d96b996e7119d833f`；测试包已删除。
+- 本轮修复与实测范围为本地服务和该荣耀手机。公网HTTPS服务健康正常，但新增地图端点仍返回404；远端代码同步和个人数据迁移尚未执行，SSH认证仍需配置，不能把本轮结果视为远端发布完成。
+
 ## 2026-10-18 透明角色完整动画与主线合并
 
 - 保持用户已认可的生活形象及静帧构图，接入生活 3.833 秒循环、通勤 5 秒循环及结束后 6.042 秒单次动画。移除原视频白底、装饰圆环，修补白色手脚、脸部及结束过渡的遮罩；三段均为 960×480 H.264 左 RGB／右 alpha，无音轨，四张透明 WebP 回退图保留。资源总计约 3.02 MiB。
@@ -840,6 +849,52 @@ Android `testDebugUnitTest lintDebug assembleDebug` 成功：159项单测，零�
 - 合并前同步 `origin/main` 的工作／通勤更新 `9b4cc80`，保留双方交接文档后在组合版本复验：Android 296 项单测、Lint 0 errors／31 warnings、debug 构建通过；Python 641 passed／1 warning、compileall 通过；同一生活原生 UI 回归再次通过（`merged-regression.log`、`merged-screenshots/`）。本次修复相对于该主分支仍仅改两个 Android 文件及两份文档。
 - 本轮仅离线结果注入及模拟器 UI；没有模型、录音或供应商 API 请求，没有安装至 USB 真机、更新公网 APK 或部署服务，Rise 听音／锁屏等硬件验收仍待实机完成。
 
+## 2026-10-18 顶部替换 viaim 液态银蓝字标（本地）
+
+- 按用户选择，将主页面顶部原 aidol 图片替换为第二款 viaim 液态银蓝艺术字；使用 image_gen 从选中图处理透明背景，保留五个小写字母、两个 i 点和银蓝金属细节。新增 `viaim_wordmark_chrome.png`，顶部显示128×38dp，无障碍名称同步为 viaim。
+- 当前源码验证：Python647 passed／1条既有弃用警告、compileall通过；Android296项单测零失败，lint 0错误／32警告，debug APK构建成功。本轮是字标替换，没有新增行为测试。
+- 已覆盖安装至当前连接的荣耀 ANN-AN00，并打开原应用。真机截图核对字形完整、透明背景、顶部对齐与右侧控件布局；设备与构建APK SHA-256一致：`60b595b06e9c3d605aa592644c2e0cf7f65b1cc6ae505a0088d9a95396497b43`。安装前确认无正在录音会议或通勤并备份用户库，安装后逐行核对会议、原文、记忆、待办、报告、设置及通勤数据未改变。
+- 仅本地替换与安装，无后端重启或GitHub推送。图片、生成提示和真机截图保存在本地 outputs/viaim-logo-options。未重新测试真实收音、来电或模型回复。
+
+
+## 2026-10-18 独立操作并行、保留原任务（本地）
+
+- MainActivity 普通请求改为按资源排队、跨资源并行；查询/纪要整理不再占用全页 busy。切换页面保留正在处理的会话；真正占用麦克风或音频输出的操作仍互斥。后台完成不把用户切回旧页，同一会议/行动项防重复提交，清空/注销前保护尚未保存的写入。
+- 行动清单支持不同任务独立保存；地址查询与通勤启停分开调度，同一次通勤的开始、结束依次完成。补充账号、请求版本、输入和弹窗存活检查，旧查询/状态快照不能覆盖新修改；密码更新时清理旧请求状态，避免刷新标志残留。
+- 后端地图、搜索、历史纪要与回忆的网络等待移出账号语音锁，任务 CRUD 使用短事务。相同来源的历史整理共享模型生成；落库前原子校验原文，清空、删除、修正、注销之后迟到结果不能恢复旧数据。保留鉴权、配额、并发上限和语音会话锁。
+- 新增设置 PATCH 只合并修改字段，保留 PUT。Android 仅在旧服务明确返回404/405时，固定同一凭据读取最新设置、合并后PUT；401/409/500和不确定的网络失败不重放写请求，设置队列不锁住其他功能。
+- 验证：Python完整测试673 passed（含26项新增HTTP并发回归），compileall通过；Android310项单测零失败，lint 0 errors／32 warnings，debug及测试APK构建成功。新模拟服务测试未调用模型或地图供应商。
+- 荣耀 ANN-AN00 / Android15 真机隔离夹具通过：慢纪要期间任务PATCH/刷新/导航继续，原任务随后成功；同资源FIFO及跨资源并行；旧快照、旧账号回调被忽略；未启动的真实HostedSession切页后保留；现代设置PATCH与旧服务405回退走真实HTTP并保留其他设置。没有测试真实收音/来电。
+- 工作/通勤原生UI回归通过：勾选与迟到回包不移动滚动位置，工作分区缓存、会议地址重试显示、地图预览和目的地天气正常。真机测试使用隔离数据；最终卸载测试包、恢复本地端口映射并打开App。已核对安装包与构建SHA-256一致：`7de5774fcd20282a2e3d0ee5ccc4b1133710d6ac8cd55a3addd86e0db0a50062`。
+- 当前手机使用USB_LOCAL（无线ADB反向端口到本机8109），本地后端已平滑重启并健康检查200/ready。远端服务尚未部署本次并发修改，仍待服务器SSH管理访问；本次没有GitHub推送或云数据迁移。保留工作区原有viaim字标修改，本提交不包含该独立改动。
+- 日志保存在workspace的work目录：`operation-concurrency-backend-check.log`、`operation-concurrency-android-final.log`、`operation-concurrency-device-final.log`、`operation-concurrency-work-ui-check.log`；可安装APK同步至outputs/aidol-latest.apk。
+
+
+## 2026-10-18 耳机柄滑动音量与长捏解绑（本地）
+
+- 滑动经当前设备/监听代次/SDK确认事件链进入策略，前滑0x93增加媒体音量、后滑0x94降低，各请求系统一档，不请求音频焦点、不改录音路由、不播放提示。150ms独立限流，保留重复序号、迟到、授权、来电及佩戴检查；不影响待决双捏模式/重点标记。
+- 双捏维持原行为；工作会议录音中标记重点，其余状态循环模式。长捏耳机柄0x83及预留0x84只撤销待决组合，不结束录音。Logo区长按0x92仍结束并保存。SDK无已知ANC/通透控制或固件重映射接口，该部分未实现，不发送猜测命令、不显示切换成功。
+- 自动检查：Python 673 passed（1条既有弃用警告），compileall通过；Android 315 tests、0失败/错误；lint 0 errors / 32 warnings；assembleDebug成功。新增5项策略测试覆盖滑动不打断记录、双捏兼容、长捏解绑、重复/迟到/快速事件及授权/来电/摘下拦截。
+- Honor ANN-AN00安装启动成功，已安装base.apk与构建SHA256一致：`6589b1ec2ee3ad8a90f61c68c814ac3f1ebfa222385f3d06ae48eb4074f75285`。设备显示固件确认触控开启，左耳已佩戴，未检测到通话。
+- 实物配合：用户确认“上滑动下滑动对应的都是对的操作，直接按照现在的情况跟进”。观察6次实际触控，末次SLIDE_BACKWARD (0x94) #6；蓝牙媒体音量从7到5。因用户执行了多次上下滑动，未逐次隔离计量，不能排除固件也调节音量。未测试长捏ANC切换，不等同已支持。
+- 安装前确认App工作模式待机且无录音/通勤服务，并备份2个本地用户库。安装后原有受保护记录未删除或修改；其中一个库transcripts新增2条，未读出内容、未删除，来源未归因。其他保护表保持一致。未清除手机数据、未主动开始录音、未重启服务器，未提交或推送Git。保留此前viaim字标改动。
+
+### 2026-10-18 对话启动通勤、站点 App 通知
+
+- 用户已纠正通知渠道：使用 App 通知，不是手机号短信。未添加 SEND_SMS 权限、号码配置或短信调用。
+- 本地离线回归：`pytest tests -q` **687 passed**；`compileall app` 通过。包含缺少必填信息、跨轮补齐、地址候选确认、保存地址复用、模型不能虚构起点、取消、清除草稿、权限前不启动、天气与路线播报、连续语音正常 `call.done` 等用例。
+- Android：`testDebugUnitTest lintDebug assembleDebug assembleDebugAndroidTest` 通过，**321 tests / 0 failures**；Lint **0 errors / 34 warnings**（现有风格警告及新增文字国际化提示）。计时估算、GPS 前一站、移动定位识别上车、重复提醒抑制、进度恢复、过期定位、错过时刻、坐标转换有离线用例。
+- 荣耀 ANN-AN00 / Android 15，隔离 `.review` 真机 `CommuteDialogueInstrumentation` **PASS**：完整参数带入一次启动请求、合并 TTS 静音 WAV 完成后才打开拦截的高德 Intent、重复计划不重复启动、测试 App 通知已发布。使用模拟服务/路线/音频；不是真实供应商语音、真实通勤服务或乘车验证，不操作主 App 账号数据。测试包已卸载。
+- 随后的短弹窗布局与自动上车识别调整已构建并通过单元测试；第二次真机复查遇到手机锁屏，未执行完成，已停止并清理隔离测试包。此前真机证据仅覆盖已列流程，不证明地下定位、耳机实际听感、锁屏全程或高德实时站点同步。
+- 安装包已输出 `outputs/aidol-commute-dialogue.apk`，SHA-256 `26e74c67c7bd475b37b3607d52c3b84524cc7756cd8d48ea5acea9d98f377b2f`。主 App 未覆盖安装；本机服务未因本次改动重启。用户随后明确暂停安装与服务更新，先将本地验证版本提交 GitHub；远端服务未部署。
+
+### 2026-10-18 暂停安装，保存并同步 GitHub 主线
+
+- 用户明确暂停当前手机安装与后端重启，先推送刚才完成的本地版本。保存字标/耳机柄改动为 `3eeffb7`，对话通勤及 App 通知为 `adfc593`，连同未推送的 TLS 修复 `b4fc66d`、并行操作修复 `5c05e67` 一并同步。
+- 拉取远端 `edfdbca`，保留透明角色动画分支历史；合并测试 runner、会话完成/取消/销毁回调及验收文档，未以单侧版本覆盖另一侧功能。
+- 合并后 `pytest tests -q` **689 passed / 1条既有弃用警告**、compileall通过；Android **340 tests / 0失败/错误**，Lint **0错误 / 34警告**，应用和测试APK构建成功。日志：workspace `work/github-merge-python.log`、`work/github-merge-android.log`。
+- 本轮无手机操作、后端重启、远端部署或数据迁移；未执行合并版真机自动测试。改动清单同步至 `docs/change-list-2026-10-18.md`。
+
 ## 2026-10-18 说话人改名（本地，未上真机）
 
 - 分支 `feat/speaker-names`，基于 `origin/main` `7b23bda`。依据飞书妙记差距调研 P0 第 1 项实现，改动见 [更新清单](change-list-2026-10-18-speaker-names.md)。
@@ -847,4 +902,3 @@ Android `testDebugUnitTest lintDebug assembleDebug` 成功：159项单测，零�
 - Android：JBR 21.0.11 / SDK 35 执行 `testDebugUnitTest lintDebug assembleDebug` 成功，**301** 项单测零失败（变基后复跑 **320** 项零失败），Lint 0 errors / 31 warnings（新代码无告警）；新增 `SpeakerNamesTest` 4 项、`MeetingExportTest` 改名导出 1 项。本机默认 JDK 25/26 无法运行 Gradle 8.9，需指定 JDK 17/21。
 - 真机（Redmi K70 `4fb3c538`）：手机原有 `com.aidol.app.debug` 签名不同无法覆盖，改装并存的 `com.aidol.app.review`（`-PaidolVisualReview`，同一源码）；`adb reverse tcp:8108 tcp:8118` 指向本分支后端。旧包后台持有 Rise SDK 的 GAIA BLE/BR-EDR 服务时，新包显示“耳机服务尚未完成释放”（`state=ERROR error=disconnect_error`）；停止旧包、Rise 重连系统蓝牙后新包显示“耳机已就绪”，13:45 一场工作录音的实时字幕正常出字，`/v1/voice` 分段上传 200。
 - 未在真机完成：录音结束后点按段首改名、键盘与长名称换行、改名后纪要/导出显示。未做界面截图（截屏为黑屏），未请求供应商 API。
-

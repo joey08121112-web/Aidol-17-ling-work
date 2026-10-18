@@ -22,8 +22,13 @@ class HttpClientPool:
     def __init__(self):
         self._clients: dict[tuple, httpx.AsyncClient] = {}
 
-    def client(self, vendor, *, timeout, proxy=None, verify=httpx.USE_CLIENT_DEFAULT):
-        key = (vendor, proxy, None if verify is httpx.USE_CLIENT_DEFAULT else verify)
+    def client(self, vendor, *, timeout, proxy=None, verify=True):
+        # USE_CLIENT_DEFAULT belongs to per-request options, not AsyncClient's
+        # TLS constructor. Passing it through stores it as an SSLContext and
+        # crashes when HTTPS (including CONNECT proxies) configures ALPN.
+        if verify is httpx.USE_CLIENT_DEFAULT:
+            verify = True
+        key = (vendor, proxy, verify)
         client = self._clients.get(key)
         if client is None:
             client = httpx.AsyncClient(timeout=timeout, proxy=proxy, verify=verify)

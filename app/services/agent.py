@@ -12,6 +12,7 @@ from .conversation import ConversationService
 from .memory_interaction import MemoryInteraction
 from .assistant_tools import AssistantTools
 from .commute import ROUTE_FIELDS, commute_destination, with_destination
+from .commute_dialogue import CommuteDialogue
 from .voice_intent import mode_command, shortcut_command
 
 
@@ -97,6 +98,16 @@ class Agent:
                 return {"mode": self.mode, "memories": [], "response": "已切换到" + names[target],
                         "extraction": "rules", "interaction": "mode_switch", "explicit_reply": True,
                         "auto_mode": False}
+            if directed and not silent and self.store.settings().mode == Mode.commute:
+                travel = await CommuteDialogue(self.config, self.store, self.maps, getattr(self, 'tool_charge', lambda: True)).handle(item.text)
+                if travel is not None:
+                    self.mode = Mode.commute
+                    transcript = {"speaker": item.speaker, "text": item.text, "mode": self.mode,
+                                  "source": item.source, "interaction_source": "direct_question"}
+                    if self.store.settings().retain_transcripts:
+                        transcript = self.store.add("transcripts", **transcript)
+                    await self.bus.emit("transcript.final", transcript, persist=False)
+                    return {"mode": self.mode, **travel}
             shortcut = shortcut_command(item.text) if directed else None
             if shortcut is not None:
                 answered = await self._shortcut_answer(shortcut, item, recording, started)

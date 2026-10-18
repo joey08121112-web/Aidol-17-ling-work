@@ -381,10 +381,22 @@ class Store(CommuteStorage):
             return None
         return {"id": row["id"], "created_at": row["created_at"], **json.loads(row["payload"])}
 
-    def save_meeting_report(self, signature, payload):
+    def save_meeting_report(self, signature, payload, *, expected_sources=None):
         """Commit a report and its action items together; retries never duplicate tasks."""
+        if expected_sources is not None and not Path(self.path).exists():
+            return None
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            # A long model call may overlap deletion, correction or a new recording.
+            # Validate exactly the captured evidence, allowing new unrelated rows.
+            if expected_sources is not None:
+                for source in expected_sources:
+                    row = db.execute("SELECT * FROM transcripts r WHERE id=? AND mode='work' "
+                                     "AND speaker!='assistant' AND interaction_source='ambient_capture' "
+                                     "AND NOT EXISTS (SELECT 1 FROM recall_exclusions e WHERE e.transcript_id=r.id)",
+                                     (source['id'],)).fetchone()
+                    if row is None or dict(row) != source:
+                        return None
             existing = db.execute("SELECT * FROM meeting_reports WHERE signature=?", (signature,)).fetchone()
             if existing:
                 return {"id": existing["id"], "created_at": existing["created_at"], **json.loads(existing["payload"])}
@@ -526,7 +538,7 @@ class Store(CommuteStorage):
 
     def clear(self):
         with self.connect() as db:
-            db.execute("DELETE FROM commute_data WHERE key='journey'")
+            db.execute("DELETE FROM commute_data WHERE key IN ('journey', 'dialogue')")
             for table in ("work_meeting_deletions", "action_task_dismissals", "location_records", "work_audio_uploads", "work_utterances", "work_meeting_events", "work_meeting_segments", "work_meetings", "memories", "transcripts", "events", "drafts", "processed", "meeting_reports", "action_tasks", "mobile_turns", "recall_exclusions"):
                 db.execute(f"DELETE FROM {table}")
         shutil.rmtree(self.audio_root, ignore_errors=True)

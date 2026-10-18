@@ -393,3 +393,11 @@ Android 实际播放排空后发送 `{"type":"playback.done","turn":N}`，后端
 - Android 仅通勤页在前台时更新预览/图片，正常间隔180秒；更换端点/方式立即更新，旧请求取消并按账号/请求身份过滤迟到结果。目的地天气自动获取，正常10分钟刷新；失败有界间隔重试，手动刷新可提前更新。真正通勤的180秒锁屏定位和路线服务仍由 CommuteService 负责，切走页面只取消预览请求。
 
 依据高德官方[静态地图](https://lbs.amap.com/api/webservice/guide/api/staticmaps)、[路径规划](https://lbs.amap.com/api/webservice/guide/api/direction)、[天气查询](https://lbs.amap.com/api/webservice/guide/api/weatherinfo)接入。
+
+## 对话启动通勤与站点信息（2026-10-18）
+
+- `capabilities.commute_dialogue=true`：在已选通勤模式中，直接文字提问/连续语音可收集起点、目的地和出行方式。缺项返回 `interaction=commute_collect`，不默认当前位置或驾车。命名地址有多个候选时询问序号；家/公司/学校复用本账号保存的坐标。收集草稿按账号保存在 `commute_data.dialogue`，30分钟过期，取消和清除数据会清空。
+- 信息完整后返回 `interaction=commute_ready`、`speak=false` 和 `commute_plan`。计划字段与 `POST /v1/commute` 相同。此时尚未启动行程；Android 收到新结果，正常释放语音通话后，经过定位权限流程再提交。连续语音返回 `call.done`。历史请求恢复只展示结果，不自动执行计划。
+- `GET /v1/commute/{id}/briefing`：本账号活跃行程的播报资料，返回 `journey_id/text/weather/route`。复用已计算路线，另查询目的地实况天气；路线/天气不可用会在播报中说明。接口占用查询额度、独立于对话锁并复核认证；非当前活跃行程404。固定起点估算不冒充当前位置实时到达时间。
+- 公共交通 `route.steps[].station_points` 保留每段出发站、途经站、到达站的顺序，`name` 必有，GCJ-02 `longitude/latitude` 仅供应商返回有效值时存在；原 `stations` 字符串列表保留。每个 segment 的 buslines 为备选，仅使用选定线路。
+- Android 站点提醒无短信接口、无号码配置、无 SEND_SMS 权限。使用本机通知和 `/v1/speech`；原有“给联系人到达草稿”功能不变。

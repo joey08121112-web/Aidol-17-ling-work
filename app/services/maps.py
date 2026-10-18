@@ -338,6 +338,7 @@ class MapService:
                               "duration_seconds": cls._number(line.get("duration")),
                               "first_departure": cls._text(line.get("start_time")),
                               "last_departure": cls._text(line.get("end_time")),
+                              "station_points": cls._station_points(line),
                               "stations": list(dict.fromkeys([x for x in [start] +
                                   [cls._text(stop.get("name")) for stop in (line.get("via_stops") or [])[:80]
                                    if isinstance(stop, dict)] + [end] if x]))})
@@ -346,6 +347,24 @@ class MapService:
                 name = cls._text(railway.get("name")) or cls._text(railway.get("trip"))
                 steps.append({"type": "railway", "instruction": f"乘坐列车 {name}", "line": name})
         return steps
+
+    @classmethod
+    def _station_points(cls, line):
+        points = []
+        for stop in [line.get('departure_stop')] + (line.get('via_stops') or [])[:80] + [line.get('arrival_stop')]:
+            if not isinstance(stop, dict):
+                continue
+            point = {'name': cls._text(stop.get('name'))}
+            try:
+                lon, lat = map(float, stop.get('location', '').split(','))
+                if -180 <= lon <= 180 and -90 <= lat <= 90:
+                    point.update(longitude=lon, latitude=lat)
+            except (ValueError, TypeError, AttributeError):
+                pass
+            # Retain missing coordinates and station order for honest time estimates.
+            if point['name']:
+                points.append(point)
+        return points
 
     async def _get(self, client, path, params):
         return await amap_get(client, self.config.amap_key, path, params)
