@@ -6,6 +6,9 @@ vehicle telemetry. Missing configuration/results are explicit and are not mocked
 import math
 from datetime import datetime, timezone
 
+# Kept as the monkeypatch anchor used by the maps test fixtures: they patch
+# app.services.maps.httpx.AsyncClient to intercept the shared pool's clients.
+import httpx
 from ..providers.amap import amap_get
 
 
