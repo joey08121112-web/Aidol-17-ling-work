@@ -1,4 +1,6 @@
 """Hosted Android contract: real auth/SQLite, offline providers, isolated accounts."""
+import threading
+import time
 from dataclasses import replace
 from uuid import uuid4
 
@@ -480,9 +482,10 @@ def test_active_turn_blocks_destructive_actions_but_not_another_account(mobile, 
         assert pending.result(timeout=10).status_code == 200
 
 
-def test_state_snapshot_read_bypasses_the_account_lock_but_writes_keep_409(client, runtime):
+def test_state_snapshot_read_bypasses_the_account_lock_but_writes_keep_409(client, runtime, monkeypatch):
     # A live turn or duplex call holds the account lock for seconds; the client's
     # state poll is a lock-free SQLite snapshot and must never queue behind it.
+    monkeypatch.setattr("app.main.SETTINGS_LOCK_WAIT", 0.2)
     client.portal.call(runtime.lock.acquire)
     try:
         state = client.get("/v1/state")
@@ -490,11 +493,41 @@ def test_state_snapshot_read_bypasses_the_account_lock_but_writes_keep_409(clien
         body = state.json()
         assert body["user"]["id"] and body["agent"]["mode"] and body["settings"]["auto_mode"] is False
         assert client.get("/v1/work-meetings").status_code == 200
-        # Write paths keep their fast-fail conflict semantics.
+        # Write paths keep their conflict semantics; settings only after a bounded wait.
         assert client.put("/v1/settings", json={"auto_mode": False, "mode": "life"}).status_code == 409
         assert chat(client, dict(client.headers)).status_code == 409
     finally:
         client.portal.call(runtime.lock.release)
+
+
+def test_mode_switch_waits_for_a_finishing_call_instead_of_409(client, runtime):
+    # Hang-up releases the account lock only after upstream teardown; a mode switch
+    # sent right away must queue behind it rather than bounce through client retries.
+    client.portal.call(runtime.lock.acquire)
+    release = threading.Timer(0.3, lambda: client.portal.call(runtime.lock.release))
+    release.start()
+    try:
+        started = time.monotonic()
+        changed = client.put("/v1/settings", json={"auto_mode": False, "mode": "work"})
+        assert changed.status_code == 200, changed.text
+        assert 0.2 <= time.monotonic() - started < 5
+        assert changed.json()["mode"] == "work" and client.get("/v1/state").json()["agent"]["mode"] == "work"
+    finally:
+        release.join()
+    assert not runtime.lock.locked()
+
+
+def test_mode_only_settings_change_skips_the_audio_retention_scan(client, runtime, monkeypatch):
+    calls = []
+    original = type(runtime.store).purge_work_audio
+    monkeypatch.setattr(type(runtime.store), "purge_work_audio", lambda store: calls.append(1) or original(store))
+    settings = client.get("/v1/state").json()["settings"]
+    for mode in ("work", "commute", "life"):
+        assert client.put("/v1/settings", json={**settings, "mode": mode}).status_code == 200
+    assert calls == []
+    settings["work_audio_retention_days"] = 7
+    assert client.put("/v1/settings", json=settings).status_code == 200
+    assert calls == [1]
 
 
 def test_voice_no_speech_and_provider_failure_are_safe(mobile, monkeypatch):

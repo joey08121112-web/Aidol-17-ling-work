@@ -41,6 +41,9 @@ from .providers.bocha import BochaSearch
 WORK_SUMMARY_SAVE_ATTEMPTS = 3
 WORK_SUMMARY_SAVE_LOCK_WAIT = 10
 WORK_SUMMARY_SAVE_RETRY_DELAY = 2
+# A mode/settings write queues briefly behind a finishing call or segment instead
+# of failing fast: the lock is usually released within a second of hang-up.
+SETTINGS_LOCK_WAIT = 5
 
 
 def create_hosted_app(config=None, data_directory=None):
@@ -423,7 +426,7 @@ def create_hosted_app(config=None, data_directory=None):
 
     @api.put('/v1/settings')
     async def mobile_settings(value: Settings, request: Request, current=Depends(user)):
-        async with runtime(current, request) as rt:
+        async with runtime(current, request, wait_seconds=SETTINGS_LOCK_WAIT) as rt:
             # Android v1 is foreground-only; do not advertise background listening.
             value.auto_mode = False
             value.life_poll_enabled = False
@@ -436,7 +439,9 @@ def create_hosted_app(config=None, data_directory=None):
                 journey = rt.store.commute_journey()
                 if journey.get('active'):
                     rt.store.stop_commute(journey['id'])
-            rt.store.purge_work_audio()
+            # Retention is enforced lazily on meeting reads; a mode switch skips the scan.
+            if old.work_audio_retention_days != value.work_audio_retention_days:
+                rt.store.purge_work_audio()
             await rt.agent.decide()
             return value
 

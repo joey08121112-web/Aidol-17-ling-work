@@ -776,3 +776,10 @@ Android `testDebugUnitTest lintDebug assembleDebug` 成功：159项单测，零�
 - 首次夹具启动阻塞，线程堆栈定位到基线 `AuthVault` 空偏好直接返回而未结束加载 latch，维护回调反复等待。保留首次日志和堆栈；仅在未登录 UI 夹具内结束内存中的空加载状态后重跑通过。没有修改正式账号加载逻辑；该基线问题仍需独立修复。通用历史 UI 夹具及需要 Rise 的硬件专项未重跑。
 - 证据和候选包：忽略目录 `artifacts/life-conversation-ui/`，包含 `android-build-final.log`、`pytest.log`、`compileall.log`、`visual-run-final.log`、`visual-run-320dp-font130.log`、`instrumentation-first-stack.txt`、`final/` 与 `narrow-final/` 截图。`aidol-life-conversation-debug.apk` 为 `com.aidol.app.debug` 开发包，默认本地 USB 服务，连接设置可切换已有远端。本地验收时未安装至 USB 真机、未更新公网 APK、未推送或部署；后续源码提交与合并状态以 Git 记录为准。
 - 待验：本轮真实登录、Rise 采音、语音转写／回复／人耳听音、锁屏与来电断连；Android 8–10 的兼容键盘分支未在旧系统实跑。模拟器与构建结果不替代这些验收。
+
+## 2026-10-18 模式切换提速（本地）
+
+- 后端：`PUT /v1/settings` 在账号锁上有界等待 `SETTINGS_LOCK_WAIT=5` 秒；仅保留期变化时执行 `purge_work_audio()`。新增测试：锁在0.3秒后释放时切换返回200（不再409）、仅改模式不触发录音保留扫描；原“锁持续占用仍409”测试改为缩短等待后断言。
+- Android：切换乐观更新并立即播放本地模式耳标，失败/放弃/离开前台/会话取消时回滚；模式请求用独立线程，`/v1/state` 刷新改为独立线程与代次校验，不再设置 `busy`；工作↔通勤切换重建对话页。`ModeChangeRetry` 记录原模式并提供本地快照写入，新增2项单测。
+- 软件验证：Python `.venv` 离线测试 **625 passed**、compileall 通过；JBR 21.0.11、Android SDK 35 执行 `testDebugUnitTest lintDebug assembleDebug` 成功，Android **285 项单测零失败**，Lint **0 errors / 28 warnings**（既有类别）。
+- 未验证：本轮未安装 APK、未用 Rise 实测切换耗时与耳标听音；`ModeSwitchInstrumentation` 未运行，其“切换不重建页面”和“确认后才播放”断言已与当前约定不符（生活布局改版后已不成立），需要按新约定更新后再做真机复核。
