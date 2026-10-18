@@ -51,6 +51,11 @@ final class CommutePanel implements AutoCloseable {
     /** While a commute runs, its state and the only in-app end control stay above the fold. */
     private LinearLayout activeBar;
     private TextView activeTitle;
+    /** Reverse-geocoded phone position shown on the origin row while the origin follows GPS. */
+    private JSONObject currentPlace;
+    private long originAttemptAt = -600_000;
+    private boolean locatingOrigin;
+    private String originProblem = "";
     private ScrollView pageScroll;
     private String lastRender = "";
     private Dialog navigationFallback;
@@ -198,6 +203,7 @@ final class CommutePanel implements AutoCloseable {
     }
     private final Runnable tick = new Runnable() { public void run() {
         if (closed || !visible.getAsBoolean()) return;
+        locateOrigin(false);
         boolean running = CommuteService.running(client.get());
         JSONObject active = CommuteService.current(client.get());
         if (active != null) journey = active;
@@ -217,7 +223,11 @@ final class CommutePanel implements AutoCloseable {
         activeBar.addView(endButton, new LinearLayout.LayoutParams(-2, -2));
         mapPanel.renderMap(parent);
         LinearLayout plan = card(parent);
-        originButton = compactButton(plan, "", () -> { if (editable()) choosePlace(true, p -> { journeyVersion++; origin = p; originMode = p == null ? "gps" : "fixed"; update(); }); });
+        originButton = compactButton(plan, "", () -> {
+            if (!editable()) return;
+            if ("gps".equals(originMode) && !locationAllowed()) { withPermission(false, () -> locateOrigin(true)); return; }
+            choosePlace(true, p -> { journeyVersion++; origin = p; originMode = p == null ? "gps" : "fixed"; update(); if (p == null) locateOrigin(true); });
+        });
         destinationButton = compactButton(plan, "", () -> { if (editable()) choosePlace(false, p -> { journeyVersion++; destination = p; update(); }); });
         transportButton = compactButton(plan, "", () -> {
             if (!editable()) return;
@@ -250,11 +260,54 @@ final class CommutePanel implements AutoCloseable {
         LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, dp(48)); p.setMargins(0, dp(3), 0, dp(3));
         parent.addView(button, p); return button;
     }
+    private String gpsOrigin() {
+        if (currentPlace != null) {
+            String address = currentPlace.optString("address"), city = currentPlace.optString("city");
+            // The city is implied by the route; keep the row to district and street.
+            if (!city.isEmpty() && address.startsWith(city) && address.length() > city.length()) address = address.substring(city.length());
+            return "当前位置 · " + address;
+        }
+        if (locatingOrigin) return "正在定位当前位置…";
+        if (!locationAllowed()) return "当前位置（点此开启定位）";
+        return originProblem.isEmpty() ? "当前位置" : "当前位置（" + originProblem + "）";
+    }
+    private boolean locationAllowed() {
+        return activity.checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            || activity.checkSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED;
+    }
+    /** Resolves the phone's position to an address: every 3 minutes while visible, or 1 minute after a failure. */
+    private void locateOrigin(boolean force) {
+        if (closed || locatingOrigin || !"gps".equals(originMode) || !locationAllowed()) return;
+        long now = SystemClock.elapsedRealtime();
+        if (!force && now - originAttemptAt < (currentPlace == null ? 60_000 : 180_000)) return;
+        ApiClient api = client.get(); if (api == null || api.vault.token().isEmpty()) return;
+        String token = api.vault.token(); long current = generation;
+        originAttemptAt = now; locatingOrigin = true; update();
+        queries.execute(() -> {
+            JSONObject place = null; String problem = "";
+            try {
+                JSONObject fix = MeetingStartLocation.capture(activity, api, visible);
+                LocationSnapshot snap = fix == null ? null : LocationSnapshot.parse(fix.toString());
+                if (snap == null || !snap.usable(System.currentTimeMillis(), 120_000)) problem = "暂未获得定位";
+                else {
+                    JSONObject data = api.json("POST", "/v1/maps/reverse", fix);
+                    if (data.optBoolean("available")) place = data; else problem = data.optString("reason", "无法识别当前位置");
+                }
+            } catch (Exception e) { problem = "定位失败"; }
+            JSONObject found = place; String reason = problem;
+            ui.post(() -> {
+                locatingOrigin = false;
+                if (!current(api, token, current)) return;
+                if (found != null) currentPlace = found;
+                originProblem = reason; update();
+            });
+        });
+    }
     private boolean editable() { if (journey.optBoolean("active")) { notice = "请先结束本次通勤，再修改起终点"; update(); return false; } return !mutating; }
     private void update() {
         if (stationStatus != null) stationStatus.setText(CommuteService.reminderStatus(client.get()));
         if (originButton == null) return;
-        originButton.setText("起点  ·  " + ("gps".equals(originMode) ? "当前位置" : origin == null ? "选择自定义起点" : origin.optString("name")));
+        originButton.setText("起点  ·  " + ("gps".equals(originMode) ? gpsOrigin() : origin == null ? "选择自定义起点" : origin.optString("name")));
         destinationButton.setText("终点  ·  " + (destination == null ? "选择目的地" : destination.optString("name")));
         transportButton.setText("出行方式  ·  " + methodName(transport));
         boolean running = CommuteService.running(client.get()), active = journey.optBoolean("active");
@@ -681,7 +734,8 @@ final class CommutePanel implements AutoCloseable {
     }
     private void resetViews() {
         speaker.stop(); briefingVersion++; dialogueJourney = ""; mapPanel.reset(); navigationOpenedAt = -2000;
-        generation++; addressesVersion++; journeyVersion++; addressWrites = 0; addressesNeedReload = addressRefreshInFlight = false; pendingJourneyId = ""; loaded = loading = mutating = stopping = false; addresses = new JSONArray(); journey = new JSONObject(); origin = destination = null; originMode = "gps"; transport = "driving"; notice = ""; permissionAction = null; lastRender = "";
+        generation++; addressesVersion++; journeyVersion++; addressWrites = 0; addressesNeedReload = addressRefreshInFlight = false; pendingJourneyId = ""; loaded = loading = mutating = stopping = false; addresses = new JSONArray(); journey = new JSONObject(); origin = destination = null; originMode = "gps";
+        currentPlace = null; originAttemptAt = -600_000; locatingOrigin = false; originProblem = ""; transport = "driving"; notice = ""; permissionAction = null; lastRender = "";
         for (Dialog dialog : new ArrayList<>(dialogs)) dialog.dismiss(); addressRows = null;
     }
     void reset() { CommuteService.stop(activity); resetViews(); account = ""; }
