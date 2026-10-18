@@ -63,8 +63,11 @@ class MobileRuntimes:
         self.config, self.directory, self.capacity = config, Path(directory), capacity
         self.items = {}
 
-    @asynccontextmanager
-    async def use(self, user_id, wait_seconds=0):
+    def obtain(self, user_id):
+        """The account's orchestrator without acquiring its business lock.
+
+        Snapshot reads must not queue behind a live turn; creation and idle
+        eviction follow the same capacity rules as the locking path."""
         runtime = self.items.get(user_id)
         if runtime is None:
             if len(self.items) >= self.capacity:
@@ -73,6 +76,11 @@ class MobileRuntimes:
                     raise HTTPException(503, '服务器繁忙，请稍后重试')
                 del self.items[idle]
             runtime = self.items[user_id] = MobileRuntime(self.config, self.directory / (user_id + '.sqlite3'))
+        return runtime
+
+    @asynccontextmanager
+    async def use(self, user_id, wait_seconds=0):
+        runtime = self.obtain(user_id)
         if runtime.lock.locked() and not wait_seconds:
             raise HTTPException(409, '你的上一项操作仍在进行，请稍后再试')
         try:
