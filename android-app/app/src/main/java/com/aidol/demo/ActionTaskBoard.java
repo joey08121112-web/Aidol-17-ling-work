@@ -71,7 +71,10 @@ final class ActionTaskBoard implements AutoCloseable {
                         public boolean onPreDraw() {
                             if (viewport.getViewTreeObserver().isAlive()) viewport.getViewTreeObserver().removeOnPreDrawListener(this);
                             View anchor = list.findViewWithTag(id);
-                            if (anchor != null && anchor.isAttachedToWindow()) { int[] now = new int[2]; anchor.getLocationOnScreen(now); viewport.scrollBy(0, now[1] - top); }
+                            if (viewport == scroll && list == rows && list.isAttachedToWindow() && list.isShown()
+                                    && anchor != null && anchor.isAttachedToWindow() && anchor.isShown()) {
+                                int[] now = new int[2]; anchor.getLocationOnScreen(now); viewport.scrollBy(0, now[1] - top);
+                            }
                             return true;
                         }
                     });
@@ -233,7 +236,8 @@ final class ActionTaskBoard implements AutoCloseable {
             sync(latest, true);
             if (!latest.toString().equals(tasks.toString())) {
                 tasks = latest; changed.accept(tasks); updateCount();
-                if (rows != null && rows.isAttachedToWindow()) { Runnable restore = preserveTaskPosition ? preserveViewport() : () -> {}; rows.removeAllViews(); for (int i = 0; i < tasks.length(); i++) row(tasks.optJSONObject(i), false); emptyState(); restore.run(); }
+                // Detached rows may belong to a cached work tab that will be reattached unchanged.
+                if (rows != null) { Runnable restore = preserveTaskPosition ? preserveViewport() : () -> {}; rows.removeAllViews(); for (int i = 0; i < tasks.length(); i++) row(tasks.optJSONObject(i), false); emptyState(); restore.run(); }
             }
         }, () -> {}); }
     @Override public void close() { if (addDialog != null) addDialog.dismiss(); closed = true; worker.shutdownNow(); }

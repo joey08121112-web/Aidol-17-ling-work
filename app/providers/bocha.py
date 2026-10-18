@@ -46,18 +46,19 @@ class BochaSearch:
         if not self.config.bocha_key:
             return {"available": False, "source": "bocha", "results": [], "reason": "尚未配置博查搜索 Key"}
         try:
-            async with httpx.AsyncClient(timeout=12, proxy=self.config.proxy) as client:
-                async with client.stream("POST", "https://api.bochaai.com/v1/web-search",
-                        headers={"Authorization": "Bearer " + self.config.bocha_key},
-                        json={"query": query, "freshness": freshness, "count": count, "summary": True}) as response:
-                    response.raise_for_status()
-                    raw = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        raw.extend(chunk)
-                        if len(raw) > 1024 * 1024:
-                            raise ValueError()
-                    import json
-                    body = json.loads(raw)
+            client = self.config.http_pool.client("bocha", timeout=12, proxy=self.config.proxy)
+            async with client.stream("POST", "https://api.bochaai.com/v1/web-search",
+                    headers={"Authorization": "Bearer " + self.config.bocha_key},
+                    json={"query": query, "freshness": freshness, "count": count, "summary": True},
+                    timeout=12) as response:
+                response.raise_for_status()
+                raw = bytearray()
+                async for chunk in response.aiter_bytes():
+                    raw.extend(chunk)
+                    if len(raw) > 1024 * 1024:
+                        raise ValueError()
+                import json
+                body = json.loads(raw)
             if not isinstance(body, dict) or str(body.get("code", 200)) != "200":
                 raise ValueError()
             data = body.get("data", body)

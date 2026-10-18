@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 import os
 from dotenv import load_dotenv
+from .providers.http import HttpClientPool
 from .providers.volc_speech import VolcSpeechConfig
 from .providers.qwen_realtime import QwenRealtimeConfig
 from .providers.qwen_work_asr import QwenWorkAsrConfig
@@ -21,6 +22,9 @@ class Config:
     qwen: QwenRealtimeConfig = field(default_factory=QwenRealtimeConfig.from_env)
     work_asr: QwenWorkAsrConfig = field(default_factory=QwenWorkAsrConfig.from_env)
     asr_mode: str = field(default_factory=lambda: os.getenv("SPEECH_ASR_MODE", "stream"))
+    # Shared vendor clients ride on the config so per-request service instances
+    # reuse them; one pool per app instance, closed via await config.http_pool.aclose().
+    http_pool: HttpClientPool = field(default_factory=HttpClientPool, repr=False, compare=False)
 
     def capabilities(self):
         return {"text_llm": bool(self.text_key and self.text_model), "amap": bool(self.amap_key),

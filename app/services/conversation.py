@@ -15,16 +15,17 @@ class ConversationService:
         if self.tool_runner is not None:
             return await self._tool_reply(text, instructions, history)
         try:
-            async with httpx.AsyncClient(timeout=15, proxy=self.config.proxy) as client:
-                result = await client.post(self.config.text_url.rstrip('/') + '/chat/completions',
-                    headers={'Authorization': 'Bearer ' + self.config.text_key},
-                    json={'model': self.config.text_model, 'thinking': {'type': 'disabled'},
-                          'temperature': 0.5, 'max_tokens': 240,
-                          'messages': [{'role': 'system', 'content': instructions + ' 用简短中文回应，通常不超过80字。'}]
-                                      + (history or []) + [{'role': 'user', 'content': text}]})
-                result.raise_for_status()
-                content = result.json()['choices'][0]['message']['content']
-                return content.strip() if isinstance(content, str) else None
+            client = self.config.http_pool.client('text', timeout=15, proxy=self.config.proxy)
+            result = await client.post(self.config.text_url.rstrip('/') + '/chat/completions',
+                headers={'Authorization': 'Bearer ' + self.config.text_key},
+                json={'model': self.config.text_model, 'thinking': {'type': 'disabled'},
+                      'temperature': 0.5, 'max_tokens': 240,
+                      'messages': [{'role': 'system', 'content': instructions + ' 用简短中文回应，通常不超过80字。'}]
+                                  + (history or []) + [{'role': 'user', 'content': text}]},
+                timeout=15)
+            result.raise_for_status()
+            content = result.json()['choices'][0]['message']['content']
+            return content.strip() if isinstance(content, str) else None
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError):
             return None
 
@@ -39,14 +40,15 @@ class ConversationService:
             ' 自然承接上一轮，不要每轮寒暄或机械复述；说明必要的资料来源和不确定性。'}] + (history or []) + [{'role': 'user', 'content': text}]
         calls_used = 0
         try:
-            async with asyncio.timeout(45), httpx.AsyncClient(timeout=15, proxy=self.config.proxy) as client:
+            async with asyncio.timeout(45):
+                client = self.config.http_pool.client('text', timeout=15, proxy=self.config.proxy)
                 for round_number in range(4):
                     body = {'model': self.config.text_model, 'thinking': {'type': 'disabled'},
                         'temperature': 0.3, 'max_tokens': 500, 'messages': messages}
                     if round_number < 3 and calls_used < 6:
                         body.update(tools=runner.schemas(), tool_choice='auto')
                     response = await client.post(self.config.text_url.rstrip('/') + '/chat/completions',
-                        headers={'Authorization': 'Bearer ' + self.config.text_key}, json=body)
+                        headers={'Authorization': 'Bearer ' + self.config.text_key}, json=body, timeout=15)
                     response.raise_for_status()
                     message = response.json()['choices'][0]['message']
                     calls = message.get('tool_calls') or []

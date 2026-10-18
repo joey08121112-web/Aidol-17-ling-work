@@ -8,6 +8,7 @@ import wave
 
 import httpx
 
+from .http import HttpClientPool
 from .volc_speech import AsrResult, SpeechProviderError
 
 
@@ -17,6 +18,9 @@ class QwenWorkAsrConfig:
     url: str = 'https://maas.qianwenaiapi.com/api/v1/services/aigc/multimodal-generation/generation'
     model: str = 'qwen-audio-3.1-asr-flash'
     proxy: str | None = None
+    # Shared HTTP client pool; one instance per app because app Config builds
+    # this config once, and the meeting transcription provider reuses it too.
+    http_pool: HttpClientPool = field(default_factory=HttpClientPool, repr=False, compare=False)
 
     @classmethod
     def from_env(cls):
@@ -64,17 +68,17 @@ class QwenWorkAsrProvider:
                 base64.b64encode(buffer.getvalue()).decode('ascii')}}]}]},
             'parameters': {'format': 'wav', 'sample_rate': '16000', 'speaker_diarization_enabled': True}}
         try:
-            async with httpx.AsyncClient(timeout=55, proxy=self.config.proxy) as client:
-                response = await client.post(self.config.url, json=payload, headers={
-                    'Authorization': 'Bearer ' + self.config.api_key, 'X-DashScope-SSE': 'disable'})
-                # This service uses HTTP 400 for a successful no-speech observation.
-                if response.status_code == 400:
-                    error = response.json()
-                    if error.get('code') == 'CLIENT_ERROR' and error.get('message') == 'ASR_RESPONSE_HAVE_NO_WORDS':
-                        yield AsrResult('', final=True)
-                        return
-                response.raise_for_status()
-                output = response.json()['output']
+            client = self.config.http_pool.client('qwen_work_asr', timeout=55, proxy=self.config.proxy)
+            response = await client.post(self.config.url, json=payload, timeout=55, headers={
+                'Authorization': 'Bearer ' + self.config.api_key, 'X-DashScope-SSE': 'disable'})
+            # This service uses HTTP 400 for a successful no-speech observation.
+            if response.status_code == 400:
+                error = response.json()
+                if error.get('code') == 'CLIENT_ERROR' and error.get('message') == 'ASR_RESPONSE_HAVE_NO_WORDS':
+                    yield AsrResult('', final=True)
+                    return
+            response.raise_for_status()
+            output = response.json()['output']
             text = output['text']
             if not isinstance(text, str):
                 raise ValueError('Invalid transcription')

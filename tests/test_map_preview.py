@@ -114,3 +114,46 @@ async def test_image_proxy_rejects_errors_and_oversize_without_leaking_key(conte
     async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(status, content=content))) as client:
         with pytest.raises(ValueError) as error: await amap_image(client, 'private', {})
         assert 'private' not in str(error.value) and 'https://' not in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_preview_points_routes_and_images_reuse_owned_http_pools(config, monkeypatch):
+    """Merge guard: the new preview path retains shared clients and route geometry."""
+    config.amap_key = 'offline-map-key'
+    created, hits = [], []
+    real_client = httpx.AsyncClient
+    image = b'\x89PNG\r\n\x1a\nfixture'
+
+    def handler(request):
+        hits.append(request.url.path)
+        if request.url.path.endswith('/convert'):
+            return httpx.Response(200, json={'status': '1', 'locations': '116.405,39.902'})
+        if request.url.path.endswith('/driving'):
+            assert request.url.params['strategy'] == '11'
+            assert request.url.params['origin'] == '116.405,39.902'
+            return httpx.Response(200, json={'status': '1', 'route': {'paths': [
+                {'distance': '3000', 'duration': '200'},
+                {'distance': '2000', 'duration': '300', 'steps': [{'polyline': '116.405,39.902;116.4,39.9'}]},
+            ]}})
+        assert request.url.path == '/v3/staticmap'
+        assert '116.405000,39.902000' in request.url.params['paths']
+        return httpx.Response(200, content=image)
+
+    def factory(**kwargs):
+        client = real_client(transport=httpx.MockTransport(handler))
+        created.append((kwargs['timeout'], client))
+        return client
+
+    monkeypatch.setattr(httpx, 'AsyncClient', factory)
+    for _ in range(2):
+        # Endpoints construct fresh MapService objects but retain config-owned transports.
+        point = await MapService(config).map_point(LocationInput(longitude=116.4, latitude=39.9))
+        route = await MapService(config).route(LocationInput(**point),
+            Settings(destination_lon=116.4, destination_lat=39.9), origin_gcj=True, prefer_shorter=True)
+        assert route['distance_meters'] == 2000 and route['geometry'] == [[[116.405, 39.902], [116.4, 39.9]]]
+        snapshot = MapSnapshot(origin=point, destination=PLACE, paths=route['geometry'])
+        assert await MapService(config).snapshot(snapshot) == (image, 'image/png')
+    assert [timeout for timeout, _ in created] == [10, 12]
+    assert len(hits) == 6 and all(not client.is_closed for _, client in created)
+    await config.http_pool.aclose()
+    assert all(client.is_closed for _, client in created)

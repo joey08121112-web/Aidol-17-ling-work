@@ -70,6 +70,7 @@ final class CommutePanel implements AutoCloseable {
     }
     private void track(Dialog dialog) {
         ScrollView page = viewport.get();
+        View pageContent = page == null || page.getChildCount() == 0 ? null : page.getChildAt(0);
         int y = page == null ? 0 : page.getScrollY();
         dialogs.add(dialog);
         dialog.setOnDismissListener(d -> {
@@ -81,7 +82,7 @@ final class CommutePanel implements AutoCloseable {
             page.getViewTreeObserver().addOnPreDrawListener(new ViewTreeObserver.OnPreDrawListener() {
                 public boolean onPreDraw() {
                     if (page.getViewTreeObserver().isAlive()) page.getViewTreeObserver().removeOnPreDrawListener(this);
-                    if (page == viewport.get()) page.scrollTo(0, y);
+                    if (page == viewport.get() && page.getChildCount() > 0 && page.getChildAt(0) == pageContent) page.scrollTo(0, y);
                     return true;
                 }
             });
@@ -205,7 +206,13 @@ final class CommutePanel implements AutoCloseable {
             text(summary, "更新于 " + TimeFormat.format(active ? journey.optString("updated_at") : route.optString("fetched_at")) + (journey.optString("error").isEmpty() ? "" : "\n更新失败，以上为上次估算"), 12, EditorUi.MUTED);
             button(summary, "查看路线详情", false, () -> routeDetails(route));
         } else text(summary, active ? "等待定位与路线结果…" : "选择起终点后自动显示路线，点击开始通勤持续更新。", 14, EditorUi.MUTED);
-        if (pageScroll != null) { ScrollView viewport = pageScroll; viewport.post(() -> viewport.scrollTo(0, y)); }
+        if (pageScroll != null && summary.isAttachedToWindow() && summary.isShown()) {
+            ScrollView viewport = pageScroll; LinearLayout routeSummary = summary;
+            viewport.post(() -> {
+                if (viewport == pageScroll && routeSummary == summary && routeSummary.isAttachedToWindow() && routeSummary.isShown())
+                    viewport.scrollTo(0, y);
+            });
+        }
     }
     private void updateNavigation(boolean active, boolean running) {
         navigationButton.setVisibility(active ? View.VISIBLE : View.GONE);

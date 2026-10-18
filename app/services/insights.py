@@ -185,21 +185,21 @@ class MeetingInsights:
         result = None
         if records and self.config.text_key and self.config.text_model:
             try:
-                async with httpx.AsyncClient(timeout=25, proxy=self.config.proxy) as client:
-                    response = await client.post(
-                        self.config.text_url.rstrip("/") + "/chat/completions",
-                        headers={"Authorization": f"Bearer {self.config.text_key}"},
-                        json={"model": self.config.text_model, "temperature": 0.1, "max_tokens": 3000,
-                              "thinking": {"type": "disabled"}, "response_format": {"type": "json_object"},
-                              "messages": [{"role": "system", "content": _PROMPT},
-                                           {"role": "user", "content": json.dumps({"transcripts": records}, ensure_ascii=False)}]},
-                    )
-                    response.raise_for_status()
-                    raw = response.json()["choices"][0]["message"]["content"]
-                    if not isinstance(raw, str) or len(raw) > 24000:
-                        raise ValueError("Invalid model output size")
-                    result = _validate(json.loads(raw), records)
-                    extraction = "llm"
+                client = self.config.http_pool.client("text", timeout=25, proxy=self.config.proxy)
+                response = await client.post(
+                    self.config.text_url.rstrip("/") + "/chat/completions",
+                    headers={"Authorization": f"Bearer {self.config.text_key}"},
+                    json={"model": self.config.text_model, "temperature": 0.1, "max_tokens": 3000,
+                          "thinking": {"type": "disabled"}, "response_format": {"type": "json_object"},
+                          "messages": [{"role": "system", "content": _PROMPT},
+                                       {"role": "user", "content": json.dumps({"transcripts": records}, ensure_ascii=False)}]},
+                    timeout=25)
+                response.raise_for_status()
+                raw = response.json()["choices"][0]["message"]["content"]
+                if not isinstance(raw, str) or len(raw) > 24000:
+                    raise ValueError("Invalid model output size")
+                result = _validate(json.loads(raw), records)
+                extraction = "llm"
             except (httpx.HTTPError, ValueError, KeyError, TypeError, IndexError, AttributeError):
                 extraction = "rules_fallback"
         if result is None:

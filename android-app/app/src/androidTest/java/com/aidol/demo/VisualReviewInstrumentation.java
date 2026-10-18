@@ -29,6 +29,19 @@ public final class VisualReviewInstrumentation extends Instrumentation {
         start();
     }
 
+    @Override public void callActivityOnCreate(android.app.Activity target, Bundle state) {
+        super.callActivityOnCreate(target, state);
+        if (!"life".equals(prefix) || !(target instanceof MainActivity)) return;
+        try {
+            // Current empty-vault loading returns without settling its latch. Settle only this
+            // signed-out fixture's in-memory state so maintenance ticks do not starve UI idle.
+            Field apiField = MainActivity.class.getDeclaredField("api"); apiField.setAccessible(true);
+            ApiClient fixture = (ApiClient) apiField.get(target);
+            Field vaultState = AuthVault.class.getDeclaredField("state"); vaultState.setAccessible(true);
+            ((AuthVault.VaultState) vaultState.get(fixture.vault)).clear();
+        } catch (ReflectiveOperationException error) { throw new IllegalStateException(error); }
+    }
+
     @Override public void onStart() {
         Bundle result = new Bundle();
         try {
@@ -38,6 +51,13 @@ public final class VisualReviewInstrumentation extends Instrumentation {
             output = new File(getTargetContext().getExternalFilesDir(null), "visual-review");
             if (!output.isDirectory() && !output.mkdirs()) throw new IllegalStateException("Cannot create output directory");
             activity = (MainActivity) startActivitySync(new Intent(getTargetContext(), MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+            if ("life".equals(prefix)) {
+                reviewLifeConversation();
+                runOnMainSync(() -> activity.finish());
+                result.putString("stream", "PASS: life transcript alignment, pinned modes/orb/controls, streaming replacement, unsaved turns, draft across tabs/modes, keyboard, settings and end button. Offline UI fixtures only. Screenshots: " + output);
+                finish(android.app.Activity.RESULT_OK, result);
+                return;
+            }
             if ("meetings".equals(prefix)) {
                 reviewWorkMeetings();
                 runOnMainSync(() -> activity.finish());
@@ -61,12 +81,10 @@ public final class VisualReviewInstrumentation extends Instrumentation {
             });
             capture("03-conversation");
             onMain(() -> {
-                TextView toggle = findText(activity.getWindow().getDecorView(), "通话设置");
-                if (toggle == null) throw new AssertionError("Missing listening disclosure");
-                toggle.performClick();
+                invoke("showLifeCallSettings", new Class<?>[]{});
                 TextView manual = (TextView) get("voiceHint");
                 if (manual == null || !manual.isShown()) throw new AssertionError("Listening options cannot be opened");
-                toggle.performClick();
+                ((android.app.AlertDialog) get("sourceDialog")).dismiss();
                 if (manual.isShown()) throw new AssertionError("Listening options cannot be closed");
             });
             String[] pages = {"conversation", "memories", "work", "commute", "profile"};
@@ -226,6 +244,102 @@ public final class VisualReviewInstrumentation extends Instrumentation {
         });
         capture("05-retry-fallback");
     }
+    private void reviewLifeConversation() throws Exception {
+        onMain(() -> {
+            set("state", new JSONObject("{\"settings\":{\"mode\":\"life\"},\"agent\":{\"mode\":\"life\"},\"transcripts\":[],\"capabilities\":{}}"));
+            set("tab", 0); invoke("showApp", new Class<?>[]{});
+        });
+        capture("00-empty");
+        onMain(() -> {
+            if (findText(activity.getWindow().getDecorView(), "你的随身 AI 伙伴") != null)
+                throw new AssertionError("Legacy hero still occupies the life transcript");
+            invoke("showLifeCallSettings", new Class<?>[]{});
+        });
+        capture("01-settings");
+        getUiAutomation().performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK);
+        waitForIdleSync();
+        onMain(() -> {
+            JSONObject fixture = (JSONObject) get("state");
+            org.json.JSONArray history = new org.json.JSONArray();
+            history.put(new JSONObject().put("speaker", "user").put("text", "今天想慢下来，去附近走走。"));
+            history.put(new JSONObject().put("speaker", "assistant").put("text", "那就留一点时间给自己。想去公园散散步，还是找一家安静的咖啡馆？"));
+            history.put(new JSONObject().put("speaker", "user").put("text", "去公园吧，想晒晒太阳。"));
+            history.put(new JSONObject().put("speaker", "assistant").put("text", "好啊，走一走，也让脑子休息一下。"));
+            fixture.put("transcripts", history); invoke("showApp", new Class<?>[]{});
+        });
+        capture("02-conversation");
+        onMain(() -> {
+            TextView user = findText((View) get("content"), "今天想慢下来");
+            TextView assistant = findText((View) get("content"), "那就留一点时间");
+            if (screenX(user) <= screenX(assistant)) throw new AssertionError("User message is not aligned right");
+            if (assistant.getBackground() != null) throw new AssertionError("Assistant should be plain text");
+            if (((View) get("composer")).getParent() == get("page")) throw new AssertionError("Voice controls scroll with messages");
+            ((EditText) get("chatInput")).setText("尚未发送的草稿");
+            invoke("switchTab", new Class<?>[]{int.class}, 1);
+            invoke("switchTab", new Class<?>[]{int.class}, 0);
+            if (!"尚未发送的草稿".contentEquals(((EditText) get("chatInput")).getText())) throw new AssertionError("Tab switch lost draft");
+            JSONObject fixture = (JSONObject) get("state");
+            fixture.getJSONObject("agent").put("mode", "work"); fixture.getJSONObject("settings").put("mode", "work");
+            invoke("renderModeSelection", new Class<?>[]{});
+            if ((Boolean) get("lifeConversationLayout")) throw new AssertionError("Work inherited life layout");
+            fixture.getJSONObject("agent").put("mode", "commute"); fixture.getJSONObject("settings").put("mode", "commute");
+            invoke("renderModeSelection", new Class<?>[]{});
+            if ((Boolean) get("lifeConversationLayout")) throw new AssertionError("Commute inherited life layout");
+            fixture.getJSONObject("agent").put("mode", "life"); fixture.getJSONObject("settings").put("mode", "life");
+            invoke("renderModeSelection", new Class<?>[]{});
+            if (!"尚未发送的草稿".contentEquals(((EditText) get("chatInput")).getText())) throw new AssertionError("Mode switch lost draft");
+            ((EditText) get("chatInput")).setText("");
+            invoke("newSession", new Class<?>[]{}); // Allocate only: no capture, sockets or model call.
+            if (!"正在准备…".contentEquals(((View) get("voiceButton")).getContentDescription())) throw new AssertionError("Missing accessible call state");
+            ConversationFeed feed = (ConversationFeed) get("conversationFeed");
+            feed.transcript("周末"); feed.reply("可以"); invoke("renderLiveTurn", new Class<?>[]{});
+            Object userBubble = get("liveUserBubble"), assistantBubble = get("liveAssistantBubble");
+            feed.transcript("周末想出去走走。"); feed.reply("可以去公园，或者沿河散步。"); invoke("renderLiveTurn", new Class<?>[]{});
+            if (userBubble != get("liveUserBubble") || assistantBubble != get("liveAssistantBubble")) throw new AssertionError("Partial updates recreated bubbles");
+            invoke("acceptBusinessResult", new Class<?>[]{JSONObject.class}, new JSONObject().put("text", feed.user()).put("response", feed.reply()));
+            if (get("liveTurn") != null) throw new AssertionError("Final result duplicated streaming turn");
+        });
+        capture("03-active-call");
+        onMain(() -> {
+            ((View) get("voiceButton")).performClick();
+            if (get("session") != null) throw new AssertionError("End control did not cancel the session");
+            JSONObject fixture = (JSONObject) get("state");
+            fixture.getJSONObject("settings").put("retain_transcripts", false);
+            invoke("acceptBusinessResult", new Class<?>[]{JSONObject.class}, new JSONObject().put("text", "这句不保存").put("response", "仅在本次显示。"));
+            invoke("showApp", new Class<?>[]{});
+            if (findText((View) get("content"), "这句不保存") == null) throw new AssertionError("Unsaved turn vanished after rebuilding");
+            // Long history must scroll independently of the top selector and bottom controls.
+            org.json.JSONArray history = fixture.getJSONArray("transcripts");
+            for (int i = 0; i < 12; i++) history.put(new JSONObject().put("speaker", i % 2 == 0 ? "user" : "assistant").put("text", "公开测试对话 " + i + "，用于检查长对话滚动及底部操作。"));
+            invoke("showApp", new Class<?>[]{});
+        });
+        capture("04-long-history");
+        final int[] positions = new int[2];
+        onMain(() -> {
+            positions[0] = screenY((View) get("modeChoices")); positions[1] = screenY((View) get("orb"));
+            ((android.widget.ScrollView) get("scroll")).scrollTo(0, 0);
+        });
+        waitForIdleSync();
+        onMain(() -> {
+            if (positions[0] != screenY((View) get("modeChoices")) || positions[1] != screenY((View) get("orb"))) throw new AssertionError("Scroll moved pinned controls");
+            EditText draft = (EditText) get("chatInput"); draft.requestFocus(); draft.setText("键盘打开时也能发送");
+            ((android.view.inputmethod.InputMethodManager) activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE)).showSoftInput(draft, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT);
+        });
+        SystemClock.sleep(700); capture("05-keyboard");
+        onMain(() -> {
+            View voice = (View) get("voiceButton");
+            android.graphics.Rect visible = new android.graphics.Rect(); activity.getWindow().getDecorView().getWindowVisibleDisplayFrame(visible);
+            if (screenY(voice) + voice.getHeight() > visible.bottom) throw new AssertionError("Keyboard covers voice control");
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                if (!activity.getWindow().getDecorView().getRootWindowInsets().isVisible(android.view.WindowInsets.Type.ime())) throw new AssertionError("Keyboard fixture did not open the IME");
+                if (((View) get("orb")).isShown() || ((View) get("bottomNavigation")).isShown()) throw new AssertionError("Keyboard did not free transcript space");
+            }
+            invoke("hideKeyboard", new Class<?>[]{});
+        });
+    }
+    private int screenX(View view) { int[] p = new int[2]; view.getLocationOnScreen(p); return p[0]; }
+    private int screenY(View view) { int[] p = new int[2]; view.getLocationOnScreen(p); return p[1]; }
+
     private void onMain(Checked operation) throws Exception {
         Throwable[] failure = {null};
         runOnMainSync(() -> { try { operation.run(); } catch (Throwable error) { failure[0] = error; } });

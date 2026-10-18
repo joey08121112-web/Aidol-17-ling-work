@@ -106,9 +106,44 @@ public final class WorkCommuteUiInstrumentation extends Instrumentation {
             main(()->{((ScrollView)field(activity,"scroll")).fullScroll(View.FOCUS_DOWN);});SystemClock.sleep(250);capture("04-destination-weather");
             main(()->{invoke(activity,"switchTab",2);quiet();});
             check(field(map,"planTask")==null&&field(map,"mapTask")==null&&field(map,"weatherTask")==null,"Off-page requests not cancelled");
+            // The merged scaffold caches pages inside one shared ScrollView. Returning must
+            // restore each tab without stale callbacks or task-notification state mismatches.
+            ScrollView shared=(ScrollView)field(activity,"scroll");
+            Object cachedWork=((LinearLayout[])field(activity,"tabViews"))[2];
+            main(()->shared.scrollTo(0,350));SystemClock.sleep(150);int workY=shared.getScrollY();
+            main(()->{invoke(activity,"switchTab",3);quiet();});SystemClock.sleep(200);
+            main(()->shared.scrollTo(0,100));SystemClock.sleep(100);
+            main(()->{invoke(activity,"switchTab",2);quiet();});SystemClock.sleep(250);
+            check(field(activity,"scroll")==shared&&((LinearLayout[])field(activity,"tabViews"))[2]==cachedWork,"Clean tab switch discarded cached work page");
+            check(shared.getScrollY()==workY,"Cached tab switch lost work scroll");
+            main(()->{invoke(activity,"switchTab",3);quiet();});SystemClock.sleep(200);
+            main(()->activity.onNewIntent(new Intent().putExtra("open_work_tasks",true)));SystemClock.sleep(250);
+            main(()->onlySection(2));check(((Integer)field(activity,"workSection"))==2,"Task notification did not select cached task module");
+            main(()->{
+                shared.scrollTo(0,300);
+                set(panel,"journey",new JSONObject().put("error","hidden-summary-change"));invoke(panel,"update");
+                shared.scrollTo(0,120);
+            });SystemClock.sleep(250);
+            check(shared.getScrollY()==120,"Detached commute summary scrolled the visible work page");
+            main(()->{
+                invoke(activity,"restoreWorkScroll",shared,300);
+                invoke(activity,"switchTab",3);quiet();shared.scrollTo(0,100);
+            });SystemClock.sleep(250);
+            check(shared.getScrollY()==100,"Queued work viewport restoration scrolled a different cached page");
+            JSONArray updatedTasks=new JSONArray(state.getJSONArray("tasks").toString()).put(new JSONObject().put("id","fixture-added-off-page").put("content","后台更新的行动项").put("status","open"));
+            main(()->{state.put("tasks",updatedTasks);((ActionTaskBoard)field(activity,"taskBoard")).refreshReminders();});
+            waitUntil(()->find((View)cachedWork,"后台更新的行动项")!=null,4000,"Detached cached task rows did not accept refreshed tasks");
+            main(()->{invoke(activity,"switchTab",2);quiet();});SystemClock.sleep(200);main(()->onlySection(2));
+            check(find(activity.getWindow().getDecorView(),"后台更新的行动项")!=null,"Returning to cached work tab showed stale tasks");
+            main(()->{state.getJSONObject("settings").put("mode","life");((boolean[])field(activity,"tabDirty"))[0]=true;invoke(activity,"switchTab",0);quiet();});SystemClock.sleep(200);
+            check((Boolean)field(activity,"lifeConversationLayout"),"Life fixture did not build life layout");
+            main(()->{invoke(activity,"switchTab",3);quiet();state.getJSONObject("settings").put("mode","commute");invoke(activity,"renderModeSelection");});
+            check(((boolean[])field(activity,"tabDirty"))[0],"Off-page commute mode change left cached life content valid");
+            main(()->{invoke(activity,"switchTab",0);quiet();});SystemClock.sleep(200);
+            check(!(Boolean)field(activity,"lifeConversationLayout"),"Returning conversation kept stale life mode layout");
             check(failure.get()==null,"Fixture error: "+failure.get());check(writes.get()==2,"Unexpected non-preview mutation: "+writes.get());
             check(getTargetContext().getSystemService(android.media.AudioManager.class).getActiveRecordingConfigurations().isEmpty(),"Unexpected recording");
-            result.putString("stream","PASS: three exclusive mounted work tabs; remembered scroll; checkbox stable; delayed checkbox reply preserves another section; compact selectors; map before controls; preview and auto destination weather; stale responses ignored; tab exit cancels requests; no recording/journey writes. previews="+previews+", maps="+maps+", weather="+weather);code=Activity.RESULT_OK;
+            result.putString("stream","PASS: three exclusive mounted work tabs; remembered scroll; checkbox stable; delayed checkbox reply preserves another section; compact selectors; map before controls; preview and auto destination weather; stale responses ignored; tab exit cancels requests; cached tab scroll/task notification/off-page task refresh; detached commute callback and queued work restore cannot move another tab; off-page mode change invalidates cached life layout; no recording/journey writes. previews="+previews+", maps="+maps+", weather="+weather);code=Activity.RESULT_OK;
         }catch(Throwable e){result.putString("stream","FAIL: "+android.util.Log.getStackTraceString(e));}
         finally{
             if(activity!=null)try{main(()->{if(panel!=null)panel.close();if(original!=null){set(activity,"api",original);set(activity,"state",originalState);}activity.finish();});}catch(Exception ignored){}

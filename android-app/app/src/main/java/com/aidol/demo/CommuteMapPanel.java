@@ -88,12 +88,13 @@ final class CommuteMapPanel implements AutoCloseable {
         Dialog dialog=EditorUi.dialog(activity,"路线全景",body,footer); enlarged=dialog;
         footer.addView(EditorUi.button(activity,"完成",true,dialog::dismiss));
         ScrollView page=viewport.get(); int y=page==null?0:page.getScrollY();
+        View pageContent=page==null||page.getChildCount()==0?null:page.getChildAt(0);
         dialog.setOnDismissListener(d -> {
             enlarged=null;
             if(page!=null && page==viewport.get() && page.isAttachedToWindow()) {
                 page.clearFocus();
                 page.getViewTreeObserver().addOnPreDrawListener(new android.view.ViewTreeObserver.OnPreDrawListener(){
-                    public boolean onPreDraw(){if(page.getViewTreeObserver().isAlive())page.getViewTreeObserver().removeOnPreDrawListener(this);if(page==viewport.get())page.scrollTo(0,y);return true;}
+                    public boolean onPreDraw(){if(page.getViewTreeObserver().isAlive())page.getViewTreeObserver().removeOnPreDrawListener(this);if(page==viewport.get()&&page.getChildCount()>0&&page.getChildAt(0)==pageContent)page.scrollTo(0,y);return true;}
                 });page.requestLayout();
             }
         });dialog.show();

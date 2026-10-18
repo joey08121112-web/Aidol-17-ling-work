@@ -793,3 +793,12 @@ Android `testDebugUnitTest lintDebug assembleDebug` 成功：159项单测，零�
 - PZ261A Android16最终专项 `WorkCommuteUiInstrumentation` **PASS**：三个分区、原视图复用、返回恢复滚动、勾选及跨模块迟到勾选回执、48dp控件、地图在选择区上方、地图放大关闭位置、自动天气、快速目的地切换的迟到响应隔离、离页取消；3次预览、6次图片、3次天气请求，2次隔离任务PATCH，0次录音/旅程写入。使用MockWebServer和隔离偏好，未操作真实账号业务数据；截图已检查。旧工作专项脚本已适配分区入口，提醒实到、真实来电及3分钟锁屏行程没有在本轮重新实测。
 - 正式高德供应商检查：故宫博物院到天坛公园，返回6213米驾车路线、3条线形和760×420 PNG（60900字节），目的地天气available=true。另经临时账号、临时数据目录的真实已鉴权API链再次检查preview→snapshot→weather，均成功且未创建旅程，临时目录随后清理。该检查仅用公开地标，不证明真实行程导航或所有交通方式在线可用；四种方式候选策略由离线回归覆盖。
 - 本任务8109后端已更新且healthz ok/ready=true；覆盖安装后设备APK与构建一致，SHA-256为 `d1aedf0f811958c867bcc4f91f353ed8f00cc58d46ba2c126422afdc1784bfa3`。该APK同时含同目录另一个任务接入的顶部字标。与本次私有备份逐行核对：会议9、原文259、记忆13、待办4、报告10、设置1、通勤数据2均一致。本轮不推送GitHub。
+## 2026-10-18 生活模式连续对话界面（本地候选）
+
+- 基线：从 `origin/main` 快进同步至 `060747b`，在 `codex/life-conversation-ui` 修改；开始时工作区无未提交文件。
+- 参考用户提供的 `IMG_0485 2.PNG` 对话布局与 `IMG_0486.HEIC` 当前页面照片。顶部三模式选择保留；生活模式采用右侧浅蓝用户气泡、左侧助手正文，底部固定小球、文字输入及接通／结束按钮。设置、耳机详情与诊断收进入口；长按消息保留复制／重播／存为记忆入口。键盘展开收起装饰和导航，为正文留空间。没有增加虚假的静音按钮或修改供应商、采音与打断协议。
+- 软件验证：JBR 21.0.11、Android SDK 35 执行 `testDebugUnitTest lintDebug assembleDebug` 成功，Android 283 项单测通过，Lint 0 errors / 27 warnings；Python 3.14 离线测试 623 passed / 1 warning，`compileall` 通过。
+- 原生 UI 夹具：只读独立模拟器 `emulator-5582`（API 36），独立包 `com.aidol.app.review`，未登录真实账号。标准屏与 320dp 宽／1.3 倍字体两组均通过：正文左右对齐、顶部和底部固定、流式更新复用视图、最终结果替换临时文字、不保存转写时的当前对话、跨页／模式草稿保留、设置弹窗、结束按钮和完整键盘避让。截图已逐张检查。没有执行模型、录音或供应商 API 请求，分配会话对象用于结束按钮测试不等于真实接通。
+- 首次夹具启动阻塞，线程堆栈定位到基线 `AuthVault` 空偏好直接返回而未结束加载 latch，维护回调反复等待。保留首次日志和堆栈；仅在未登录 UI 夹具内结束内存中的空加载状态后重跑通过。没有修改正式账号加载逻辑；该基线问题仍需独立修复。通用历史 UI 夹具及需要 Rise 的硬件专项未重跑。
+- 证据和候选包：忽略目录 `artifacts/life-conversation-ui/`，包含 `android-build-final.log`、`pytest.log`、`compileall.log`、`visual-run-final.log`、`visual-run-320dp-font130.log`、`instrumentation-first-stack.txt`、`final/` 与 `narrow-final/` 截图。`aidol-life-conversation-debug.apk` 为 `com.aidol.app.debug` 开发包，默认本地 USB 服务，连接设置可切换已有远端。本地验收时未安装至 USB 真机、未更新公网 APK、未推送或部署；后续源码提交与合并状态以 Git 记录为准。
+- 待验：本轮真实登录、Rise 采音、语音转写／回复／人耳听音、锁屏与来电断连；Android 8–10 的兼容键盘分支未在旧系统实跑。模拟器与构建结果不替代这些验收。

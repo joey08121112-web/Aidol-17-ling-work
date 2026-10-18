@@ -59,3 +59,15 @@ async def test_backpressure_drops_oldest_without_blocking_audio(bus, store):
 async def test_persisted_event_payload_roundtrips_unicode(bus, store):
     await bus.emit("mode.changed", {"reason": "会议开始", "mode": "work"})
     assert store.list("events")[0]["payload"] == {"reason": "会议开始", "mode": "work"}
+
+
+@pytest.mark.asyncio
+async def test_agent_flow_emits_without_persisting_events(agent, store):
+    # events 表只写不读且无界增长（审计 2026-10-18 W4）；agent 全部事件改为
+    # 仅投递订阅者，-events 表在完整对话流程后保持为空。
+    from app.domain import TextInput
+    result = await agent.ingest(TextInput(text='现在几点了'), directed=True)
+    assert result['interaction'] == 'intent_shortcut'
+    await agent.decide('开始通勤，下一站到了')      # mode.changed + hardware.notice
+    await agent.propose_arrival('测试直达')          # notification.proposed
+    assert store.list("events") == []

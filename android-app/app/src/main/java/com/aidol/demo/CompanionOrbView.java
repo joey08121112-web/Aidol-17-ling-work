@@ -12,16 +12,28 @@ import android.view.View;
 
 /** Decorative, locally rendered voice sculpture. No network assets or audio ownership. */
 final class CompanionOrbView extends View {
+    /** Full frame rate only while the voice level still moves; silence drops to a coarse idle rate. */
+    static final long ACTIVE_FRAME_MILLIS = 40, IDLE_FRAME_MILLIS = 250, LEVEL_HOLD_MILLIS = 1500;
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Path path = new Path();
     private final Rect visibleArea = new Rect();
     private RadialGradient halo, sphere;
     private float radius, cx, cy;
     float level;
+    private float drawnLevel = Float.MIN_VALUE;
+    private long levelMovedAt;
+    private boolean conversationStyle;
 
     CompanionOrbView(Context context) {
         super(context);
         setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
+    }
+
+    void conversationStyle() { conversationStyle = true; }
+
+    /** Full rate while reacting to a recent level change, coarse once idle. */
+    static long frameDelayMillis(long sinceLevelChangeMillis) {
+        return sinceLevelChangeMillis < LEVEL_HOLD_MILLIS ? ACTIVE_FRAME_MILLIS : IDLE_FRAME_MILLIS;
     }
 
     @Override protected void onSizeChanged(int w, int h, int oldw, int oldh) {
@@ -30,15 +42,19 @@ final class CompanionOrbView extends View {
         halo = new RadialGradient(cx, cy, radius * 1.65f,
             new int[]{0x286e9edc, 0x0c96b8e8, 0x0096b8e8}, null, Shader.TileMode.CLAMP);
         sphere = new RadialGradient(cx - radius * .35f, cy - radius * .45f, radius * 1.65f,
-            new int[]{0xffffffff, 0xffeef2f8, 0xffb9c9df, 0xff637f9e},
+            conversationStyle ? new int[]{0xff2459e8, 0xff4c7bf2, 0xffdbe6ff, 0xff91b1f5}
+                : new int[]{0xffffffff, 0xffeef2f8, 0xffb9c9df, 0xff637f9e},
             new float[]{0, .35f, .72f, 1}, Shader.TileMode.CLAMP);
     }
 
     @Override protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
         if (radius <= 0) return;
+        long now = android.os.SystemClock.uptimeMillis();
+        // The meter updates level without invalidating; sampling it here is what keeps the loop reactive.
+        if (level != drawnLevel) { drawnLevel = level; levelMovedAt = now; }
         boolean animate = ValueAnimator.areAnimatorsEnabled();
-        float phase = animate ? (android.os.SystemClock.uptimeMillis() % 18000) / 18000f * 6.283f : 0;
+        float phase = animate ? (now % 18000) / 18000f * 6.283f : 0;
         float pulse = 1 + (float) Math.sin(phase) * .018f + level * .035f;
         canvas.save(); canvas.scale(pulse, pulse, cx, cy);
         paint.setStyle(Paint.Style.FILL); paint.setShader(halo);
@@ -59,7 +75,8 @@ final class CompanionOrbView extends View {
         paint.setColor(0x80ffffff); paint.setStrokeWidth(getResources().getDisplayMetrics().density * .7f);
         canvas.drawCircle(cx, cy, radius, paint);
         canvas.restore();
-        if (animate && isShown() && getWindowVisibility() == VISIBLE && getLocalVisibleRect(visibleArea)) postInvalidateDelayed(40);
+        if (animate && isShown() && getWindowVisibility() == VISIBLE && getLocalVisibleRect(visibleArea))
+            postInvalidateDelayed(frameDelayMillis(now - levelMovedAt));
     }
 
     @Override protected void onWindowVisibilityChanged(int visibility) {

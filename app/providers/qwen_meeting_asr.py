@@ -36,50 +36,50 @@ class QwenMeetingAsrProvider:
             raise SpeechProviderError('Meeting ASR is not configured')
         auth = {'Authorization': 'Bearer ' + self.config.api_key}
         try:
-            async with httpx.AsyncClient(timeout=120, proxy=self.config.proxy) as client:
-                if not task_id:
-                    response = await client.get(self.base + '/uploads', headers=auth,
-                                                params={'action': 'getPolicy', 'model': self.model})
-                    response.raise_for_status()
-                    policy = response.json()['data']
-                    name = uuid4().hex + '.wav'
-                    key = policy['upload_dir'] + '/' + name
-                    fields = {'OSSAccessKeyId': policy['oss_access_key_id'], 'Signature': policy['signature'],
-                              'policy': policy['policy'], 'x-oss-object-acl': policy['x_oss_object_acl'],
-                              'x-oss-forbid-overwrite': policy['x_oss_forbid_overwrite'],
-                              'key': key, 'success_action_status': '200'}
-                    wav.seek(0)
-                    response = await client.post(self._external_url(policy['upload_host']),
-                                                 data=fields, files={'file': (name, wav, 'audio/wav')})
-                    response.raise_for_status()
-                    response = await client.post(self.base + '/services/audio/asr/transcription',
-                        headers={**auth, 'X-DashScope-Async': 'enable', 'X-DashScope-OssResourceResolve': 'enable'},
-                        json={'model': self.model, 'input': {'file_urls': ['oss://' + key]},
-                              'parameters': {'channel_id': [0], 'diarization_enabled': True}})
-                    response.raise_for_status()
-                    task_id = response.json()['output']['task_id']
-                    if not isinstance(task_id, str) or not re.fullmatch(r'[\w-]{1,128}', task_id):
-                        raise ValueError('Invalid task ID')
-                    on_task(task_id)
-                if not re.fullmatch(r'[\w-]{1,128}', task_id):
-                    raise ValueError('Invalid saved task ID')
-                async with asyncio.timeout(1800):
-                    while True:
-                        response = await client.get(self.base + '/tasks/' + task_id, headers=auth)
-                        response.raise_for_status()
-                        output = response.json()['output']
-                        status = output['task_status']
-                        if status == 'SUCCEEDED':
-                            break
-                        if status not in ('PENDING', 'RUNNING'):
-                            raise MeetingTaskFailed('Transcription task failed')
-                        await asyncio.sleep(3)
-                results = output['results']
-                if len(results) != 1 or results[0]['subtask_status'] != 'SUCCEEDED':
-                    raise MeetingTaskFailed('Incomplete transcription')
-                response = await client.get(self._external_url(results[0]['transcription_url']))
+            client = self.config.http_pool.client('qwen_meeting_asr', timeout=120, proxy=self.config.proxy)
+            if not task_id:
+                response = await client.get(self.base + '/uploads', headers=auth,
+                                            params={'action': 'getPolicy', 'model': self.model}, timeout=120)
                 response.raise_for_status()
-                return self.parse(response.json())
+                policy = response.json()['data']
+                name = uuid4().hex + '.wav'
+                key = policy['upload_dir'] + '/' + name
+                fields = {'OSSAccessKeyId': policy['oss_access_key_id'], 'Signature': policy['signature'],
+                          'policy': policy['policy'], 'x-oss-object-acl': policy['x_oss_object_acl'],
+                          'x-oss-forbid-overwrite': policy['x_oss_forbid_overwrite'],
+                          'key': key, 'success_action_status': '200'}
+                wav.seek(0)
+                response = await client.post(self._external_url(policy['upload_host']),
+                                             data=fields, files={'file': (name, wav, 'audio/wav')}, timeout=120)
+                response.raise_for_status()
+                response = await client.post(self.base + '/services/audio/asr/transcription',
+                    headers={**auth, 'X-DashScope-Async': 'enable', 'X-DashScope-OssResourceResolve': 'enable'},
+                    json={'model': self.model, 'input': {'file_urls': ['oss://' + key]},
+                          'parameters': {'channel_id': [0], 'diarization_enabled': True}}, timeout=120)
+                response.raise_for_status()
+                task_id = response.json()['output']['task_id']
+                if not isinstance(task_id, str) or not re.fullmatch(r'[\w-]{1,128}', task_id):
+                    raise ValueError('Invalid task ID')
+                on_task(task_id)
+            if not re.fullmatch(r'[\w-]{1,128}', task_id):
+                raise ValueError('Invalid saved task ID')
+            async with asyncio.timeout(1800):
+                while True:
+                    response = await client.get(self.base + '/tasks/' + task_id, headers=auth, timeout=120)
+                    response.raise_for_status()
+                    output = response.json()['output']
+                    status = output['task_status']
+                    if status == 'SUCCEEDED':
+                        break
+                    if status not in ('PENDING', 'RUNNING'):
+                        raise MeetingTaskFailed('Transcription task failed')
+                    await asyncio.sleep(3)
+            results = output['results']
+            if len(results) != 1 or results[0]['subtask_status'] != 'SUCCEEDED':
+                raise MeetingTaskFailed('Incomplete transcription')
+            response = await client.get(self._external_url(results[0]['transcription_url']), timeout=120)
+            response.raise_for_status()
+            return self.parse(response.json())
         except (httpx.HTTPError, ValueError, KeyError, TypeError, IndexError, TimeoutError) as exc:
             raise SpeechProviderError('Whole meeting transcription failed') from exc
 
