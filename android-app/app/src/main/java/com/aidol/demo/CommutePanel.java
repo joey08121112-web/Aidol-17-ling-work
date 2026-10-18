@@ -17,6 +17,7 @@ import org.json.*;
 final class CommutePanel implements AutoCloseable {
     interface Permission { boolean ensure(boolean notifications); }
     private final Activity activity;
+    private final CommuteMapPanel mapPanel;
     private final Supplier<ApiClient> client;
     private final Supplier<JSONObject> appState;
     private final Supplier<ScrollView> viewport;
@@ -33,14 +34,18 @@ final class CommutePanel implements AutoCloseable {
     private long generation;
     private Runnable permissionAction;
     private LinearLayout summary, addressRows;
-    private TextView originButton, destinationButton, transportButton, startButton, endButton, status;
+    private TextView originButton, destinationButton, transportButton, startButton, endButton, navigationButton, navigationHint, status;
     private ScrollView pageScroll;
     private String lastRender = "";
+    private Dialog navigationFallback;
+    private long navigationOpenedAt = -2000;
+    private Boolean navigationPrimary;
     private interface Job { JSONObject run(ApiClient api) throws Exception; }
     private interface Result { void accept(JSONObject result) throws Exception; }
     CommutePanel(Activity activity, Supplier<ApiClient> client, Supplier<JSONObject> state,
                  BooleanSupplier allowed, BooleanSupplier visible, Permission permission, Runnable started, Runnable runningChanged, Supplier<ScrollView> viewport) {
-        this.activity = activity; this.client = client; this.appState = state; this.allowed = allowed;
+        this.activity = activity; this.client = client;
+        this.mapPanel = new CommuteMapPanel(activity, client, visible, viewport); this.appState = state; this.allowed = allowed;
         this.viewport = viewport; this.visible = visible; this.permission = permission; this.started = started; this.runningChanged = runningChanged;
     }
     private int dp(int value) { return EditorUi.dp(activity, value); }
@@ -69,6 +74,7 @@ final class CommutePanel implements AutoCloseable {
         dialogs.add(dialog);
         dialog.setOnDismissListener(d -> {
             dialogs.remove(dialog);
+            if (navigationFallback == dialog) navigationFallback = null;
             if (page == null || page != viewport.get() || !page.isAttachedToWindow()) return;
             // Window focus restoration may scroll a previously focused button into view.
             page.clearFocus();
@@ -108,7 +114,8 @@ final class CommutePanel implements AutoCloseable {
         if (!client.get().vault.token().isEmpty() && !loaded && !loading) load();
         ui.removeCallbacks(tick); ui.post(tick);
     }
-    void pause() { ui.removeCallbacks(tick); }
+    void pause() { ui.removeCallbacks(tick); mapPanel.pause(); }
+    void pauseMap() { mapPanel.pause(); }
     private void load() {
         loading = true;
         execute(api -> {
@@ -147,24 +154,33 @@ final class CommutePanel implements AutoCloseable {
     }};
     void render(LinearLayout parent, ScrollView scroll) {
         pageScroll = scroll; resume();
-        summary = card(parent); text(summary, "本次通勤", 19, EditorUi.INK).setTypeface(null, Typeface.BOLD);
+        mapPanel.renderMap(parent);
         LinearLayout plan = card(parent);
-        originButton = button(plan, "", false, () -> { if (editable()) choosePlace(true, p -> { origin = p; originMode = p == null ? "gps" : "fixed"; update(); }); });
-        destinationButton = button(plan, "", false, () -> { if (editable()) choosePlace(false, p -> { destination = p; update(); }); });
-        transportButton = button(plan, "", false, () -> {
+        originButton = compactButton(plan, "", () -> { if (editable()) choosePlace(true, p -> { origin = p; originMode = p == null ? "gps" : "fixed"; update(); }); });
+        destinationButton = compactButton(plan, "", () -> { if (editable()) choosePlace(false, p -> { destination = p; update(); }); });
+        transportButton = compactButton(plan, "", () -> {
             if (!editable()) return;
             String[] keys = {"driving", "walking", "transit", "bicycling"};
             RoundedChoiceDialog dialog = new RoundedChoiceDialog(activity, "出行方式", "选择此次路线的计算方式。", new String[]{"驾车", "步行", "公共交通", "骑行"}, Arrays.asList(keys).indexOf(transport), "确定", at -> { transport = keys[at]; update(); }); track(dialog); dialog.show();
         });
+        navigationButton = button(plan, "打开高德导航", true, this::openNavigation);
+        navigationHint = text(plan, "", 12, EditorUi.MUTED);
         startButton = button(plan, "开始通勤", true, this::start);
+        navigationPrimary = null;
         endButton = button(plan, "结束通勤", false, this::stop);
         status = text(plan, "", 12, EditorUi.MUTED);
         text(plan, "开始后每 3 分钟更新定位与路线，锁屏也继续；可从通知结束。固定起点保留原地址，仅更新路线耗时估算。", 12, EditorUi.MUTED);
-        LinearLayout around = card(parent); text(around, "附近与天气", 18, EditorUi.INK);
-        button(around, "搜索附近地点", false, () -> nearby(false)); button(around, "附近地铁站", false, () -> nearby(true));
-        button(around, "目的地天气", false, () -> weather(false)); button(around, "目的地天气预报", false, () -> weather(true));
-        button(around, "到达提醒偏好与草稿", false, this::arrival);
+        summary = card(parent);
+        mapPanel.renderWeather(parent);
         lastRender = ""; update();
+    }
+    private TextView compactButton(LinearLayout parent, String value, Runnable action) {
+        TextView button = EditorUi.button(activity, value, false, action);
+        button.setTextSize(14); button.setGravity(Gravity.CENTER_VERTICAL);
+        button.setPadding(dp(12), dp(8), dp(12), dp(8)); button.setMinHeight(dp(46));
+        button.setSingleLine(true); button.setEllipsize(TextUtils.TruncateAt.END);
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, dp(48)); p.setMargins(0, dp(3), 0, dp(3));
+        parent.addView(button, p); return button;
     }
     private boolean editable() { if (journey.optBoolean("active")) { notice = "请先结束本次通勤，再修改起终点"; update(); return false; } return !mutating; }
     private void update() {
@@ -175,19 +191,81 @@ final class CommutePanel implements AutoCloseable {
         boolean running = CommuteService.running(client.get()), active = journey.optBoolean("active");
         startButton.setText(running ? "立即更新路线" : active ? "继续通勤" : "开始通勤"); startButton.setEnabled(!mutating);
         endButton.setVisibility(active || running ? View.VISIBLE : View.GONE);
+        updateNavigation(active, running);
         status.setText(!notice.isEmpty() ? notice : running ? CommuteService.status(client.get()) : active ? "后台定位已暂停，请点继续通勤" : "选择起终点后开始通勤");
-        JSONObject route = journey.optJSONObject("route");
-        String render = journey.toString() + running;
+        mapPanel.update(originMode, origin, destination, transport, journey);
+        JSONObject route = active ? journey.optJSONObject("route") : mapPanel.route();
+        String render = journey.toString() + running + (route == null ? "" : route.toString()) + active;
         if (summary == null || render.equals(lastRender)) return;
         lastRender = render; int y = pageScroll == null ? 0 : pageScroll.getScrollY();
-        summary.removeAllViews(); text(summary, active ? "本次路线" : "上次通勤路线", 19, EditorUi.INK).setTypeface(null, Typeface.BOLD);
+        summary.removeAllViews(); text(summary, active ? "本次路线" : "路线预览", 19, EditorUi.INK).setTypeface(null, Typeface.BOLD);
         if (route != null && route.optBoolean("available")) {
-            text(summary, ("fixed".equals(journey.optString("origin_mode")) ? "路线耗时约 " : "预计还需 ") + Math.max(1, Math.round(route.optDouble("eta_seconds") / 60)) + " 分钟", 24, EditorUi.ACCENT);
+            text(summary, (!active || "fixed".equals(journey.optString("origin_mode")) ? "路线耗时约 " : "预计还需 ") + Math.max(1, Math.round(route.optDouble("eta_seconds") / 60)) + " 分钟", 24, EditorUi.ACCENT);
             text(summary, String.format(Locale.CHINA, "%.1f 公里 · %s", route.optDouble("distance_meters") / 1000, route.optString("destination")), 15, EditorUi.INK);
-            text(summary, "更新于 " + TimeFormat.format(journey.optString("updated_at")) + (journey.optString("error").isEmpty() ? "" : "\n更新失败，以上为上次估算"), 12, EditorUi.MUTED);
+            text(summary, "更新于 " + TimeFormat.format(active ? journey.optString("updated_at") : route.optString("fetched_at")) + (journey.optString("error").isEmpty() ? "" : "\n更新失败，以上为上次估算"), 12, EditorUi.MUTED);
             button(summary, "查看路线详情", false, () -> routeDetails(route));
-        } else text(summary, active ? "等待定位与路线结果…" : "选择目的地，开始本次通勤。", 14, EditorUi.MUTED);
+        } else text(summary, active ? "等待定位与路线结果…" : "选择起终点后自动显示路线，点击开始通勤持续更新。", 14, EditorUi.MUTED);
         if (pageScroll != null) { ScrollView viewport = pageScroll; viewport.post(() -> viewport.scrollTo(0, y)); }
+    }
+    private void updateNavigation(boolean active, boolean running) {
+        navigationButton.setVisibility(active ? View.VISIBLE : View.GONE);
+        navigationHint.setVisibility(active ? View.VISIBLE : View.GONE);
+        if (navigationPrimary == null || navigationPrimary != active) {
+            navigationPrimary = active;
+            startButton.setBackground(EditorUi.shape(activity, active ? 0xffffffff : EditorUi.ACCENT, 16, active ? EditorUi.LINE : EditorUi.ACCENT));
+            startButton.setTextColor(active ? EditorUi.ACCENT : 0xffffffff);
+        }
+        if (!active) return;
+        navigationButton.setText("高德导航 · " + methodName(journey.optString("transport")));
+        boolean valid;
+        try { AmapNavigation.create(journey, true); valid = true; } catch (IllegalArgumentException invalid) { valid = false; }
+        boolean enabled = valid && running && !mutating && allowed.getAsBoolean();
+        navigationButton.setEnabled(enabled); navigationButton.setAlpha(enabled ? 1f : .5f);
+        navigationHint.setText(!valid ? "本次通勤地址无效，请结束后重新选择。" : !running ? "先继续通勤，再打开高德导航。"
+            : "fixed".equals(journey.optString("origin_mode")) ? "带入所选起终点，在高德确认路线并开始导航。"
+            : "transit".equals(journey.optString("transport")) ? "带入目的地，在高德选择公交或地铁乘车方案。"
+            : "从当前位置出发，其他偏好沿用高德设置。");
+    }
+    private void openNavigation() {
+        if (closed || mutating || !visible.getAsBoolean() || !allowed.getAsBoolean()) return;
+        ApiClient api = client.get();
+        JSONObject active = CommuteService.current(api);
+        if (active == null || !active.optBoolean("active") || !account.equals(CommuteService.owner(api))) { update(); return; }
+        long now = SystemClock.elapsedRealtime();
+        if (now - navigationOpenedAt < 1500 || navigationFallback != null) return;
+        AmapNavigation.Plan plan;
+        try {
+            String version = "";
+            try { version = activity.getPackageManager().getPackageInfo(AmapNavigation.PACKAGE, 0).versionName; }
+            catch (android.content.pm.PackageManager.NameNotFoundException ignored) { /* Launch handles an absent app. */ }
+            plan = AmapNavigation.create(active, AmapNavigation.supportsFeatureNavigation(version));
+        } catch (IllegalArgumentException invalid) { notice = "本次通勤地址无效，请结束后重新选择。"; update(); return; }
+        navigationOpenedAt = now;
+        if (launchNavigationUri(plan.appUri, true)) return;
+        if (!plan.appUri.equals(plan.routeUri) && launchNavigationUri(plan.routeUri, true)) return;
+        showNavigationFallback(plan, api, api.vault.token(), active.optString("id"));
+    }
+    private boolean launchNavigationUri(String uri, boolean nativeApp) {
+        Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(uri));
+        intent.addCategory(Intent.CATEGORY_DEFAULT);
+        if (nativeApp) intent.setPackage(AmapNavigation.PACKAGE);
+        else intent.addCategory(Intent.CATEGORY_BROWSABLE);
+        try { activity.startActivity(intent); return true; }
+        catch (ActivityNotFoundException | SecurityException unavailable) { return false; }
+    }
+    private void showNavigationFallback(AmapNavigation.Plan plan, ApiClient api, String token, String journeyId) {
+        LinearLayout body = EditorUi.column(activity), footer = EditorUi.column(activity);
+        text(body, "未能打开高德地图。可以先用网页版查看已选路线，或安装、更新高德后重试。", 14, EditorUi.INK);
+        TextView error = text(body, "", 12, EditorUi.MUTED);
+        Dialog dialog = sheet("打开导航", body, footer); navigationFallback = dialog;
+        button(footer, "打开网页版路线", true, () -> {
+            JSONObject active = CommuteService.current(client.get());
+            if (closed || !visible.getAsBoolean() || api != client.get() || !token.equals(api.vault.token())
+                    || active == null || !active.optBoolean("active") || !journeyId.equals(active.optString("id"))) { dialog.dismiss(); return; }
+            if (launchNavigationUri(plan.webUri, false)) dialog.dismiss();
+            else error.setText("没有可打开路线的浏览器，请安装高德地图后重试。");
+        });
+        button(footer, "取消", false, dialog::dismiss);
     }
     private void withPermission(boolean notifications, Runnable action) { if (permission.ensure(notifications)) action.run(); else permissionAction = action; }
     void permissionResult(boolean granted) { Runnable action = permissionAction; permissionAction = null; if (granted && action != null && visible.getAsBoolean()) action.run(); else { notice = "请允许定位权限"; update(); } }
@@ -218,6 +296,7 @@ final class CommutePanel implements AutoCloseable {
         catch (RuntimeException error) { notice = "通勤服务未能启动，请检查定位权限后重试"; update(); }
     }
     void stop() {
+        if (navigationFallback != null) navigationFallback.dismiss();
         notice = "通勤已结束";
         if (CommuteService.running(client.get())) CommuteService.stop(activity);
         String id = journey.optString("id"); put(journey, "active", false); update();
@@ -403,9 +482,10 @@ final class CommutePanel implements AutoCloseable {
         }
     }
     private void resetViews() {
+        mapPanel.reset(); navigationOpenedAt = -2000;
         generation++; loaded = loading = mutating = false; addresses = new JSONArray(); journey = new JSONObject(); origin = destination = null; originMode = "gps"; transport = "driving"; notice = ""; permissionAction = null; lastRender = "";
         for (Dialog dialog : new ArrayList<>(dialogs)) dialog.dismiss(); addressRows = null;
     }
     void reset() { CommuteService.stop(activity); resetViews(); account = ""; }
-    @Override public void close() { closed = true; pause(); for (Dialog dialog : new ArrayList<>(dialogs)) dialog.dismiss(); network.shutdownNow(); }
+    @Override public void close() { closed = true; pause(); mapPanel.close(); for (Dialog dialog : new ArrayList<>(dialogs)) dialog.dismiss(); network.shutdownNow(); }
 }

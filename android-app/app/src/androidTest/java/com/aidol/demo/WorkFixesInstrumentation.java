@@ -49,7 +49,7 @@ public final class WorkFixesInstrumentation extends Instrumentation {
             api.json("POST", "/v1/tasks", new JSONObject().put("task_id", id).put("content", text).put("owner", "Test")
                 .put("due_at", Instant.now().plusSeconds(3620).toString()).put("reminder_hours", 1)); created.add(id);
             JSONObject state = api.json("GET", "/v1/state", null);
-            main(() -> { set(activity, "state", state); set(activity, "tab", 2); invoke(activity, "showApp"); });
+            main(() -> { set(activity, "state", state); set(activity, "tab", 2); set(activity, "workSection", 2); invoke(activity, "showApp"); });
             SystemClock.sleep(500); waitForIdleSync();
             CheckBox check = (CheckBox) find(activity.getWindow().getDecorView(), text);
             if (check == null) throw new AssertionError("Task row missing");
@@ -181,7 +181,7 @@ public final class WorkFixesInstrumentation extends Instrumentation {
         JSONObject initial = api.json("POST", "/v1/tasks", new JSONObject().put("task_id", id).put("content", text).put("owner", "Before")
             .put("due_at", initialDue).put("reminder_hours", 1)); created.add(id);
         JSONObject state = api.json("GET", "/v1/state", null);
-        main(() -> { set(activity, "state", state); set(activity, "tab", 2); invoke(activity, "showApp"); }); SystemClock.sleep(500);
+        main(() -> { set(activity, "state", state); set(activity, "tab", 2); set(activity, "workSection", 2); invoke(activity, "showApp"); }); SystemClock.sleep(500);
         ScrollView scroll = (ScrollView) field(activity, "scroll");
         CheckBox check = (CheckBox) find(activity.getWindow().getDecorView(), text);
         if (check == null) throw new AssertionError("Edit fixture missing");
@@ -288,6 +288,7 @@ public final class WorkFixesInstrumentation extends Instrumentation {
             JSONObject settings = new JSONObject(original.getJSONObject("settings").toString()).put("work_audio_retention_days", 90);
             main(() -> invokeJson("applyRecordingRetentionResult", settings)); SystemClock.sleep(250);
             if (scroll != field(activity, "scroll") || scroll.getScrollY() != retentionY || !retention.getText().toString().contains("90")) throw new AssertionError("Saving setting rebuilt or moved page");
+            main(() -> ((LinearLayout) field(activity, "workSectionTabs")).getChildAt(1).performClick()); SystemClock.sleep(250);
             TextView range = (TextView) field(activity, "historyRangeAction"); placeInViewport(scroll, range); int rangeY = scroll.getScrollY();
             int[] before = new int[2]; range.getLocationOnScreen(before);
             main(() -> invoke(activity, "showHistoryRangeOptions")); SystemClock.sleep(200);

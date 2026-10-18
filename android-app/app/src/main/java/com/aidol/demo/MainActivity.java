@@ -27,6 +27,7 @@ import android.view.inputmethod.InputMethodManager;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.RadioButton;
 import android.widget.RadioGroup;
@@ -59,6 +60,10 @@ public final class MainActivity extends Activity {
     private ActionTaskBoard taskBoard;
     private TextView workRetentionAction, historyRangeAction;
     private LinearLayout historyReportBox;
+    private LinearLayout workSectionTabs;
+    private final LinearLayout[] workSections = new LinearLayout[3];
+    private final int[] workSectionScroll = {-1, -1, -1};
+    private int workSection;
     private RoundedChoiceDialog workOptionsDialog;
     private LinearLayout lastRenderedMeetingList;
     private String lastRenderedMeetingSnapshot = "";
@@ -288,7 +293,7 @@ public final class MainActivity extends Activity {
             },
             () -> { startupLocationAttempted = false; handler.post(startupLocationTick); }, () -> scroll);
         if (getIntent().getBooleanExtra("open_commute", false)) tab = 3;
-        if (getIntent().getBooleanExtra("open_work_tasks", false)) tab = 2;
+        if (getIntent().getBooleanExtra("open_work_tasks", false)) { tab = 2; workSection = 2; }
         if (api.vault.token().isEmpty()) showAuth(0); else { showApp(); refresh(); }
     }
 
@@ -391,7 +396,11 @@ public final class MainActivity extends Activity {
         LinearLayout head = row(); head.setGravity(Gravity.CENTER_VERTICAL); head.setPadding(dp(24), dp(8), dp(24), dp(4));
         root.addView(head);
         LinearLayout wordmark = column(); head.addView(wordmark, new LinearLayout.LayoutParams(0, -2, 1));
-        TextView logo = label(wordmark, "aidol", 25, INK); logo.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL)); logo.setLetterSpacing(-.04f);
+        ImageView logo = new ImageView(this);
+        logo.setImageResource(R.drawable.aidol_wordmark_speed);
+        logo.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        logo.setContentDescription("Aidol");
+        wordmark.addView(logo, new LinearLayout.LayoutParams(dp(124), dp(32)));
         TextView refresh = action(head, "↻", () -> { if (canAct()) { lastNotice = ""; refresh(); } }); refresh.setTextSize(25); refresh.setContentDescription("刷新服务器数据");
         TextView avatar = action(head, api.vault.username().isEmpty() ? "A" : api.vault.username().substring(0, 1).toUpperCase(Locale.ROOT), () -> switchTab(4));
         avatar.setBackground(ripple(SOFT, 24, LINE)); avatar.setTextColor(ACCENT); avatar.setContentDescription("打开我的空间");
@@ -438,6 +447,7 @@ public final class MainActivity extends Activity {
     private void switchTab(int next) {
         if (tab == next) return;
         clearHeadsetGesture();
+        if (commutePanel != null) commutePanel.pauseMap();
         boolean keepCall = sessionUsesCapture && session != null || repeatArmed;
         if (session != null && !keepCall) cancelSession("已结束当前操作");
         if (!keepCall) stopRepeat(); tab = next; if (next == 0) followingConversation = true; hideKeyboard(); showApp();
@@ -1592,15 +1602,55 @@ public final class MainActivity extends Activity {
             renderWorkCaption();
         } else workCaptionBox = null;
         label(intro, "结束后自动保存原文，再由 AI 整理摘要、决策与待办", 11, MUTED).setGravity(Gravity.CENTER);
+        workSectionTabs = row();
+        workSectionTabs.setPadding(dp(4), dp(4), dp(4), dp(4));
+        workSectionTabs.setBackground(shape(CARD, 24, CARD));
+        page.addView(workSectionTabs);
+        String[] sections = {"会议纪要", "历史整理", "行动清单"};
+        for (int i = 0; i < sections.length; i++) {
+            final int index = i;
+            segment(workSectionTabs, sections[i], workSection == i, () -> selectWorkSection(index));
+            workSections[i] = column();
+        }
+        for (int i = 0; i < workSections.length; i++) {
+            page.addView(workSections[i]); workSections[i].setVisibility(workSection == i ? View.VISIBLE : View.GONE);
+        }
+        LinearLayout meetings = workSections[0], history = workSections[1], tasks = workSections[2];
         int retention = settings().optInt("work_audio_retention_days", 30);
-        workRetentionAction = sectionHeader(page, "会议记录", "每次录音独立保存 · 处理进度自动更新",
+        workRetentionAction = sectionHeader(meetings, "会议记录", "每次录音独立保存 · 处理进度自动更新",
             retention == 0 ? "录音：不保存" : "录音保存 " + retention + " 天", this::showRecordingRetentionOptions);
-        label(page, "录音按账号保存在服务器，到期自动删除；缩短期限会立即删除超期录音。文字原文与纪要不受影响。", 11, MUTED);
-        workMeetingList = column(); page.addView(workMeetingList); renderWorkMeetings();
-        historyRangeAction = sectionHeader(page, "历史记录整理", "按时间范围整理较早的工作记录", "选择范围", this::showHistoryRangeOptions);
-        historyReportBox = column(); page.addView(historyReportBox); renderHistoryReport();
-        taskBoard.render(page, array(state, "tasks"), scroll);
+        label(meetings, "录音按账号保存在服务器，到期自动删除；文字原文与纪要保留。", 11, MUTED);
+        workMeetingList = column(); meetings.addView(workMeetingList); renderWorkMeetings();
+        historyRangeAction = sectionHeader(history, "历史记录整理", "按时间范围整理较早的工作记录", "选择范围", this::showHistoryRangeOptions);
+        historyReportBox = column(); history.addView(historyReportBox); renderHistoryReport();
+        taskBoard.render(tasks, array(state, "tasks"), scroll);
+        styleWorkSections();
     }
+    private void styleWorkSections() {
+        if (workSectionTabs == null) return;
+        String[] names = {"会议纪要", "历史整理", "行动清单"};
+        for (int i = 0; i < workSections.length; i++) {
+            TextView choice = (TextView) workSectionTabs.getChildAt(i);
+            styleSegment(choice, workSection == i);
+            choice.setSelected(workSection == i);
+            choice.setContentDescription(names[i] + (workSection == i ? "，已选中" : ""));
+        }
+    }
+    private void selectWorkSection(int next) {
+        if (next == workSection || tab != 2 || workSectionTabs == null) return;
+        ScrollView viewport = scroll; int y = viewport.getScrollY();
+        workSectionScroll[workSection] = y;
+        workSection = next;
+        for (int i = 0; i < workSections.length; i++) {
+            workSections[i].animate().cancel();
+            workSections[i].setAlpha(1f); workSections[i].setVisibility(i == next ? View.VISIBLE : View.GONE);
+        }
+        styleWorkSections();
+        workSections[next].setAlpha(.4f); workSections[next].animate().alpha(1f).setDuration(160).start();
+        int target = workSectionScroll[next] >= 0 ? workSectionScroll[next] : Math.min(y, workSectionTabs.getTop());
+        viewport.clearFocus(); restoreWorkScroll(viewport, target);
+    }
+
     private void showRecordingRetentionOptions() {
         if (!canAct()) return;
         int current = settings().optInt("work_audio_retention_days", 30);
@@ -2477,7 +2527,9 @@ public final class MainActivity extends Activity {
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent); setIntent(intent);
         if (intent.getBooleanExtra("open_commute", false) && api != null && !api.vault.token().isEmpty()) switchTab(3);
-        if (intent.getBooleanExtra("open_work_tasks", false) && api != null && !api.vault.token().isEmpty()) switchTab(2);
+        if (intent.getBooleanExtra("open_work_tasks", false) && api != null && !api.vault.token().isEmpty()) {
+            if (tab == 2) selectWorkSection(2); else { workSection = 2; switchTab(2); }
+        }
     }
     @Override public void onBackPressed() { if (session != null) { endVoice(); return; } if (!api.vault.token().isEmpty() && tab != 0) { switchTab(0); return; } if (api.vault.token().isEmpty() && authMode != 0) { showAuth(0); return; } super.onBackPressed(); }
 

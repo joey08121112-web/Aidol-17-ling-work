@@ -85,6 +85,9 @@ APK 默认本地基址 `http://127.0.0.1:8108`，可切换内置远端 `https://
 | `GET /v1/location-records?limit=100` | 当前账号最近位置，`limit` 1–1000，返回 `{records:[…]}`，按观测时间倒序 |
 | `POST /v1/maps/nearby` | 定位字段加 `{keyword}`，默认“美食”；高德 3 km 周边结果 |
 | `GET /v1/maps/weather?city=310000` | city 可选，为六位 adcode；省略/留空则用本人保存的目的地坐标反查区域后查询天气，无目的地 422；返回高德实况天气结构 |
+| `POST /v1/commute/preview` | 只读起终点与路线预览；接受未选齐的端点，不创建通勤或改变模式。请求与坐标规则见文末“通勤地图预览” |
+| `POST /v1/maps/snapshot` | 已鉴权的高德静态地图图片代理；接收 GCJ-02 起终点与有界线形，返回 PNG/JPEG，不接受任意上游 URL |
+| `POST /v1/maps/weather-at?forecast=false` | 接收已定位的 `PlacePoint`，按目的地行政区域查询实况天气；不依赖手机当前位置，不占语音会话锁 |
 | `POST /v1/drafts/{id}/{action}` | action 仅 `copied/dismissed`；返回 `{ok:true,status,sent:false}`；不支持真实发送 |
 | `GET /v1/export` | v4 JSON：`version/user/settings/memories/transcripts/reports/tasks/drafts/work_meetings/location_records` |
 | `DELETE /v1/data` | `{password}`；清空业务数据和对话幂等结果，保留账号与设置；返回 `{ok:true}` |
@@ -115,7 +118,7 @@ state 最多返回 100 条转写（按时间正序）、300 条记忆、300 条�
 
 Android添加/编辑共用圆角表单；左滑露出编辑和删除，编辑预填内容、负责人、截止时间和提醒选项。保存只替换原卡片，保留列表顺序与视口；取消不保存，失败保留输入。没有具体时间的旧AI任务可保留原文字截止时间，选择日期和时间后启用提醒。
 
-Android以系统AlarmManager安排本地通知，提前量按绝对截止时间计算。编辑截止或提前量会取消旧闹钟、清除旧的已通知状态并重新安排；仅改内容/负责人不重发已送达提醒，待发送通知使用最新内容；关闭提醒取消闹钟和通知。提醒时刻已过去而截止时间仍在未来时尽快提醒；已到期、完成、删除的任务不安排。通知可直接进入工作页；重启、时间/时区变动及包更新后恢复，前台/刷新/任务修改时同步。退出账号、切换服务、清空和注销取消相应本地提醒；权限未允许时显示说明与通知设置入口。采用无额外特殊授权的非精确闹钟，省电策略可能延迟（[Android官方说明](https://developer.android.com/develop/background-work/services/alarms)）。本地已知状态下完成/删除会取消提醒；其他设备的更改在本机下次同步后生效，不是服务器远程推送。位置与录音的前后台策略保持原样。
+Android以系统AlarmManager安排本地通知，提前量按绝对截止时间计算。编辑截止或提前量会取消旧闹钟、清除旧的已通知状态并重新安排；仅改内容/负责人不重发已送达提醒，待发送通知使用最新内容；关闭提醒取消闹钟和通知。提醒时刻已过去而截止时间仍在未来时尽快提醒；已到期、完成、删除的任务不安排。通知直接进入工作页的“行动清单”选项卡；重启、时间/时区变动及包更新后恢复，前台/刷新/任务修改时同步。退出账号、切换服务、清空和注销取消相应本地提醒；权限未允许时显示说明与通知设置入口。采用无额外特殊授权的非精确闹钟，省电策略可能延迟（[Android官方说明](https://developer.android.com/develop/background-work/services/alarms)）。本地已知状态下完成/删除会取消提醒；其他设备的更改在本机下次同步后生效，不是服务器远程推送。位置与录音的前后台策略保持原样。
 
 ### 用户修正并重新生成纪要（2026-10-18）
 
@@ -149,7 +152,7 @@ M1 Android 复用 HTTP 短语音，无新增实时接口。含异步停止尾帧
 | 注册容量 | `AIDOL_MAX_USERS=500`；达到容量后注册 403 |
 | 鉴权尝试 | 每来源 IP 40 次/900 秒、每归一账号 15 次/900 秒；注册、登录、恢复、改密、清空与注销共用该计数，超限 429；不信任客户端自行写的 X-Forwarded-For |
 | 业务额度 | `AIDOL_DAILY_REQUESTS=300`；每账号从窗口首次操作起计 24 小时，到期重置，不是北京时间午夜；不是逐请求滑动时间序列，也不是资金预算 |
-| 计数操作 | 新 chat/voice、每次 speech、recall、meetings、地图 search/nearby/weather、location 各计一次；聊天后合成语音通常两次，录音后合成语音也通常两次。已完成 chat/voice 重试不计；其他操作可能即使上游失败或会议命中缓存仍计数 |
+| 计数操作 | 新 chat/voice、每次 speech、recall、meetings、地图 search/nearby/weather/weather-at/commute-preview/snapshot、location 各计一次；聊天后合成语音通常两次，录音后合成语音也通常两次。已完成 chat/voice 重试不计；其他操作可能即使上游失败或会议命中缓存仍计数 |
 | 同账号并发 | 同时一项业务操作；第二项 409。其他账号可独立操作，全局最多八项活动业务操作，满时 503 |
 | 请求体 | 文字/普通请求最多 65536 字节；voice 最多 1920000 字节（60 秒）。按实际接收长度检查，不能通过省略 Content-Length 绕过 |
 | 音频长度 | voice 至少 3200 字节且字节数为偶数；单次最多 60 秒；ASR 处理有 65 秒上限 |
@@ -378,3 +381,14 @@ Android 实际播放排空后发送 `{"type":"playback.done","turn":N}`，后端
 - 导出补充 `saved_addresses/commute`；清空业务数据删除旅程和位置记录，保留账号设置及常用地址；删除账号移除全部数据。手机断网结束时立即停止定位，私有队列在下次登录进入后补发结束，开始新旅程前先处理该队列。
 
 保存地址消除的是重复地址解析查询；实时路线、天气和周边查询仍需联网地图 API。公共交通数据为线路规划/计划时刻，不表示实时车辆位置。
+
+## 通勤地图预览（2026-10-18）
+
+- 新增 `POST /v1/commute/preview`：需鉴权；接收 `origin_mode: gps/fixed`、可选 `origin`/`location`、可选 `destination` 和四种 `transport`。地址遵循上面的 PlacePoint 契约；GPS location 必须为两分钟内且精度≤200米的手机坐标，转换一次后以 GCJ-02 规划。只有一个端点时返回该标记，不请求路线。返回 `origin/destination/route/coordinate_system`，不创建旅程、不改模式或设置、不写位置记录，不争用语音锁。路线失败仍可返回已知端点，`route.available=false`。
+- 通勤预览及旅程刷新优先选高德返回候选中距离较短、同距离耗时较短的一条。驾车使用 v3 `strategy=11` 获取候选，其他方式按实际候选选择；不声称所有道路组合的数学全局最短。普通对话工具的默认路线策略保持原样。
+- `route` 新增 GCJ-02 `origin/destination_point/geometry/geometry_partial/selection`。`geometry` 为最多4条折线、每条最多120个经纬度对，抽稀保留端点与主要转折。公交只取所选方案与首条可替代公交线；无铁路线形时不伪造直线。超过静态图4条覆盖物限制时显示较长的4段并标记 `geometry_partial=true`，客户端明确提示部分路段缺少线形。
+- 新增 `POST /v1/maps/snapshot`：鉴权后提交 GCJ-02 `origin`/`destination`（至少一个）和可选 `paths`；坐标必须有限且合法，路径数量/点数有界。后端用现有 Web 服务 Key 请求高德静态底图并自动适配所有端点和路线，返回 `image/png` 或 `image/jpeg`，上游图片上限4MiB。客户端不接收 Key 或含 Key 的URL，供应商异常不透出凭据。失效鉴权401、参数错误422、额度用完429、上游失败502。
+- `POST /v1/maps/weather-at` 改为独立只读查询，不等语音锁；仍优先复用地址 adcode，缺少时才反查。以上三个查询入口各计一次既有账号每日业务额度；未配置/不可用不制造天气或地图。
+- Android 仅通勤页在前台时更新预览/图片，正常间隔180秒；更换端点/方式立即更新，旧请求取消并按账号/请求身份过滤迟到结果。目的地天气自动获取，正常10分钟刷新；失败有界间隔重试，手动刷新可提前更新。真正通勤的180秒锁屏定位和路线服务仍由 CommuteService 负责，切走页面只取消预览请求。
+
+依据高德官方[静态地图](https://lbs.amap.com/api/webservice/guide/api/staticmaps)、[路径规划](https://lbs.amap.com/api/webservice/guide/api/direction)、[天气查询](https://lbs.amap.com/api/webservice/guide/api/weatherinfo)接入。

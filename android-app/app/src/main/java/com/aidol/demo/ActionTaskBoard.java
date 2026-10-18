@@ -57,7 +57,7 @@ final class ActionTaskBoard implements AutoCloseable {
         sync(value, false);
     }
     Runnable preserveViewport() {
-        if (scroll == null || rows == null || !rows.isAttachedToWindow()) return () -> {};
+        if (scroll == null || rows == null || !rows.isAttachedToWindow() || !rows.isShown()) return () -> {};
         final ScrollView viewport = scroll;
         final LinearLayout list = rows;
         int[] screen = new int[2]; viewport.getLocationOnScreen(screen);
@@ -114,14 +114,20 @@ final class ActionTaskBoard implements AutoCloseable {
         check.setOnClickListener(v -> {
             if (!allowed.getAsBoolean()) { check.setChecked("done".equals(task.optString("status"))); return; }
             mutationVersion++; mutations++;
-            boolean selected = check.isChecked(); int y = scroll == null ? 0 : scroll.getScrollY(); check.setEnabled(false);
+            final ScrollView viewport = scroll;
+            final LinearLayout list = rows;
+            boolean selected = check.isChecked(); int y = viewport == null ? 0 : viewport.getScrollY(); check.setEnabled(false);
             card.animate().alpha(.72f).setDuration(120).start();
             execute(c -> c.json("PATCH", "/v1/tasks/" + id, new JSONObject().put("status", selected ? "done" : "open")), r -> {
                 mutations--;
                 for (int i = 0; i < tasks.length(); i++) if (tasks.optJSONObject(i).optString("id").equals(id)) try { tasks.optJSONObject(i).put("status", selected ? "done" : "open"); } catch (JSONException ignored) {}
                 try { task.put("status", selected ? "done" : "open"); } catch (JSONException ignored) {}
                 paint(check, selected); check.setEnabled(true); card.animate().alpha(1).setDuration(180).start();
-                updateCount(); publish(); if (scroll != null) scroll.scrollTo(0, y);
+                updateCount(); publish();
+                // A delayed reply must not move another work section or a rebuilt page.
+                if (viewport != null && viewport == scroll && list != null && list == rows
+                        && viewport.isAttachedToWindow() && list.isAttachedToWindow() && list.isShown())
+                    viewport.scrollTo(0, y);
             }, () -> { mutations--; check.setChecked(!selected); check.setEnabled(true); card.animate().alpha(1).setDuration(180).start(); });
         });
         card.setOnLongClickListener(v -> { new AlertDialog.Builder(activity).setItems(new String[]{"编辑待办", "删除待办"}, (d, which) -> { if (which == 0) taskDialog(task); else remove(task, shell); }).show(); return true; });

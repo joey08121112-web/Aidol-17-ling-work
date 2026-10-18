@@ -7,14 +7,15 @@ import math
 from datetime import datetime, timezone
 
 import httpx
-from ..providers.amap import amap_get
+from ..providers.amap import amap_get, amap_image
+from .map_preview import route_geometry, snapshot_params
 
 
 class MapService:
     def __init__(self, config):
         self.config = config
 
-    async def route(self, location, settings, *, origin_gcj=False, origin_city=""):
+    async def route(self, location, settings, *, origin_gcj=False, origin_city="", prefer_shorter=False):
         if not self.config.amap_key:
             return {"available": False, "reason": "尚未配置高德 Key；不生成虚构的实时 ETA"}
         if settings.destination_lon is None or settings.destination_lat is None:
@@ -36,12 +37,15 @@ class MapService:
                 route = await self._get(client, "direction/transit/integrated", params)
             else:
                 if transport == "driving":
-                    params.update({"extensions": "base", "strategy": "0"})
+                    params.update({"extensions": "base", "strategy": "11" if prefer_shorter else "0"})
                 route = await self._get(client, "direction/" + transport, params)
         paths = route.get("data" if transport == "bicycling" else "route", {}).get("transits" if transport == "transit" else "paths", [])
         if not paths:
             return {"available": False, "reason": "高德未返回可用路线"}
-        selected = paths[0]
+        valid = [p for p in paths if isinstance(p, dict) and self._number(p.get("distance")) is not None and self._number(p.get("duration")) is not None]
+        if not valid:
+            return {"available": False, "reason": "高德路线缺少有效的时间或距离"}
+        selected = min(valid, key=lambda p: (self._number(p.get("distance")), self._number(p.get("duration")))) if prefer_shorter else valid[0]
         duration, distance = self._number(selected.get("duration")), self._number(selected.get("distance"))
         if duration is None or distance is None:
             return {"available": False, "reason": "高德路线缺少有效的时间或距离"}
@@ -52,6 +56,12 @@ class MapService:
                   "eta_seconds": duration, "distance_meters": distance,
                   "fetched_at": datetime.now(timezone.utc).isoformat(),
                   "destination": settings.destination_name, "note": notes[transport]}
+        geometry, partial = route_geometry(selected, transport, self._coordinates)
+        origin_point = self._coordinates(origin)
+        result.update({"coordinate_system": "GCJ-02", "geometry": geometry, "geometry_partial": partial,
+            "origin": {"longitude": origin_point[0], "latitude": origin_point[1]} if origin_point else None,
+            "destination_point": {"longitude": settings.destination_lon, "latitude": settings.destination_lat},
+            "selection": "shorter_available" if prefer_shorter else "recommended"})
         if transport == "transit":
             result.update({"scheduled": True, "steps": self._transit_steps(selected),
                            "walking_distance_meters": self._number(selected.get("walking_distance")),
@@ -62,6 +72,21 @@ class MapService:
                                  "duration_seconds": self._number(step.get("duration"))}
                                 for step in selected.get("steps", [])[:40] if isinstance(step, dict)]
         return result
+
+    async def map_point(self, location):
+        if not self.config.amap_key:
+            raise ValueError("尚未配置高德地图服务")
+        async with httpx.AsyncClient(timeout=10, proxy=self.config.proxy) as client:
+            converted = self._coordinates(await self._convert(client, location))
+        if converted is None:
+            raise ValueError("当前位置暂时无法显示在地图上")
+        return {"longitude": converted[0], "latitude": converted[1]}
+
+    async def snapshot(self, value):
+        if not self.config.amap_key:
+            raise ValueError("尚未配置高德地图服务")
+        async with httpx.AsyncClient(timeout=12, proxy=self.config.proxy) as client:
+            return await amap_image(client, self.config.amap_key, snapshot_params(value))
 
     async def search(self, query, city=""):
         """Search a destination; returned coordinates can be saved without conversion."""
