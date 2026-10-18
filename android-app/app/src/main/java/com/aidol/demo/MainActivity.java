@@ -177,7 +177,8 @@ public final class MainActivity extends Activity {
     private double diagnosticRms;
     private long diagnosticBytes;
     private JSONObject state = new JSONObject();
-    private LinearLayout root, page, content, composer;
+    private LinearLayout root, page, content, composer, conversationHeader, bottomNavigation, lifeOptions;
+    private boolean lifeConversationLayout;
     private ScrollView scroll;
     private TextView status, voiceButton, cancelButton, authError;
     private EditText chatInput;
@@ -311,6 +312,8 @@ public final class MainActivity extends Activity {
     }
 
     private void base() {
+        bottomNavigation = null;
+        lifeOptions = null;
         maintenanceStatus = null;
         diagnosticsView = null;
         turnDetails = null;
@@ -329,7 +332,12 @@ public final class MainActivity extends Activity {
         setContentView(root);
         root.setOnApplyWindowInsetsListener((v, insets) -> {
             root.setPadding(0, insets.getSystemWindowInsetTop(), 0, insets.getSystemWindowInsetBottom());
+            if (Build.VERSION.SDK_INT >= 30) updateLifeKeyboard(insets.isVisible(android.view.WindowInsets.Type.ime()));
             return insets;
+        });
+        if (Build.VERSION.SDK_INT < 30) root.getViewTreeObserver().addOnGlobalLayoutListener(() -> {
+            android.graphics.Rect area = new android.graphics.Rect(); root.getWindowVisibleDisplayFrame(area);
+            updateLifeKeyboard(root.getRootView().getHeight() - area.bottom > dp(160));
         });
         root.requestApplyInsets();
     }
@@ -426,6 +434,9 @@ public final class MainActivity extends Activity {
         activeCallRow = row(); activeCallRow.setPadding(dp(24), dp(4), dp(24), dp(4)); root.addView(activeCallRow);
         button(activeCallRow, "AI 通话中 · 返回", false, () -> switchTab(0));
         button(activeCallRow, "挂断", false, () -> { cancelSession("通话已结束"); markTabsDirty(); renderTab(); });
+        conversationHeader = column();
+        conversationHeader.setPadding(dp(24), dp(12), dp(24), dp(4));
+        root.addView(conversationHeader);
         scroll = new ScrollView(this); scroll.setFillViewport(true); scroll.setClipToPadding(false); scroll.setVerticalScrollBarEnabled(false);
         root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
         scroll.setOnScrollChangeListener((v, x, y, oldX, oldY) -> {
@@ -438,6 +449,7 @@ public final class MainActivity extends Activity {
         composer.setVisibility(tab == 0 ? View.VISIBLE : View.GONE);
         View divider = new View(this); divider.setBackgroundColor(SOFT); root.addView(divider, new LinearLayout.LayoutParams(-1, dp(1)));
         LinearLayout nav = row(); nav.setPadding(dp(12), dp(5), dp(12), dp(5)); nav.setBackgroundColor(BG); root.addView(nav);
+        bottomNavigation = nav;
         String[] names = {"对话", "记忆", "工作", "通勤", "我的"};
         for (int i = 0; i < names.length; i++) {
             final int index = i; LinearLayout item = column(); item.setGravity(Gravity.CENTER); item.setPadding(0, dp(7), 0, dp(5));
@@ -461,7 +473,7 @@ public final class MainActivity extends Activity {
         if (tab == 0 && chatInput != null) chatDraft = chatInput.getText().toString();
         if (tabDirty[tab] || tabViews[tab] == null) {
             clearTabFields(tab);
-            if (tab == 0) composer.removeAllViews();
+            if (tab == 0) { composer.removeAllViews(); conversationHeader.removeAllViews(); }
             LinearLayout fresh = column(); fresh.setPadding(dp(24), dp(12), dp(24), dp(32));
             page = fresh;
             if (tab == 0) conversation(); else if (tab == 1) memories(); else if (tab == 2) work(); else if (tab == 3) commute(); else profile();
@@ -473,6 +485,9 @@ public final class MainActivity extends Activity {
             if (tab == 0 && session != null) followConversation();
         }
         composer.setVisibility(tab == 0 ? View.VISIBLE : View.GONE);
+        conversationHeader.setVisibility(tab == 0 && lifeConversationLayout ? View.VISIBLE : View.GONE);
+        if (Build.VERSION.SDK_INT >= 30 && root.getRootWindowInsets() != null)
+            updateLifeKeyboard(root.getRootWindowInsets().isVisible(android.view.WindowInsets.Type.ime()));
         updateNavSelection();
         if (restoreComposerFocus && chatInput != null) {
             chatInput.requestFocus(); chatInput.setSelection(Math.max(0, Math.min(draftSelection, chatInput.length())));
@@ -497,6 +512,7 @@ public final class MainActivity extends Activity {
             liveTurn = null; liveUserBubble = null; liveAssistantBubble = null; conversationStarters = null;
             conversationScrollQueued = false; headsetStatus = null; voiceHint = null; modeChoices = null; modeHint = null;
             lockScreenButton = null;
+            lifeOptions = null;
         } else if (which == 2) {
             workClock = null; workMeetingList = null; workCaptionBox = null; workCaptionViews.box = null;
         } else if (which == 4) {
@@ -525,12 +541,15 @@ public final class MainActivity extends Activity {
 
     private void conversation() {
         if (session == null && !repeatArmed) listenMode = "work".equals(mode()) ? VoiceInteraction.NOTES : VoiceInteraction.CALL;
-        LinearLayout modes = row(); modes.setPadding(dp(4), dp(4), dp(4), dp(4)); modes.setBackground(shape(CARD, 26, CARD)); page.addView(modes);
+        lifeConversationLayout = "life".equals(mode());
+        LinearLayout modes = row(); modes.setPadding(dp(4), dp(4), dp(4), dp(4)); modes.setBackground(shape(CARD, 26, CARD));
+        (lifeConversationLayout ? conversationHeader : page).addView(modes);
         modeChoices = modes;
         String[] keys = {"life", "work", "commute"};
         for (int i = 0; i < keys.length; i++) {
             final String mode = keys[i]; segment(modes, ModeCopy.name(mode), mode.equals(mode()), () -> changeMode(mode));
         }
+        if (lifeConversationLayout) { lifeConversation(); return; }
         LinearLayout hero = card(page); hero.setGravity(Gravity.CENTER);
         hero.setPadding(dp(8), dp(18), dp(8), dp(20)); hero.setBackgroundColor(BG);
         TextView eyebrow = label(hero, "你的随身 AI 伙伴", 12, MUTED); eyebrow.setGravity(Gravity.CENTER); eyebrow.setLetterSpacing(.08f);
@@ -615,6 +634,136 @@ public final class MainActivity extends Activity {
         if (session != null) followConversation();
     }
 
+    /** Life keeps the transcript scrollable and the voice controls within reach. */
+    private void lifeConversation() {
+        page.setPadding(dp(20), dp(8), dp(20), dp(16));
+        LinearLayout tools = row(); tools.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        lifeOptions = tools;
+        conversationHeader.addView(tools);
+        if (!settings().optBoolean("retain_transcripts", true)) label(tools, "本次对话不保存", 11, MUTED);
+        TextView options = action(tools, "", this::showLifeCallSettings);
+        options.setForeground(getDrawable(R.drawable.ic_voice_settings)); options.setForegroundGravity(Gravity.CENTER);
+        options.setContentDescription("通话设置与耳机详情");
+        content = column(); page.addView(content);
+        JSONArray history = array(state, "transcripts");
+        for (int i = Math.max(0, history.length() - 30); i < history.length(); i++) {
+            JSONObject line = history.optJSONObject(i); if (line == null) continue;
+            lifeChatLine(content, "assistant".equals(line.optString("speaker")), line.optString("text"), line.optString("id"));
+        }
+        if (!settings().optBoolean("retain_transcripts", true))
+            for (ConversationFeed.Line line : conversationFeed.unsaved()) lifeChatLine(content, line.assistant, line.text, "");
+        if (content.getChildCount() == 0 && conversationFeed.user().isEmpty() && conversationFeed.reply().isEmpty()) {
+            conversationStarters = column(); content.addView(conversationStarters);
+            TextView welcome = label(conversationStarters, "想聊什么，都可以。", 20, INK);
+            welcome.setPadding(0, dp(32), 0, dp(8));
+            label(conversationStarters, "点下方接通 AI，或直接打字。", 13, MUTED);
+        }
+        renderLiveTurn();
+        turnDetails = column(); page.addView(turnDetails); renderTurnDetails();
+
+        composer.setPadding(dp(20), 0, dp(20), dp(10));
+        orb = new CompanionOrbView(this); orb.conversationStyle();
+        LinearLayout.LayoutParams orbParams = new LinearLayout.LayoutParams(dp(112), dp(100));
+        orbParams.gravity = Gravity.CENTER_HORIZONTAL; composer.addView(orb, orbParams);
+        callCaption = label(composer, session == null ? "随时可以开始聊天" : "通话中 · 说“小万”可打断", 11, MUTED);
+        callCaption.setGravity(Gravity.CENTER); callCaption.setMaxLines(2);
+        callCaption.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        gap(composer, 8);
+        LinearLayout controls = row(); controls.setGravity(Gravity.CENTER_VERTICAL); composer.addView(controls);
+        LinearLayout capsule = row(); capsule.setGravity(Gravity.CENTER_VERTICAL);
+        capsule.setPadding(dp(16), dp(2), dp(4), dp(2)); capsule.setBackground(shape(BG, 28, LINE));
+        controls.addView(capsule, new LinearLayout.LayoutParams(0, -2, 1));
+        chatInput = input("说点什么…", false, 6000); chatInput.setBackground(null);
+        chatInput.setDefaultFocusHighlightEnabled(false);
+        chatInput.setPadding(0, dp(10), dp(4), dp(10)); chatInput.setMinHeight(dp(48));
+        chatInput.setMinLines(1); chatInput.setMaxLines(4); chatInput.setText(chatDraft);
+        chatInput.setContentDescription("文字消息");
+        capsule.addView(chatInput, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView send = action(capsule, "", this::sendConversationText);
+        send.setForeground(getDrawable(R.drawable.ic_voice_send)); send.setForegroundGravity(Gravity.CENTER);
+        send.setContentDescription("发送文字消息");
+        voiceButton = action(controls, "", this::toggleVoice);
+        LinearLayout.LayoutParams voiceParams = new LinearLayout.LayoutParams(dp(52), dp(52));
+        voiceParams.leftMargin = dp(10); voiceButton.setLayoutParams(voiceParams);
+        voiceButton.setPadding(0, 0, 0, 0); voiceButton.setBackground(ripple(INK, 28, INK));
+        voiceButton.setForegroundGravity(Gravity.CENTER);
+        voiceButtonText(session == null ? "接通 AI" : "结束会话");
+        followConversation();
+    }
+
+    private void sendConversationText() {
+        String text = value(chatInput); if (text.isEmpty()) return;
+        if (session != null && session.isDuplexCall()) {
+            session.sendDuplexText(text); conversationFeed.transcript(text); renderLiveTurn();
+        } else { if (!canAct()) return; startSession(text); }
+        hideKeyboard(); chatInput.setText(""); chatDraft = "";
+    }
+
+    private void updateLifeKeyboard(boolean keyboardVisible) {
+        boolean typing = tab == 0 && lifeConversationLayout && keyboardVisible;
+        if (tab == 0 && lifeConversationLayout) {
+            if (orb != null) orb.setVisibility(typing ? View.GONE : View.VISIBLE);
+            if (callCaption != null) callCaption.setVisibility(typing ? View.GONE : View.VISIBLE);
+            if (lifeOptions != null) lifeOptions.setVisibility(typing ? View.GONE : View.VISIBLE);
+            if (chatInput != null) chatInput.setMaxLines(typing ? 2 : 4);
+        }
+        if (maintenanceStatus != null) maintenanceStatus.setVisibility(typing ? View.GONE : View.VISIBLE);
+        if (bottomNavigation != null) bottomNavigation.setVisibility(typing ? View.GONE : View.VISIBLE);
+    }
+
+    private TextView lifeChatLine(LinearLayout parent, boolean assistant, String text, String transcriptId) {
+        LinearLayout line = column();
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(assistant ? -1 : -2, -2);
+        p.gravity = assistant ? Gravity.START : Gravity.END;
+        p.setMargins(0, dp(14), 0, dp(14)); parent.addView(line, p);
+        TextView words = label(line, text, 18, assistant ? INK : ACCENT);
+        words.setLineSpacing(dp(4), 1.12f);
+        if (!assistant) {
+            words.setMaxWidth(Math.round((getResources().getDisplayMetrics().widthPixels - dp(40)) * .86f));
+            words.setPadding(dp(18), dp(12), dp(18), dp(12));
+            words.setBackground(shape(0xffedf2ff, 26, 0xffedf2ff));
+        }
+        // Keep the transcript quiet; copy, replay and saving remain available on long press.
+        words.setOnLongClickListener(v -> {
+            String current = words.getText().toString(); if (current.isEmpty()) return false;
+            String[] actions = assistant ? new String[]{"复制", "播放"}
+                : transcriptId.isEmpty() ? new String[]{"复制"} : new String[]{"复制", "存为记忆"};
+            new AlertDialog.Builder(this).setItems(actions, (dialog, index) -> {
+                if (index == 0) copy("Aidol 对话", current);
+                else if (assistant) { if (canAct()) { newSession(); sessionIsReplay = true; session.speak(current); } }
+                else if (canAct()) mutate("POST", "/v1/memories/from-transcript/" + transcriptId, json());
+            }).show();
+            return true;
+        });
+        return words;
+    }
+
+    private void showLifeCallSettings() {
+        LinearLayout body = dialogBody();
+        button(body, "耳机详情", false, this::showDeviceDetails);
+        label(body, "接通后持续聆听，停顿后自动回答。说“小万”可打断当前回复；点黑色结束按钮挂断。", 14, MUTED);
+        voiceHint = label(body, voiceHintText(), 12, MUTED);
+        lockScreenButton = button(body, lockScreenEnabled() ? "停止锁屏耳机会话" : "开启本次锁屏耳机会话", false, () -> {
+            if (lockScreenEnabled()) { stopLockScreenSession(); updateStatus(); }
+            else enableLockScreenSession();
+        });
+        label(body, "锁屏会话需要本次主动开启，通知可随时停止；来电或耳机断连后不会自动恢复。", 12, MUTED);
+        if (BuildConfig.DEBUG) {
+            LinearLayout diagnosticCard = disclosure(body, "开发诊断", "", false);
+            diagnosticsView = label(diagnosticCard, "", 12, MUTED); diagnosticsView.setTextIsSelectable(true);
+            renderDiagnostics(); button(diagnosticCard, "连接设置", false, this::showDevelopmentSettings);
+        }
+        scrollDialog("通话设置", body);
+    }
+
+    private void voiceButtonText(String text) {
+        if (voiceButton == null) return;
+        if (!lifeConversationLayout) { voiceButton.setText(text); return; }
+        voiceButton.setText(""); voiceButton.setContentDescription(text);
+        voiceButton.setForeground(getDrawable(session != null || repeatArmed || callStartPending
+            ? R.drawable.ic_voice_end : R.drawable.ic_voice_mic));
+    }
+
     /**
      * Work mode on the 对话 page: the meeting's text record in the reference layout — a ruled meta
      * block (topic, date and time range, speakers) and speaker paragraphs that grow while recording.
@@ -689,6 +838,7 @@ public final class MainActivity extends Activity {
         return lines;
     }
     private TextView chatBubble(LinearLayout parent, boolean assistant, String text, String time) {
+        if (lifeConversationLayout) return lifeChatLine(parent, assistant, text, "");
         LinearLayout bubble = card(parent); bubble.setBackground(shape(assistant ? CARD : 0xffeef5ff, 22, assistant ? CARD : 0xffeef5ff));
         LinearLayout.LayoutParams bubbleParams = (LinearLayout.LayoutParams) bubble.getLayoutParams();
         if (assistant) bubbleParams.rightMargin = dp(20); else bubbleParams.leftMargin = dp(24);
@@ -2531,10 +2681,10 @@ public final class MainActivity extends Activity {
                 if (value.optBoolean("voice_error")) { turnSucceeded = false; stopRepeat(); }
             }
             @Override public void transcript(String text) { if (!currentSession(generation)) return; liveTranscript = text; if (liveWords != null) liveWords.setText(text); if (submittedInteraction != VoiceInteraction.NOTES && conversationFeed.transcript(text)) renderLiveTurn(); }
-            @Override public void reply(String text) { if (!currentSession(generation)) return; liveReplyText = text; recording = false; if (liveWords != null) liveWords.setText(text); if (conversationFeed.reply(text)) renderLiveTurn(); if (voiceButton != null) voiceButton.setText("结束会话"); if (callCaption != null) callCaption.setText("正在回答 · 说“小万”可打断 · 单击结束通话"); }
-            @Override public void processing() { if (!currentSession(generation)) return; recording = false; if (voiceButton != null) voiceButton.setText(submittedInteraction == VoiceInteraction.NOTES ? "正在保存…" : "结束会话"); if (callCaption != null) callCaption.setText(submittedInteraction == VoiceInteraction.NOTES ? "正在保存工作记录" : "正在思考 · 单击结束会话"); }
+            @Override public void reply(String text) { if (!currentSession(generation)) return; liveReplyText = text; recording = false; if (liveWords != null) liveWords.setText(text); if (conversationFeed.reply(text)) renderLiveTurn(); if (voiceButton != null) voiceButtonText("结束会话"); if (callCaption != null) callCaption.setText("正在回答 · 说“小万”可打断 · 单击结束通话"); }
+            @Override public void processing() { if (!currentSession(generation)) return; recording = false; if (voiceButton != null) voiceButtonText(submittedInteraction == VoiceInteraction.NOTES ? "正在保存…" : "结束会话"); if (callCaption != null) callCaption.setText(submittedInteraction == VoiceInteraction.NOTES ? "正在保存工作记录" : "正在思考 · 单击结束会话"); }
             @Override public void idle() { if (!currentSession(generation)) return; turnSucceeded = listenMode == VoiceInteraction.CALL; if (!turnSucceeded) stopRepeat(); uncertainTurnId = ""; }
-            @Override public void recording() { if (!currentSession(generation)) return; recording = true; if (voiceButton != null) voiceButton.setText(listenMode == VoiceInteraction.NOTES ? "结束并保存记录" : "结束会话"); if (callCaption != null) callCaption.setText(InteractionCopy.recording(listenMode, settings().optBoolean("vad_enabled", true))); setStatusText("正在听你说…");
+            @Override public void recording() { if (!currentSession(generation)) return; recording = true; if (voiceButton != null) voiceButtonText(listenMode == VoiceInteraction.NOTES ? "结束并保存记录" : "结束会话"); if (callCaption != null) callCaption.setText(InteractionCopy.recording(listenMode, settings().optBoolean("vad_enabled", true))); setStatusText("正在听你说…");
                 if (listenMode == VoiceInteraction.NOTES && visible && tab == 2) { markTabsDirty(); renderTab(); } }  // Show pause/mark controls.
             @Override public void meter(long bytes, double rms) { if (currentSession(generation)) { diagnosticBytes = bytes; diagnosticRms = rms; renderDiagnostics(); if (orb != null) orb.level = (float) Math.min(1, rms * 9);
                 if (workClock != null && workClock.isAttachedToWindow() && session != null && !session.workPaused())
@@ -2561,7 +2711,7 @@ public final class MainActivity extends Activity {
                     if (!turnSucceeded || !sessionAvailable() || (!visible && listenMode != VoiceInteraction.CALL) || (listenMode == 2 && !"life".equals(mode()))) stopRepeat();
                     if (repeatArmed) scheduleNextTurn();
                     else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                    if (voiceButton != null) voiceButton.setText(InteractionCopy.start(listenMode)); if (cancelButton != null) cancelButton.setVisibility(repeatArmed ? View.VISIBLE : View.GONE); if (orb != null) orb.level = 0;
+                    if (voiceButton != null) voiceButtonText(InteractionCopy.start(listenMode)); if (cancelButton != null) cancelButton.setVisibility(repeatArmed ? View.VISIBLE : View.GONE); if (orb != null) orb.level = 0;
                     if (api.vault.token().isEmpty()) { showAuth(0); authError.setText("登录已失效，请重新登录"); } else {
                         if (visible && submittedInteraction == VoiceInteraction.NOTES) { tab = 2; markTabsDirty(); renderTab(); }
                         updateStatus(); if (visible && !repeatArmed) refresh();
@@ -2573,7 +2723,9 @@ public final class MainActivity extends Activity {
         session = new HostedSession(this, api, AudioMode.RISE_SDK,
             new VendorCaptureSource(headset, true, listenMode == VoiceInteraction.NOTES), headset::matchesOutput, listener).locationForeground(() -> visible);
         if (lockScreenEnabled()) voiceService.own(session);
-        if (voiceButton != null) voiceButton.setText("正在准备…"); if (cancelButton != null) cancelButton.setVisibility(View.VISIBLE); updateStatus();
+        if (voiceButton != null) voiceButtonText("正在准备…");
+        if (lifeConversationLayout && callCaption != null) callCaption.setText("正在接通 AI…");
+        if (cancelButton != null) cancelButton.setVisibility(View.VISIBLE); updateStatus();
     }
     private boolean currentSession(long generation) { return !isDestroyed() && generation == sessionGeneration; }
     private boolean hasHeadsetBoundSession() { return modeCueActive() || session != null && (sessionUsesCapture || sessionIsReplay); }
@@ -2596,7 +2748,7 @@ public final class MainActivity extends Activity {
         if (old != null) old.cancel();
         releaseAutomaticWorkService();
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        if (voiceButton != null) voiceButton.setText(InteractionCopy.start(listenMode));
+        if (voiceButton != null) voiceButtonText(InteractionCopy.start(listenMode));
         if (cancelButton != null) cancelButton.setVisibility(View.GONE);
         if (orb != null) orb.level = 0;
         lastNotice = reason;
@@ -2755,6 +2907,9 @@ public final class MainActivity extends Activity {
     }
 
     private void renderModeSelection() {
+        if (tab == 0 && modeChoices != null && lifeConversationLayout != "life".equals(mode())) {
+            tabDirty[0] = true; renderTab(); return;
+        }
         if (tab != 0 || modeChoices == null) return;
         String[] keys = {"life", "work", "commute"};
         for (int i = 0; i < keys.length && i < modeChoices.getChildCount(); i++) {
@@ -2778,9 +2933,9 @@ public final class MainActivity extends Activity {
             tab != 0 && repeatArmed && listenMode == VoiceInteraction.CALL ? View.VISIBLE : View.GONE);
         // The toggle's label is baked at build time; keep it in step when the service state flips.
         if (lockScreenButton != null) lockScreenButton.setText(lockScreenEnabled() ? "停止锁屏耳机会话" : "开启本次锁屏耳机会话");
-        if (voiceButton != null && session == null) voiceButton.setText(callStartPending ? "正在接通…" : repeatArmed ? "通话中 · 我在听" : InteractionCopy.start(listenMode));
+        if (voiceButton != null && session == null) voiceButtonText(callStartPending ? "正在接通…" : repeatArmed ? "通话中 · 我在听" : InteractionCopy.start(listenMode));
         if (cancelButton != null) { cancelButton.setVisibility(session != null || repeatArmed || callStartPending ? View.VISIBLE : View.GONE); cancelButton.setText(InteractionCopy.stop(listenMode)); }
-        if (callCaption != null && session == null) callCaption.setText(InteractionCopy.ready(listenMode));
+        if (callCaption != null && session == null) callCaption.setText(lifeConversationLayout ? "随时可以开始聊天" : InteractionCopy.ready(listenMode));
     }
     private void connectBackend() {
         if (modeCuePlayer != null) modeCuePlayer.stop();

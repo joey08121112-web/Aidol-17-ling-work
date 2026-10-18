@@ -766,3 +766,13 @@ Android `testDebugUnitTest lintDebug assembleDebug` 成功：159项单测，零�
 - PZ261A Android16覆盖安装后，`ModeSwitchInstrumentation` 使用隔离偏好和手机本机MockWebServer，实际走页面模式按钮与独立播放器。最终通过：三种模式共7次完整播放并核验Rise输出；顶部及滚动420px位置切换；草稿、光标、焦点、实时文字、页面对象、主按钮宽度保留；请求/播放/结束均无播放状态栏和挂断；重复点击、提示中再切模式、一次409后成功、500失败及重新尝试恢复。共11次模拟设置PUT、0次非预期测试API请求；未启动录音，结束时系统报告无本App活动录音。另分配但不启动真实会话，核对结束控件仍可见并正常取消。截图核对切换前/播放中/播放后布局稳定。
 - 专项测试没有调用真实语音生成或修改实际账号模式；真实通话、来电/断连和锁屏硬件中断未在本轮重新实测，依靠保留的处理路径与已有单测。真实耳机输出路由已通过，主观听感不作为自动验收结论。
 - 设备与最终构建APK SHA-256一致：`960bb1b1419dc73611df913211b3d110ae18d842218a6d6b80ef5a28cbc72045`。测试APK已卸载、应用重新打开；与安装前私有备份逐行核对会议10、原文215、记忆9、待办5、报告10、设置1及通勤数据2均一致。无需后端更新；本地Git保存，未推送GitHub。
+
+## 2026-10-18 生活模式连续对话界面（本地候选）
+
+- 基线：从 `origin/main` 快进同步至 `060747b`，在 `codex/life-conversation-ui` 修改；开始时工作区无未提交文件。
+- 参考用户提供的 `IMG_0485 2.PNG` 对话布局与 `IMG_0486.HEIC` 当前页面照片。顶部三模式选择保留；生活模式采用右侧浅蓝用户气泡、左侧助手正文，底部固定小球、文字输入及接通／结束按钮。设置、耳机详情与诊断收进入口；长按消息保留复制／重播／存为记忆入口。键盘展开收起装饰和导航，为正文留空间。没有增加虚假的静音按钮或修改供应商、采音与打断协议。
+- 软件验证：JBR 21.0.11、Android SDK 35 执行 `testDebugUnitTest lintDebug assembleDebug` 成功，Android 283 项单测通过，Lint 0 errors / 27 warnings；Python 3.14 离线测试 623 passed / 1 warning，`compileall` 通过。
+- 原生 UI 夹具：只读独立模拟器 `emulator-5582`（API 36），独立包 `com.aidol.app.review`，未登录真实账号。标准屏与 320dp 宽／1.3 倍字体两组均通过：正文左右对齐、顶部和底部固定、流式更新复用视图、最终结果替换临时文字、不保存转写时的当前对话、跨页／模式草稿保留、设置弹窗、结束按钮和完整键盘避让。截图已逐张检查。没有执行模型、录音或供应商 API 请求，分配会话对象用于结束按钮测试不等于真实接通。
+- 首次夹具启动阻塞，线程堆栈定位到基线 `AuthVault` 空偏好直接返回而未结束加载 latch，维护回调反复等待。保留首次日志和堆栈；仅在未登录 UI 夹具内结束内存中的空加载状态后重跑通过。没有修改正式账号加载逻辑；该基线问题仍需独立修复。通用历史 UI 夹具及需要 Rise 的硬件专项未重跑。
+- 证据和候选包：忽略目录 `artifacts/life-conversation-ui/`，包含 `android-build-final.log`、`pytest.log`、`compileall.log`、`visual-run-final.log`、`visual-run-320dp-font130.log`、`instrumentation-first-stack.txt`、`final/` 与 `narrow-final/` 截图。`aidol-life-conversation-debug.apk` 为 `com.aidol.app.debug` 开发包，默认本地 USB 服务，连接设置可切换已有远端。本地验收时未安装至 USB 真机、未更新公网 APK、未推送或部署；后续源码提交与合并状态以 Git 记录为准。
+- 待验：本轮真实登录、Rise 采音、语音转写／回复／人耳听音、锁屏与来电断连；Android 8–10 的兼容键盘分支未在旧系统实跑。模拟器与构建结果不替代这些验收。
