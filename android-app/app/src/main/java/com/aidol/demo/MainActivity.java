@@ -210,7 +210,7 @@ public final class MainActivity extends Activity {
     private LinearLayout workMeetingList, workMeetingDetail;
     private String openWorkMeetingId = "", workMeetingDetailSnapshot = "", workMeetingJumpId = "";
     private boolean workMeetingSyncError, workMeetingAudioPlayable, meetingSeeking;
-    private TextView workClock, workAudioLabel, meetingTitle, meetingMeta;
+    private TextView workClock, workAudioLabel, meetingTitle, meetingMeta, workMeetingPlace;
     private LinearLayout workCaptionBox, conversationCaptionBox;
     // Live captions of the meeting being recorded: final sentences in ink, the interim text in grey.
     // CaptionList keeps the sentence record once; the two boxes render it in different windows.
@@ -1329,7 +1329,7 @@ public final class MainActivity extends Activity {
         android.app.Dialog page = meetingPage;
         meetingPage.setOnDismissListener(d -> {
             if (meetingPage != page) return;
-            meetingPage = null; meetingScroll = null; meetingNav = null; meetingTitle = null; meetingMeta = null; meetingSeek = null;
+            meetingPage = null; meetingScroll = null; meetingNav = null; meetingTitle = null; meetingMeta = null; meetingSeek = null; workMeetingPlace = null;
             openWorkMeetingId = ""; workMeetingDetail = null; workMeetingAudioText = "";
             workMeetingPlayer = null; workMeetingPlayerStatus = null; workMeetingTimeline = null; workMeetingLines.clear(); workMeetingPlayingId = "";
             meetingSections.clear(); meetingPlayback.stop(); workMeetingOpen = null;
@@ -1346,17 +1346,56 @@ public final class MainActivity extends Activity {
             "summary_status", meeting.optString("summary_status"), "status", meeting.optString("status"),
             "error", meeting.optString("error"), "utterances", array(meeting, "utterances"),
             "events", array(meeting, "events"), "audio", meeting.optJSONObject("audio"),
+            "location", meeting.optJSONObject("location"), "address_attempts", meeting.optInt("address_attempts"),
+            "address_retry_at", meeting.opt("address_retry_at"),
             // Progress-line inputs (summary_stage/transcription_status drive the header text between
             // content changes) and detail fields the body branches on; ended_at backfills on finish.
             "transcription_status", meeting.optString("transcription_status"), "summary_stage", meeting.optString("summary_stage"),
             "processed_sections", meeting.optInt("processed_sections"), "total_sections", meeting.optInt("total_sections"),
             "received_segments", meeting.optInt("received_segments"), "ended_at", meeting.optString("ended_at")).toString();
     }
+    private static boolean onlyMeetingAddressChanged(String before, String after) {
+        if (before.isEmpty()) return false;
+        try {
+            JSONObject old = new JSONObject(before), next = new JSONObject(after);
+            for (JSONObject value : new JSONObject[]{old, next}) {
+                value.remove("location"); value.remove("address_attempts"); value.remove("address_retry_at");
+                JSONObject report = value.optJSONObject("report");
+                if (report != null) report.remove("location"); // The backend mirrors a resolved place into the report.
+            }
+            return old.toString().equals(next.toString());
+        } catch (org.json.JSONException invalid) { return false; }
+    }
+    private void updateMeetingPlace(JSONObject meeting) {
+        TextView label = workMeetingPlace;
+        if (label == null) return;
+        String value = meetingPlace(meeting);
+        if (value.contentEquals(label.getText())) return;
+        ScrollView viewport = meetingScroll;
+        int y = viewport == null ? 0 : viewport.getScrollY();
+        label.setText(value);
+        if (viewport == null || !viewport.isAttachedToWindow()) return;
+        // Address wrapping can change the header height; retain the user's current viewport.
+        viewport.getViewTreeObserver().addOnPreDrawListener(new android.view.ViewTreeObserver.OnPreDrawListener() {
+            public boolean onPreDraw() {
+                if (viewport.getViewTreeObserver().isAlive()) viewport.getViewTreeObserver().removeOnPreDrawListener(this);
+                if (meetingScroll == viewport && workMeetingPlace == label) viewport.scrollTo(0, y);
+                return true;
+            }
+        });
+        viewport.requestLayout();
+    }
     private void renderWorkMeetingDetail(JSONObject meeting, String snapshot) {
         if (workMeetingDetail == null || !meeting.optString("id").equals(openWorkMeetingId)) return;
         // While recording, the document is still small and the progress line tracks live session
         // state (workSaving flips) — keep rendering; long finished meetings take the cheap gate.
         if (snapshot.equals(workMeetingDetailSnapshot) && !"recording".equals(meeting.optString("status"))) return;
+        if (workMeetingPlace != null && !"recording".equals(meeting.optString("status"))
+                && onlyMeetingAddressChanged(workMeetingDetailSnapshot, snapshot)) {
+            workMeetingDetailSnapshot = snapshot; workMeetingOpen = meeting;
+            updateMeetingPlace(meeting);
+            return;
+        }
         workMeetingDetailSnapshot = snapshot;
         JSONObject report = meeting.optJSONObject("report");
         JSONArray sources = array(meeting, "sources");
@@ -1392,7 +1431,7 @@ public final class MainActivity extends Activity {
             + "（" + TimeFormat.gmt(zone) + "）", 14, MUTED);
         label(meta, "录音时长：" + TimeFormat.hms(timeline.audioEndMs()) + " · " + timeline.sentences().size() + " 句", 14, MUTED);
         label(meta, "说话人：" + (speakerNames.isEmpty() ? "未区分" : String.join("、", speakerNames)), 14, MUTED);
-        label(meta, meetingPlace(meeting), 14, MUTED);
+        workMeetingPlace = label(meta, meetingPlace(meeting), 14, MUTED);
         meetingSection("总结", "总结");
         if (report == null) label(workMeetingDetail, workMeetingProgress(meeting) + "。原文可先在下方查看，AI 整理完成后自动更新。", 14, MUTED);
         else {
