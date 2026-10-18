@@ -26,6 +26,8 @@ import httpx
 import truststore
 from websockets.asyncio.client import connect
 
+from .http import HttpClientPool
+
 
 class SpeechProviderError(RuntimeError):
     """Sanitized failure suitable for API status responses."""
@@ -51,6 +53,9 @@ class VolcSpeechConfig:
     output_rate: int = 24000
     timeout: float = 40.0
     proxy: str | None = None
+    # Shared HTTP client pool (flash recognize); rides on the config so every
+    # provider built from it reuses one connection pool per app instance.
+    http_pool: "HttpClientPool" = field(default_factory=HttpClientPool, repr=False, compare=False)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "VolcSpeechConfig":
@@ -252,6 +257,7 @@ def pcm_to_wav(pcm: bytes, sample_rate: int = 24000) -> bytes:
 class VolcSpeechProvider:
     def __init__(self, config: VolcSpeechConfig):
         self.config = config
+        self._tls = None
 
     @staticmethod
     def _connection_error(service: str, error: Exception) -> SpeechProviderError:
@@ -295,18 +301,21 @@ class VolcSpeechProvider:
             "format": format, "codec": codec, "rate": cfg.input_rate, "bits": 16, "channel": 1},
             "request": {"model_name": cfg.asr_model, "enable_itn": True, "enable_punc": True, "show_utterances": True}}
         headers = self._headers(flash=True)
-        async with httpx.AsyncClient(timeout=cfg.timeout, proxy=cfg.proxy,
-                verify=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)) as client:
-            try:
-                response = await client.post(cfg.asr_flash_url, headers=headers, json=body)
-                if response.status_code != 200 or response.headers.get("X-Api-Status-Code") != "20000000":
-                    raise SpeechProviderError(f"ASR flash rejected request (HTTP {response.status_code})")
-                result = response.json().get("result", {})
-                return AsrResult(str(result.get("text", "")), True, tuple(result.get("utterances", [])))
-            except httpx.HTTPError as exc:
-                raise SpeechProviderError("ASR flash connection failed") from exc
-            except (ValueError, AttributeError, TypeError) as exc:
-                raise SpeechProviderError("ASR flash returned invalid JSON") from exc
+        if self._tls is None:
+            self._tls = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        client = self.config.http_pool.client("volc_speech", timeout=cfg.timeout,
+                proxy=cfg.proxy, verify=self._tls)
+        try:
+            response = await client.post(cfg.asr_flash_url, headers=headers, json=body,
+                timeout=cfg.timeout)
+            if response.status_code != 200 or response.headers.get("X-Api-Status-Code") != "20000000":
+                raise SpeechProviderError(f"ASR flash rejected request (HTTP {response.status_code})")
+            result = response.json().get("result", {})
+            return AsrResult(str(result.get("text", "")), True, tuple(result.get("utterances", [])))
+        except httpx.HTTPError as exc:
+            raise SpeechProviderError("ASR flash connection failed") from exc
+        except (ValueError, AttributeError, TypeError) as exc:
+            raise SpeechProviderError("ASR flash returned invalid JSON") from exc
 
     async def stream_asr(self, chunks: AsyncIterable[bytes], *, uid: str = "aidol", language: str = "zh-CN",
                          speakers: bool = False) -> AsyncIterator[AsrResult]:

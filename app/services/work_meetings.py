@@ -204,53 +204,53 @@ class WorkMeetingMinutes:
     async def _analyze(self, content, rows):
         messages = [{'role': 'system', 'content': MINUTES_PROMPT},
                     {'role': 'user', 'content': json.dumps(content, ensure_ascii=False)}]
-        async with httpx.AsyncClient(timeout=120, proxy=self.config.proxy) as client:
-            # Correct one invalid structured response without relaxing evidence checks.
-            for attempt in range(2):
-                if not self.charge():
-                    raise MinutesFailure('quota_exceeded')
-                try:
-                    response = await client.post(self.config.text_url.rstrip('/') + '/chat/completions',
-                        headers={'Authorization': 'Bearer ' + self.config.text_key},
-                        json={'model': self.config.text_model, 'temperature': 0.1, 'max_tokens': 16000,
-                              'thinking': {'type': 'disabled'}, 'response_format': {'type': 'json_object'},
-                              'messages': list(messages)})
-                    response.raise_for_status()
-                except httpx.HTTPStatusError as error:
-                    status = error.response.status_code
-                    raise MinutesFailure('authentication' if status in (401, 403) else
-                                         'rate_limited' if status == 429 else 'provider_error') from None
-                except httpx.TimeoutException:
-                    raise MinutesFailure('timeout') from None
-                except httpx.RequestError:
-                    raise MinutesFailure('network') from None
-                try:
-                    choice = response.json()['choices'][0]
-                    if choice.get('finish_reason') in {'length', 'content_filter'}:
-                        raise MinutesFailure('output_truncated' if choice['finish_reason'] == 'length' else 'content_filtered')
-                    raw = choice['message']['content']
-                    if not isinstance(raw, str) or len(raw) > 180000:
-                        raise MinutesFailure('invalid_output')
-                except (ValueError, KeyError, TypeError, IndexError, AttributeError) as error:
-                    if isinstance(error, MinutesFailure):
-                        raise
-                    raise MinutesFailure('invalid_output') from None
-                try:
-                    return _validate_minutes(json.loads(raw), rows)
-                except (ValueError, KeyError, TypeError, IndexError, AttributeError):
-                    if attempt:
-                        try:
-                            return _clear_unsupported_task_metadata(json.loads(raw), rows)
-                        except (ValueError, KeyError, TypeError, IndexError, AttributeError):
-                            raise MinutesFailure('invalid_output') from None
-                    logging.getLogger('uvicorn.error.aidol.minutes').info('work_minutes validation=failed correction=1')
-                    messages.extend([
-                        {'role': 'assistant', 'content': raw},
-                        {'role': 'user', 'content': '上次 JSON 未通过格式或原文依据校验。请重新逐项核对并返回完整 JSON：'
-                         '所有 source_ids 必须是 document 中已有的原文 ID；owner、person、due、time、location '
-                         '必须逐字出现在各自引用的原文中，不得改写汉字数字、时间措辞、推断日期或人物。'
-                         '整场说话人标签仅用于有依据的观点或第一人称承诺。无法逐字支持的负责人、时间、地点留空字符串；'
-                         '不能支持的条目删除。保留整场总结和有依据的其他内容；所有必需分类均保留，无内容用空数组。'}])
+        client = self.config.http_pool.client('text', timeout=120, proxy=self.config.proxy)
+        # Correct one invalid structured response without relaxing evidence checks.
+        for attempt in range(2):
+            if not self.charge():
+                raise MinutesFailure('quota_exceeded')
+            try:
+                response = await client.post(self.config.text_url.rstrip('/') + '/chat/completions',
+                    headers={'Authorization': 'Bearer ' + self.config.text_key},
+                    json={'model': self.config.text_model, 'temperature': 0.1, 'max_tokens': 16000,
+                          'thinking': {'type': 'disabled'}, 'response_format': {'type': 'json_object'},
+                          'messages': list(messages)})
+                response.raise_for_status()
+            except httpx.HTTPStatusError as error:
+                status = error.response.status_code
+                raise MinutesFailure('authentication' if status in (401, 403) else
+                                     'rate_limited' if status == 429 else 'provider_error') from None
+            except httpx.TimeoutException:
+                raise MinutesFailure('timeout') from None
+            except httpx.RequestError:
+                raise MinutesFailure('network') from None
+            try:
+                choice = response.json()['choices'][0]
+                if choice.get('finish_reason') in {'length', 'content_filter'}:
+                    raise MinutesFailure('output_truncated' if choice['finish_reason'] == 'length' else 'content_filtered')
+                raw = choice['message']['content']
+                if not isinstance(raw, str) or len(raw) > 180000:
+                    raise MinutesFailure('invalid_output')
+            except (ValueError, KeyError, TypeError, IndexError, AttributeError) as error:
+                if isinstance(error, MinutesFailure):
+                    raise
+                raise MinutesFailure('invalid_output') from None
+            try:
+                return _validate_minutes(json.loads(raw), rows)
+            except (ValueError, KeyError, TypeError, IndexError, AttributeError):
+                if attempt:
+                    try:
+                        return _clear_unsupported_task_metadata(json.loads(raw), rows)
+                    except (ValueError, KeyError, TypeError, IndexError, AttributeError):
+                        raise MinutesFailure('invalid_output') from None
+                logging.getLogger('uvicorn.error.aidol.minutes').info('work_minutes validation=failed correction=1')
+                messages.extend([
+                    {'role': 'assistant', 'content': raw},
+                    {'role': 'user', 'content': '上次 JSON 未通过格式或原文依据校验。请重新逐项核对并返回完整 JSON：'
+                     '所有 source_ids 必须是 document 中已有的原文 ID；owner、person、due、time、location '
+                     '必须逐字出现在各自引用的原文中，不得改写汉字数字、时间措辞、推断日期或人物。'
+                     '整场说话人标签仅用于有依据的观点或第一人称承诺。无法逐字支持的负责人、时间、地点留空字符串；'
+                     '不能支持的条目删除。保留整场总结和有依据的其他内容；所有必需分类均保留，无内容用空数组。'}])
 
     async def generate(self, rows, progress=lambda stage, done, total: None):
         source_ids = [row['id'] for row in rows]

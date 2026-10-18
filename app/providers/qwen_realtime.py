@@ -396,6 +396,14 @@ class QwenDuplexSession(QwenRealtimeSession):
                         self.response_id = response_id
                         self.active = True
                         self.response_created.set()
+                    # Bind every queued event to the turn that produced it, so
+                    # the consumer can drop a previous turn's late audio after
+                    # that turn timed out. Events without any id keep the turn
+                    # current at read time; if the endpoint emits none at all,
+                    # nothing is ever dropped (behaviour unchanged).
+                    event['_aidol_response_id'] = response_id or self.response_id
+                    if event['_aidol_response_id'] and event['_aidol_response_id'] in self.cancelled_ids:
+                        continue
                     if kind == 'response.done':
                         self.active = False
                         self.settled.set()
@@ -429,9 +437,15 @@ class QwenDuplexSession(QwenRealtimeSession):
         return value
 
     async def receive(self, timeout=30):
-        event = await self.take(self.responses, timeout)
-        self.response_buffered = max(0, self.response_buffered - event.pop("_aidol_buffer_size", 0))
-        return event
+        while True:
+            event = await self.take(self.responses, timeout)
+            self.response_buffered = max(0, self.response_buffered - event.pop("_aidol_buffer_size", 0))
+            bound = event.pop("_aidol_response_id", None)
+            if bound is not None and self.response_id is not None and bound != self.response_id:
+                # A previous turn timed out or was abandoned; its late events
+                # must not leak audio into the reply being consumed now.
+                continue
+            return event
 
     async def update(self, **settings):
         async with self.update_lock:
