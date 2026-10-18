@@ -11,8 +11,18 @@ from ..providers.amap import amap_get
 
 
 class MapService:
+    # Adcode resolution caches live on the per-account MapService instance, so
+    # repeated weather queries pay one HTTP call instead of geocode+weather.
+    _CITY_CACHE_LIMIT = 16
+    _SPOT_CACHE_LIMIT = 4
+
     def __init__(self, config):
         self.config = config
+        self._city_adcodes = {}
+        self._spot_adcodes = {}
+
+    def _http(self):
+        return self.config.http_pool.client("amap", timeout=10, proxy=self.config.proxy)
 
     async def route(self, location, settings):
         if not self.config.amap_key:
@@ -22,22 +32,22 @@ class MapService:
         transport = getattr(settings, "transport", "driving")
         if transport not in {"driving", "walking", "transit", "bicycling"}:
             raise ValueError("出行方式必须为 driving、walking、transit 或 bicycling")
-        async with httpx.AsyncClient(timeout=10, proxy=self.config.proxy) as client:
-            # navigator.geolocation gives WGS-84; AMap route APIs require GCJ-02.
-            origin = await self._convert(client, location)
-            params = {"origin": origin,
-                      "destination": f"{settings.destination_lon},{settings.destination_lat}"}
-            if transport == "transit":
-                city = await self._origin_city(client, origin)
-                if not city:
-                    return {"available": False, "reason": "无法确定出发城市，请检查定位后重试"}
-                destination_city = getattr(settings, "transit_city", "上海") or "上海"
-                params.update({"city": city, "cityd": destination_city, "extensions": "all", "strategy": "0"})
-                route = await self._get(client, "direction/transit/integrated", params)
-            else:
-                if transport == "driving":
-                    params.update({"extensions": "base", "strategy": "0"})
-                route = await self._get(client, "direction/" + transport, params)
+        client = self._http()
+        # navigator.geolocation gives WGS-84; AMap route APIs require GCJ-02.
+        origin = await self._convert(client, location)
+        params = {"origin": origin,
+                  "destination": f"{settings.destination_lon},{settings.destination_lat}"}
+        if transport == "transit":
+            city = await self._origin_city(client, origin)
+            if not city:
+                return {"available": False, "reason": "无法确定出发城市，请检查定位后重试"}
+            destination_city = getattr(settings, "transit_city", "上海") or "上海"
+            params.update({"city": city, "cityd": destination_city, "extensions": "all", "strategy": "0"})
+            route = await self._get(client, "direction/transit/integrated", params)
+        else:
+            if transport == "driving":
+                params.update({"extensions": "base", "strategy": "0"})
+            route = await self._get(client, "direction/" + transport, params)
         paths = route.get("data" if transport == "bicycling" else "route", {}).get("transits" if transport == "transit" else "paths", [])
         if not paths:
             return {"available": False, "reason": "高德未返回可用路线"}
@@ -72,8 +82,8 @@ class MapService:
         params = {"keywords": query.strip(), "offset": "10", "page": "1", "extensions": "base"}
         if city:
             params["city"] = city
-        async with httpx.AsyncClient(timeout=10, proxy=self.config.proxy) as client:
-            body = await self._get(client, "place/text", params)
+        client = self._http()
+        body = await self._get(client, "place/text", params)
         return self._poi_result(body, "amap_poi")
 
     async def nearby(self, location, keyword="美食", radius=3000, metro_only=False):
@@ -84,12 +94,12 @@ class MapService:
             raise ValueError("周边搜索关键词不得超过 100 个字符")
         if not self.config.amap_key:
             return {"available": False, "pois": [], "reason": "尚未配置高德 Key"}
-        async with httpx.AsyncClient(timeout=10, proxy=self.config.proxy) as client:
-            origin = await self._convert(client, location)
-            body = await self._get(client, "place/around", {"location": origin,
-                "keywords": "" if metro_only else keyword.strip() or "美食", "radius": str(radius), "sortrule": "distance",
-                **({"types": "150500"} if metro_only else {}),
-                "offset": "10", "page": "1", "extensions": "base"})
+        client = self._http()
+        origin = await self._convert(client, location)
+        body = await self._get(client, "place/around", {"location": origin,
+            "keywords": "" if metro_only else keyword.strip() or "美食", "radius": str(radius), "sortrule": "distance",
+            **({"types": "150500"} if metro_only else {}),
+            "offset": "10", "page": "1", "extensions": "base"})
         result = self._poi_result(body, "amap_nearby")
         result["radius_meters"] = radius
         return result
@@ -101,8 +111,8 @@ class MapService:
             raise ValueError("天气查询需要 6 位城市 adcode，可从地点搜索结果获得")
         if not self.config.amap_key:
             return {"available": False, "reason": "尚未配置高德 Key"}
-        async with httpx.AsyncClient(timeout=10, proxy=self.config.proxy) as client:
-            body = await self._get(client, "weather/weatherInfo", {"city": city, "extensions": "all" if forecast else "base"})
+        client = self._http()
+        body = await self._get(client, "weather/weatherInfo", {"city": city, "extensions": "all" if forecast else "base"})
         if forecast:
             return self._forecast(body)
         lives = body.get("lives", [])
@@ -120,20 +130,61 @@ class MapService:
         """Resolve a selected GCJ-02 destination when POI search omits adcode."""
         if not self.config.amap_key:
             return {"available": False, "reason": "尚未配置高德 Key"}
-        async with httpx.AsyncClient(timeout=10, proxy=self.config.proxy) as client:
-            body = await self._get(client, "geocode/regeo", {"location": f"{longitude},{latitude}", "extensions": "base"})
+        client = self._http()
+        body = await self._get(client, "geocode/regeo", {"location": f"{longitude},{latitude}", "extensions": "base"})
         code = self._text(body.get("regeocode", {}).get("addressComponent", {}).get("adcode"))
         if len(code) != 6 or not code.isascii() or not code.isdigit():
             return {"available": False, "reason": "暂时无法识别目的地天气区域，请更换目的地重试"}
         return await self.weather(code, forecast)
+
+    async def weather_for(self, city="", location=None, forecast=False):
+        """Weather for a city name or the current position.
+
+        The adcode a city name or coordinate resolves to is cached on this
+        per-account service instance, so repeated queries cost one weather
+        request instead of geocode/regeo plus weather. City adcodes are stable
+        administrative codes; coordinates are cached rounded to ~1 km.
+        """
+        if city:
+            code = str(city).strip()
+            if not (code.isascii() and code.isdigit() and len(code) == 6):
+                code = self._city_adcodes.get(city)
+                if code is None:
+                    resolved = await self.geocode(city)
+                    if not resolved.get("available"):
+                        return resolved
+                    places = resolved.get("places", [])
+                    if len(places) != 1:
+                        return {"available": False, "reason": "城市不明确，请提供城市/区县名称"}
+                    code = places[0]["adcode"]
+                    self._remember(self._city_adcodes, city, code, self._CITY_CACHE_LIMIT)
+            return await self.weather(code, forecast)
+        if location is None:
+            raise ValueError("缺少城市或有效定位")
+        spot = (round(location.longitude, 2), round(location.latitude, 2))
+        code = self._spot_adcodes.get(spot)
+        if code is None:
+            resolved = await self.reverse(location)
+            if not resolved.get("available"):
+                return resolved
+            code = resolved.get("adcode", "")
+            if code:
+                self._remember(self._spot_adcodes, spot, code, self._SPOT_CACHE_LIMIT)
+        return await self.weather(code, forecast)
+
+    def _remember(self, cache, key, value, limit):
+        cache.pop(key, None)
+        cache[key] = value
+        while len(cache) > limit:
+            cache.pop(next(iter(cache)))
 
     async def geocode(self, address, city=""):
         if not address.strip() or len(address) > 100 or len(city) > 80:
             raise ValueError("地址需为 1–100 字，城市最多 80 字")
         if not self.config.amap_key:
             return {"available": False, "places": [], "reason": "尚未配置高德 Key"}
-        async with httpx.AsyncClient(timeout=10, proxy=self.config.proxy) as client:
-            body = await self._get(client, "geocode/geo", {"address": address, "city": city})
+        client = self._http()
+        body = await self._get(client, "geocode/geo", {"address": address, "city": city})
         places = []
         for item in (body.get("geocodes") or [])[:10]:
             if not isinstance(item, dict):
@@ -149,9 +200,9 @@ class MapService:
     async def reverse(self, location):
         if not self.config.amap_key:
             return {"available": False, "reason": "尚未配置高德 Key"}
-        async with httpx.AsyncClient(timeout=10, proxy=self.config.proxy) as client:
-            origin = await self._convert(client, location)
-            body = await self._get(client, "geocode/regeo", {"location": origin, "extensions": "base"})
+        client = self._http()
+        origin = await self._convert(client, location)
+        body = await self._get(client, "geocode/regeo", {"location": origin, "extensions": "base"})
         address = body.get("regeocode") or {}
         component = address.get("addressComponent") or {}
         # GCJ-02 coordinates let the client save "current position" as home/work directly.

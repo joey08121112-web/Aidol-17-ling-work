@@ -137,21 +137,22 @@ class WorkMeetingMinutes:
     async def _analyze(self, content, rows):
         if not self.charge():
             raise ValueError('Meeting analysis quota reached')
-        async with httpx.AsyncClient(timeout=120, proxy=self.config.proxy) as client:
-            response = await client.post(self.config.text_url.rstrip('/') + '/chat/completions',
-                headers={'Authorization': 'Bearer ' + self.config.text_key},
-                json={'model': self.config.text_model, 'temperature': 0.1, 'max_tokens': 16000,
-                      'thinking': {'type': 'disabled'}, 'response_format': {'type': 'json_object'},
-                      'messages': [{'role': 'system', 'content': MINUTES_PROMPT},
-                                   {'role': 'user', 'content': json.dumps(content, ensure_ascii=False)}]})
-            response.raise_for_status()
-            choice = response.json()['choices'][0]
-            if choice.get('finish_reason') in {'length', 'content_filter'}:
-                raise ValueError('Incomplete meeting output')
-            raw = choice['message']['content']
-            if not isinstance(raw, str) or len(raw) > 180000:
-                raise ValueError('Invalid minutes size')
-            return _validate_minutes(json.loads(raw), rows)
+        client = self.config.http_pool.client('text', timeout=120, proxy=self.config.proxy)
+        response = await client.post(self.config.text_url.rstrip('/') + '/chat/completions',
+            headers={'Authorization': 'Bearer ' + self.config.text_key},
+            json={'model': self.config.text_model, 'temperature': 0.1, 'max_tokens': 16000,
+                  'thinking': {'type': 'disabled'}, 'response_format': {'type': 'json_object'},
+                  'messages': [{'role': 'system', 'content': MINUTES_PROMPT},
+                               {'role': 'user', 'content': json.dumps(content, ensure_ascii=False)}]},
+            timeout=120)
+        response.raise_for_status()
+        choice = response.json()['choices'][0]
+        if choice.get('finish_reason') in {'length', 'content_filter'}:
+            raise ValueError('Incomplete meeting output')
+        raw = choice['message']['content']
+        if not isinstance(raw, str) or len(raw) > 180000:
+            raise ValueError('Invalid minutes size')
+        return _validate_minutes(json.loads(raw), rows)
 
     async def generate(self, rows, progress=lambda stage, done, total: None):
         source_ids = [row['id'] for row in rows]
