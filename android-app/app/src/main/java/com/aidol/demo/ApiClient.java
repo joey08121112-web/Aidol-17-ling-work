@@ -35,12 +35,14 @@ public final class ApiClient {
         HttpTransport() { this(false); }
         HttpTransport(boolean debugUsbOrigin) {
             // Reuse is safe everywhere: reads recover a stale socket on a fresh connection and
-            // mutations never replay an uncertain write. The debug USB origin only narrows the
-            // stale-socket window (adb reverse reloads) with a short pool keep-alive.
+            // mutations never replay an uncertain write.
             OkHttpClient.Builder base = new OkHttpClient.Builder().connectTimeout(15, TimeUnit.SECONDS)
                 .readTimeout(100, TimeUnit.SECONDS).writeTimeout(30, TimeUnit.SECONDS).callTimeout(120, TimeUnit.SECONDS)
                 .retryOnConnectionFailure(false).followRedirects(false).followSslRedirects(false);
-            if (debugUsbOrigin) base.connectionPool(new ConnectionPool(5, 10, TimeUnit.SECONDS));
+            // Idle sockets must be dropped before the server closes them, or the next write reuses a
+            // dead socket and fails without retry: uvicorn keeps idle connections 5 s (local USB),
+            // nginx 75 s (hosted). OkHttp's own default is 5 minutes.
+            base.connectionPool(new ConnectionPool(5, debugUsbOrigin ? 4 : 60, TimeUnit.SECONDS));
             mutations = base.build();
             safeReads = mutations.newBuilder().retryOnConnectionFailure(true).build();
             liveSockets = mutations.newBuilder().readTimeout(0, TimeUnit.SECONDS)

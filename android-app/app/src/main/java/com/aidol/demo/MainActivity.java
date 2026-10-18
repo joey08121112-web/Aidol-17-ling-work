@@ -93,6 +93,8 @@ public final class MainActivity extends Activity {
     private boolean sessionUsesCapture;
     private ModeChangeRetry modeChange;
     private String modeFailureNotice = "";
+    /** The mode shown before an optimistic switch; restored if the server never confirms it. */
+    private String modeBeforeChange = "";
     /** errorNotice colours a failure red; pageNotice only explains the page it was raised on. */
     private String errorNotice = "", pageNotice = "";
     private Runnable modeChangeDelay;
@@ -114,7 +116,7 @@ public final class MainActivity extends Activity {
         handler.removeCallbacks(preparationTick);
         if (headset == null || api == null) return;
         HeadsetController.Snapshot device = headset.snapshot();
-        boolean eligible = visible && tab == 0 && session == null && !modeCueActive()
+        boolean eligible = visible && tab == 0 && session == null
             && !api.vault.token().isEmpty() && !"work".equals(mode())
             && state.optJSONObject("capabilities") != null
             && state.optJSONObject("capabilities").optBoolean("voice_prepare")
@@ -122,6 +124,8 @@ public final class MainActivity extends Activity {
             && WearState.from(device.leftWorn, device.rightWorn) != WearState.REMOVED
             && checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
         if (!eligible) { clearVoicePreparation(); return; }
+        // The mode cue owns the headset briefly; keep a ready link but start none until it ends.
+        if (modeCueActive()) { handler.postDelayed(preparationTick, 1000); return; }
         if (voicePreparation != null && !voicePreparation.usable(api)) clearVoicePreparation();
         // Keep standby alive while eligible, including after an expired/failed
         // preparation. A stale object must never suppress future preparation.
@@ -2694,7 +2698,9 @@ public final class MainActivity extends Activity {
         // A repeated tap during the settings request must not introduce a progress/error banner.
         if (modeChange != null) return;
         if (busy || locationListener != null || permissionPending) { feedback("上一项操作正在进行，请稍后切换模式", LocalCue.BUSY); return; }
-        clearVoicePreparation(); preparationAttemptAt = -60000;
+        // Life and commute share the call layout and a prepared voice link; the server refreshes
+        // its instructions when the call starts. Only work mode, which never prepares, drops it.
+        if ("work".equals(mode) || "work".equals(mode())) { clearVoicePreparation(); preparationAttemptAt = -60000; }
         if (modeCuePlayer != null) modeCuePlayer.stop();
         if (session != null && "work".equals(mode()) && sessionUsesCapture) {
             deferredMode = mode; deferredOpenConversation = openConversation;
@@ -2707,8 +2713,32 @@ public final class MainActivity extends Activity {
         modeFailureNotice = "";
         JSONObject body = json(); put(body, "mode", mode); put(body, "auto_mode", false);
         ModeChangeRetry change = new ModeChangeRetry(mode, api, sessionGeneration, android.os.SystemClock.elapsedRealtime());
-        modeChange = change; ++stateRevision; busy = true; updateStatus();
+        modeChange = change; ++stateRevision; busy = true;
+        // Optimistic: the tap shows the new mode at once; the request confirms or rolls it back.
+        modeBeforeChange = mode(); showMode(mode, openConversation); updateStatus();
         submitModeChange(change, api, body, openConversation);
+    }
+    /** Shows a mode locally (state, layout, controls) without touching the server or sessions. */
+    private void showMode(String value, boolean openConversation) {
+        JSONObject stored = state.optJSONObject("settings"); if (stored == null) { stored = new JSONObject(); put(state, "settings", stored); }
+        put(stored, "mode", value);
+        JSONObject agent = state.optJSONObject("agent"); if (agent == null) agent = new JSONObject();
+        put(agent, "mode", value); put(state, "agent", agent);
+        listenMode = "work".equals(value) ? VoiceInteraction.NOTES : VoiceInteraction.CALL;
+        boolean navigate = openConversation && tab != 0;
+        if (openConversation) tab = 0;
+        if (tab == 0 && !navigate && modeChoices != null) {
+            // Preserve the mounted conversation, draft/focus and the user's viewport.
+            ScrollView viewport = scroll;
+            int y = viewport == null ? 0 : viewport.getScrollY();
+            renderModeSelection();
+            if (voiceHint != null) voiceHint.setText(voiceHintText());
+            restoreWorkScroll(viewport, y);
+        } else { markTabsDirty(); renderTab(); }
+    }
+    private void restoreModeBeforeChange() {
+        String previous = modeBeforeChange; modeBeforeChange = "";
+        if (!previous.isEmpty() && !previous.equals(mode()) && !isDestroyed()) showMode(previous, false);
     }
     private boolean currentModeChange(ModeChangeRetry change) {
         return !isDestroyed() && modeChange == change && change.matches(api, sessionGeneration);
@@ -2724,7 +2754,10 @@ public final class MainActivity extends Activity {
         stopRepeat();
         finishModeChange(change);
         if (!isDestroyed()) {
-            modeFailureNotice = lastNotice = "模式切换已停止，请刷新确认当前模式"; updateStatus();
+            // An in-flight request may still have applied: show the old mode, then reload the truth.
+            restoreModeBeforeChange();
+            modeFailureNotice = lastNotice = "模式切换未确认，正在同步当前模式"; updateStatus();
+            refresh();
         }
     }
     private void pauseModeChange() {
@@ -2734,7 +2767,7 @@ public final class MainActivity extends Activity {
         // An in-flight request may already have applied, so let its existing response finish.
         if (modeChangeDelay != null) {
             stopRepeat();
-            finishModeChange(modeChange);
+            finishModeChange(modeChange); restoreModeBeforeChange();
             modeFailureNotice = lastNotice = "模式尚未切换，请稍后重新选择"; updateStatus();
         }
     }
@@ -2750,24 +2783,14 @@ public final class MainActivity extends Activity {
                 runOnUiThread(() -> {
                     if (!currentModeChange(change)) { abandonModeChange(change); return; }
                     finishModeChange(change); ++stateRevision;
+                    String shown = mode();
                     put(state, "settings", result);
                     String appliedMode = result.optString("mode", change.mode);
-                    JSONObject agent = state.optJSONObject("agent"); if (agent == null) agent = new JSONObject();
-                    put(agent, "mode", appliedMode); put(state, "agent", agent);
-                    diagnosticError = "无";
+                    diagnosticError = "无"; modeBeforeChange = "";
                     if (commutePanel != null && commutePanel.modeChanged(appliedMode)) lastNotice = "已切换到" + ModeCopy.name(appliedMode) + "，本次通勤已结束";
-                    listenMode = "work".equals(appliedMode) ? VoiceInteraction.NOTES : VoiceInteraction.CALL;
-                    boolean navigate = openConversation && tab != 0;
-                    if (openConversation) tab = 0;
-                    if (tab == 0 && !navigate && modeChoices != null) {
-                        // Preserve the mounted conversation, draft/focus and the user's viewport.
-                        ScrollView viewport = scroll;
-                        int y = viewport == null ? 0 : viewport.getScrollY();
-                        renderModeSelection();
-                        if (voiceHint != null) voiceHint.setText(voiceHintText());
-                        updateStatus();
-                        restoreWorkScroll(viewport, y);
-                    } else { markTabsDirty(); renderTab(); }
+                    // The optimistic view already shows the request; redraw only if the server chose otherwise.
+                    if (!appliedMode.equals(shown)) showMode(appliedMode, false);
+                    updateStatus();
                     // Settings succeed independently of the local sound. No conversational session.
                     if (client == api && change.matches(api, sessionGeneration)) playModeCue(appliedMode);
                     prepareVoice();
@@ -2783,7 +2806,7 @@ public final class MainActivity extends Activity {
                     return;
                 }
                 finishModeChange(change);
-                stopRepeat();
+                stopRepeat(); restoreModeBeforeChange();
                 if (statusCode == 401) client.vault.clear();
                 lastNotice = statusCode == 409 ? "上一轮仍在处理，模式尚未切换；请稍后再试"
                     : statusCode == 401 ? "登录已失效，请重新登录"
