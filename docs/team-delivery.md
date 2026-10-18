@@ -4,7 +4,7 @@
 
 本轮追加的触控、佩戴、重连和电量联动操作见 [Rise 联动](rise-controls.md)。
 
-App 已内置切模式、开始和结束的固定中文操作提示；运行时不额外请求后端合成。五个 WAV 是产品源资产，随 Git 和源码交接包提供，macOS 无需安装 Windows 语音引擎，见 [操作语音](android-audio-prompts.md)。
+App 的固定操作语音已改为本地无语音耳标；三个模式各有固定声音，其他操作共用确认音。WAV是产品源资产，按Python脚本可重建，无需语音引擎或网络，见[操作提示音](android-audio-prompts.md)。
 
 ## 需要发给同事的文件
 

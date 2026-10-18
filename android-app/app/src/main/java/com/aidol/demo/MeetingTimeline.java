@@ -11,7 +11,7 @@ import org.json.JSONObject;
  */
 final class MeetingTimeline {
     static final class Entry {
-        enum Kind { SENTENCE, PAUSE, RESUME, MARK }
+        enum Kind { SENTENCE, PAUSE, RESUME, MARK, CALL_START, CALL_END }
         final Kind kind;
         final String id;       // Sentence id (or legacy transcript id); event id otherwise.
         final long startMs;
@@ -66,7 +66,8 @@ final class MeetingTimeline {
             JSONObject item = events.optJSONObject(i); if (item == null) continue;
             String kind = item.optString("kind");
             Entry.Kind type = "pause".equals(kind) ? Entry.Kind.PAUSE : "resume".equals(kind) ? Entry.Kind.RESUME
-                : "mark".equals(kind) ? Entry.Kind.MARK : null;
+                : "mark".equals(kind) ? Entry.Kind.MARK : "call_start".equals(kind) ? Entry.Kind.CALL_START
+                : "call_end".equals(kind) ? Entry.Kind.CALL_END : null;
             if (type != null) entries.add(new Entry(type, item.optString("id"), item.optLong("offset_ms"), 0, "", item.optString("created_at")));
         }
         // Stable: at equal times, events stay after the sentence that ends there.

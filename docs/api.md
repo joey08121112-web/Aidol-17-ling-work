@@ -6,24 +6,32 @@
 
 | 请求 | 契约 |
 | --- | --- |
-| `POST /v1/work-meetings` | `{"meeting_id":"客户端生成16–64位唯一编号"}`；工作模式下幂等建场，已结束编号不能复用。成功后才开启采音。 |
+| `POST /v1/work-meetings` | `{"meeting_id":"客户端生成16–64位唯一编号"}`；工作模式下幂等建场，已结束或已删除编号不能复用。成功后才开启采音。 |
 | `POST /v1/voice?request_id=…&meeting_id=…&segment_index=0&offset_ms=0` | PCM16/16kHz；`meeting_id` 与从0递增的 `segment_index` 必须同时提供，来源为 `ambient_capture`。`recognize=0` 表示该段文字已由实时字幕保存：只存录音，不做 ASR、不计额度。默认 `recognize=1` 时做整段识别，并删除起点落在该段内的实时字幕句子再写入识别结果（实时字幕中断时的兜底）。`offset_ms` 为该段在本场录音时间轴上的起点（只计已录 PCM，32 字节/毫秒，不含暂停）；旧客户端省略时按 `segment_index×20000`。只能与会议参数一起使用。每段独立 request_id；原文与场次关联在一个事务内提交。静音段保留无原文回执，不假装记录了文字。同一编号重试不重复 ASR 或原文，不同请求占用同一片段编号返回409。 |
 | `POST /v1/work-meetings/{id}/finish` | `{"segment_count":N,"complete":true}`；客户端排空后告知本场总片段数。核对0到N−1回执，完整且有文字才为 `saved`；无讲话为 `empty`，缺段／非正常结束为 `partial`。返回原文和后台整理状态；结束请求幂等，不再接受追加。异常中断可用 `complete:false` 收尾已保存部分。 |
-| `GET /v1/work-meetings` | `{"meetings":[…]}`；最近100场，含开始／结束时间、原文段数、标题、摘要和处理状态。只读 SQLite 快照不等待 ASR 账号锁。 |
+| `GET /v1/work-meetings` | `{"meetings":[…]}`；最多100场，置顶优先，同组按开始时间从新到旧（按实际时刻比较时区），同刻按ID稳定排序；含pinned、开始／结束时间、原文段数、标题、摘要和处理状态。只读 SQLite 快照不等待 ASR 账号锁。 |
 | `GET /v1/work-meetings/{id}` | 本场完整有序 `sources`（含 `offset_ms/duration_ms`）、`utterances`、`events`、`audio` 和 `report`；原文不按最近100条聊天裁剪。未知／其他账号编号返回404。列表另含 `duration_ms`。 |
 | `WS /v1/work-meetings/{id}/live?offset_ms=N` | 实时字幕（仅请求头 Bearer 鉴权）。会议须为录音中且工作模式，否则以 4409 关闭；每条连接计一次额度，不占账号锁。客户端发送已录 PCM 二进制帧（16 kHz 单声道 PCM16，单帧 ≤64000 字节；暂停期间不发），控制消息 `{"type":"pause"}` / `{"type":"resume","offset_ms":N}` / `{"type":"end"}`。服务端发送 `ready`、`partial {text,start_ms}`（仅显示、不保存）、`final {sentences:[{id,transcript_id,start_ms,end_ms,text,speaker}]}`（已保存到本场）、`paused`、`done`（收到 end 后保存完最后几句）、`error`（上游失败，随后关闭）。时间轴为 `offset_ms` 起累计的已录 PCM；暂停或单次上游满10分钟时结束当前识别并另起一段。字幕句子以 `segment_index=-1` 进入 `utterances`/`sources`，纪要可直接引用。 |
-| `POST /v1/work-meetings/{id}/events` | `{"event_id":"16–64位","kind":"pause|resume|mark","offset_ms":N,"origin":"app|headset"}`；仅录音中可写。同一 event_id 重试返回原记录，内容不同返回409；已暂停再暂停、未暂停时继续返回409。读 SQLite 快照写入，不等待片段 ASR 持有的账号锁。 |
+| `POST /v1/work-meetings/{id}/events` | `{"event_id":"16–64位","kind":"pause|resume|mark|call_start|call_end","offset_ms":N,"origin":"app|headset"}`；仅录音中可写。同一 event_id 重试返回原记录，内容不同返回409；已暂停再暂停、未暂停时继续返回409。`call_start/call_end` 标注当前会议内的耳机通话录音区间，重复开始或未开始就结束返回409；与手动暂停状态独立。读 SQLite 快照写入，不等待片段 ASR 持有的账号锁。 |
 | `GET /v1/work-meetings/{id}/audio?start_ms=0&duration_ms=600000` | 返回本场录音时间轴 `[start_ms, start_ms+duration_ms)` 的 16 kHz 单声道 WAV，单次最多 10 分钟，裁到最后一段已存音频；缺失片段补静音。无录音、已过期或已删除返回404。 |
 | `DELETE /v1/work-meetings/{id}/audio` | 只删除本场录音文件，保留原文、句子与纪要；录音中返回409。返回会议详情。 |
+| `PATCH /v1/work-meetings/{id}` | `{pinned:true/false}`（严格布尔值）；返回`{meeting_id,pinned,meetings}`。重复设置幂等，未找到/跨账号404；不改原开始时间、状态或纪要。 |
+| `DELETE /v1/work-meetings/{id}` | 删除已结束会议；录音中409，未知/跨账号404。成功返回`{ok,deleted_task_ids,meetings,meeting_report,tasks,transcripts}`，后四项为删除后的当前账号快照；同账号已删除ID重复请求返回相同删除回执，不恢复会议。 |
 | `POST /v1/work-meetings/{id}/retry-summary` | 只重新处理已保存的文字，不重新 ASR 或上传音频；并发轮询不重复启动后台任务。替换同场旧纪要和待办，保留相同待办的完成状态。 |
+
+2026-10-18 会议管理：列表/详情/导出增加`pinned`布尔值，旧库无损增加默认0字段。Android在每条标题右上角提供书签，未置顶为空心，置顶后红色实心；多条置顶按会议开始时间降序排列，取消回到普通时间组。点击有短缩放反馈，列表原地重排并保留scrollY；对话页的最近会议独立按时间选取，不受书签排序影响。会议卡片整面可左滑露出删除，确认窗说明删除范围、确认后才提交；取消/失败不移除行，失败可重试，过期轮询不得覆盖修改结果。
+
+删除事务清理本场原文、句子、事件、上传记录、纪要和引用本场原文的关联行动项（含已编辑行动项），随后清理本场录音目录；引用被删原文的历史整理快照失效，其未引用被删来源的行动项独立保留。单独保存的记忆、独立对话及其他会议保留；曾返回原文的请求缓存失效，防止迟到重放旧原文。Android取消被删行动项提醒、清理该会议本地编辑稿/详情缓存并更新历史整理结果。删除回执只保存会议ID与关联任务ID，防止迟到建场重建；迟到ASR/AI/地址结果无法恢复已删会议。全量清空同时清除此回执表。正在录音的会议先结束；录音已中断时可从原详情入口结束已上传部分再删除。
 
 `status` 是原文保存状态：`recording/saved/partial/empty`；`summary_status` 为 `waiting/pending/ready/fallback/failed/unavailable`。`summary_stage` 为 `waiting/queued/analyzing/synthesizing/done`，`processed_sections/total_sections` 是实际完成的分析组数，不伪造百分比。Android 在本机停止至上传排空间显示“正在转写并保存”。网络失败保留上次确认状态并提示同步重试；后端重启后，读取列表／详情／state 会恢复持久化的 pending 任务。
 
 `report` 含 `title/summary/topics/decisions/tasks/open_questions/chapters/highlights/source_ids/extraction/notice/capture_status`。`chapters` 最多12条 `{title, summary, source_ids, start_ms}`，按时间排序；`highlights` 最多8条 `{text, source_ids, start_ms}`，`text` 必须逐字出现在所引句子中，否则丢弃。`start_ms` 由服务端按所引句子计算，不由模型给出；格式不合格的章节或金句被丢弃，不导致整份纪要回退。旧纪要没有这两个字段，重试整理后补上。原文不经 AI 改写；长会议先按有界片段分析，再分层汇总，覆盖所有已保存文字。每条要点、决策、待办、待确认项引用本场句子 id（`<原文 id>.<序号>`，旧会议仍为原文 id）；负责人和截止日期必须能在来源中核对，身份不明时留空。模型不可用、结构不合法或额度不足返回明确的原文摘录 fallback，不宣称 AI 整理成功。原文保存不受聊天保留开关影响；新协议的录音不逐段进入个人记忆提取。ASR 和每次实际文字模型调用分别计入账号额度。
 
+2026-10-18 总结失败处理：整场 JSON 未通过格式或原文依据校验时，保留完整原文上下文，请模型纠正一次，并再次执行相同的严格校验；最多两次模型请求，每次分别计入额度。若纠正后仅待办负责人/截止时间、人物身份或事件时间/地点缺少逐字依据，则将对应字段置空、重新完整校验，并在 `metadata_omissions` 和 `notice` 中说明未明确字段；不保留无依据归属，不放宽引用校验，也不因单个未知字段丢弃其余合格纪要。`metadata_omissions` 可含 `task_owner/task_deadline/viewpoint_person/event_time/event_location`。未知原文 ID、错误结构或其他不合格内容仍回退。请求鉴权、限流、网络、超时、截断与内容过滤不进入格式纠正流程。回退报告新增 `failure_reason`，取值为 `no_sources/not_configured/quota_exceeded/authentication/rate_limited/timeout/network/provider_error/output_truncated/content_filtered/invalid_output`；`notice` 显示对应的原因与原文已保存说明，日志只记录固定原因码。会议文件导出成功仅保留文字提示，不播放“已导出”提示音。
+
 2026-10-17 说话人与时刻：实时字幕与会议分段识别开启火山流式 ASR 2.0 说话人聚类（`enable_speaker_info`、`ssd_version="200"`），确认句的 `additions.speaker_id`（"0"、"1"…）映射为 `speaker`“说话人1/2…”，并写入该句原文的 `speaker` 供纪要使用；编号只在同一上游识别段内稳定，暂停或满10分钟换段后可能错位，不代表真实身份。`utterances` 增加 `speaker`、`wall_at`（秒级 ISO 时刻 = 录音起点 + 录音内偏移 + 之前各次暂停时长）；会议增加 `speakers`（去重标签）与 `audio_started_at`（第一帧实时字幕音频到达时推算，或首个分段到达时间减去音频长度，误差约一两秒）。2026-10-17 已用合成双音色语音实测火山返回 `speaker_id` 0/1/0。
 
-2026-10-17 时间轴与录音保存：`utterances` 每项 `{id, transcript_id, segment_index, start_ms, end_ms, text}`，时间为本场录音时间轴毫秒（段起点 + ASR 句内 `start_time/end_time`，裁到段长）；每条 ASR 句再按句末标点（。！？；）拆分：供应商返回逐字 `words` 且与文字吻合时按逐字时间，否则按字数比例估算时间；不足2字的语气词并入前句。供应商未给时间时整段按同样规则拆分并估算。`events` 为暂停、继续与重点标记（`offset_ms` 同一时间轴，`created_at` 为服务器时间）。`audio` 为 `{status: saved|partial|none|expired|deleted, bytes, segments_with_audio, retention_days, expires_at}`。设置 `work_audio_retention_days`（0–365，默认30，0 表示不保存）控制保存：每段 PCM 写入 `users/<UUID>/work-audio/<会议>/`，路径只由服务端生成；会议结束超过期限后，在读取列表/详情/音频或保存设置时删除录音并标为 `expired`，异常未结束的会议多宽限1天。缩短期限立即作用于已有录音。录音不进入导出；清除数据和删除账号删除整个录音目录。服务端不加密录音文件，依赖主机磁盘与访问控制；部署备份是否包含该目录需按 `deploy/` 另行配置。
+2026-10-17 时间轴与录音保存：`utterances` 每项 `{id, transcript_id, segment_index, start_ms, end_ms, text}`，时间为本场录音时间轴毫秒（段起点 + ASR 句内 `start_time/end_time`，裁到段长）；每条 ASR 句再按句末标点（。！？；）拆分：供应商返回逐字 `words` 且与文字吻合时按逐字时间，否则按字数比例估算时间；不足2字的语气词并入前句。供应商未给时间时整段按同样规则拆分并估算。`events` 为暂停、继续、重点标记及电话对话开始/结束（`offset_ms` 同一时间轴，`created_at` 为服务器时间）。`audio` 为 `{status: saved|partial|none|expired|deleted, bytes, segments_with_audio, retention_days, expires_at}`。设置 `work_audio_retention_days`（0–365，默认30，0 表示不保存）控制保存：每段 PCM 写入 `users/<UUID>/work-audio/<会议>/`，路径只由服务端生成；会议结束超过期限后，在读取列表/详情/音频或保存设置时删除录音并标为 `expired`，异常未结束的会议多宽限1天。缩短期限立即作用于已有录音。录音不进入导出；清除数据和删除账号删除整个录音目录。服务端不加密录音文件，依赖主机磁盘与访问控制；部署备份是否包含该目录需按 `deploy/` 另行配置。
 
 `/v1/state` 增加 `work_meetings`；`/v1/export` 版本4增加全部会议详情。清除数据／删除账号包含新表；遗忘原文会撤回关联纪要和待办，后台结果不会重新发布已撤回的原文。旧 `/v1/meetings` 按时间范围整理入口保留兼容，不能据此倒推旧片段属于哪一场会议。
 
@@ -69,13 +77,16 @@ APK 默认本地基址 `http://127.0.0.1:8108`，可切换内置远端 `https://
 | `GET /v1/memories/{id}/source` | 返回明确关联的本人原始转写；手动笔记等无来源则 404 |
 | `POST /v1/recall` | `{question}`，1–500 有效字符；返回 `answer/citations/extraction/insufficient`；全历史索引检索，行动项带真实完成状态参加检索 |
 | `POST /v1/meetings` | `{hours}`，1–168，默认 24；筛选本人时段内的环境工作转写，排除助手和私人提问；有界生成后返回 `id/created_at/summary/decisions/tasks/source_ids/extraction/sources/coverage/hours/includes_demo`；同快照复用报告，无记录 422 |
+| `PUT /v1/tasks/{id}` | 编辑内容、负责人、截止时间与提前提醒，返回原ID行动项；详见下文 |
 | `PATCH /v1/tasks/{id}` | `{status:"open"或"done"}`；`{ok:true}`；可修改的任务 ID 从 state.tasks 取得 |
 | `GET /v1/maps/search?q=...&city=...` | q 1–100 字符，city 最多 80；高德地点搜索结果，沿用下方地图结构 |
 | `POST /v1/location` | `{longitude,latitude,accuracy?,speed?,source?}`，WGS-84 定位；返回 agent 快照，可能更新模式、路线与提醒草稿 |
+| `POST /v1/location-records` | 前台被动位置记录，见下文；不触发模式判断、路线或提示音 |
+| `GET /v1/location-records?limit=100` | 当前账号最近位置，`limit` 1–1000，返回 `{records:[…]}`，按观测时间倒序 |
 | `POST /v1/maps/nearby` | 定位字段加 `{keyword}`，默认“美食”；高德 3 km 周边结果 |
 | `GET /v1/maps/weather?city=310000` | city 可选，为六位 adcode；省略/留空则用本人保存的目的地坐标反查区域后查询天气，无目的地 422；返回高德实况天气结构 |
 | `POST /v1/drafts/{id}/{action}` | action 仅 `copied/dismissed`；返回 `{ok:true,status,sent:false}`；不支持真实发送 |
-| `GET /v1/export` | v3 JSON：`version/user/settings/memories/transcripts/reports/tasks/drafts` |
+| `GET /v1/export` | v4 JSON：`version/user/settings/memories/transcripts/reports/tasks/drafts/work_meetings/location_records` |
 | `DELETE /v1/data` | `{password}`；清空业务数据和对话幂等结果，保留账号与设置；返回 `{ok:true}` |
 
 `PUT /v1/settings` 是完整替换：先取 state.settings 再合并修改。字段取值范围沿用下方“设置”，Android 强制值优先；新账号默认手动生活模式，偏好为空。关闭 `retain_transcripts` 阻止新增转写历史，但不清除旧数据，也不阻止抽取记忆或幂等结果保存；完整清除使用 `/v1/data`。
@@ -93,6 +104,36 @@ APK 默认本地基址 `http://127.0.0.1:8108`，可切换内置远端 `https://
 纪要 `coverage` 披露可用/纳入/遗漏片段、截短来源与记录首尾时间；`continuous_capture_verified=false` 明示这些信息不能证明没有采集缺段。模型仍最多使用 80 条、18000 字材料。新增片段后重生成纪要时，仅内容、负责人、期限相同且来源重叠的任务复用旧 ID/完成状态；语义改写仍需后续任务关联设计。
 
 state 最多返回 100 条转写（按时间正序）、300 条记忆、300 条行动项、30 条草稿及最新纪要；记忆按收藏优先及时间倒序。导出各集合最多 10000 条，暂不提供分页。纪要中的 tasks 是生成时的草稿快照，当前完成状态以 state.tasks 或 export.tasks 为准。`include_demo` 为兼容模型字段，不会为托管账号注入模拟内容。
+
+### 自定义行动清单与通知（2026-10-18）
+
+- `GET /v1/tasks`：当前账号最多10000条行动项，含原有字段及 `due_at`（UTC ISO时间，旧AI待办为空）、`reminder_hours`（旧记录为0）。此快照不等待语音业务锁。state原有最近300条保持兼容。
+- `POST /v1/tasks`：`{task_id, content, owner, due_at, reminder_hours}`。客户端UUID（16–64位字母/数字/连字符），内容1–500有效字、负责人0–100字、带时区的未来截止时间，提前量0/1/6/24小时（0为不提醒）。返回行动项，同ID同内容幂等，不同内容409；已删除ID不能被迟到重试重建。手动任务没有report或录音来源，不消耗模型额度。
+- `PUT /v1/tasks/{id}`：`{content, owner, due?, due_at?, reminder_hours}`，编辑已有手动或AI任务，返回更新后的行动项；未知/跨账号/已删除404。内容1–500有效字、负责人0–100字、文字截止时间0–500字；`due_at`可为空，否则须含时区并统一为UTC；有具体时间时覆盖文字due。允许保留已过期截止时间，过期不安排通知；提前量0/1/6/24，有提醒时必须提供具体截止时间。保留原ID、创建时间、完成状态和来源，不创建副本。修改过的AI行动项独立保存，原会议纪要的生成快照不变，重新整理不会覆盖该行动项或恢复完全相同的原始行动项；撤回原来源时仍可联动删除。未改变字段的保存不解除原纪要关联；重复相同PUT幂等，不消耗模型额度。
+- `PATCH /v1/tasks/{id}`：原有open/done契约保留。Android只更新对应卡片、计数及提醒，不刷新整页、不改变排序或当前滚动位置。
+- `DELETE /v1/tasks/{id}`：同账号删除，未知/跨账号404。删除AI待办保留会议本身，并记住同场内容/负责人/截止时间指纹，后续重新生成不重建完全相同的已删除行动项；不影响其他手动任务。
+
+Android添加/编辑共用圆角表单；左滑露出编辑和删除，编辑预填内容、负责人、截止时间和提醒选项。保存只替换原卡片，保留列表顺序与视口；取消不保存，失败保留输入。没有具体时间的旧AI任务可保留原文字截止时间，选择日期和时间后启用提醒。
+
+Android以系统AlarmManager安排本地通知，提前量按绝对截止时间计算。编辑截止或提前量会取消旧闹钟、清除旧的已通知状态并重新安排；仅改内容/负责人不重发已送达提醒，待发送通知使用最新内容；关闭提醒取消闹钟和通知。提醒时刻已过去而截止时间仍在未来时尽快提醒；已到期、完成、删除的任务不安排。通知可直接进入工作页；重启、时间/时区变动及包更新后恢复，前台/刷新/任务修改时同步。退出账号、切换服务、清空和注销取消相应本地提醒；权限未允许时显示说明与通知设置入口。采用无额外特殊授权的非精确闹钟，省电策略可能延迟（[Android官方说明](https://developer.android.com/develop/background-work/services/alarms)）。本地已知状态下完成/删除会取消提醒；其他设备的更改在本机下次同步后生效，不是服务器远程推送。位置与录音的前后台策略保持原样。
+
+### 用户修正并重新生成纪要（2026-10-18）
+
+`GET /v1/work-meetings/{id}/revision` 返回 `{base_report_id, document}`，仅已结束且有可编辑纪要、当前未在整理时可用。document含title，以及summary/tasks/viewpoints/conflicts/events/topics/decisions/open_questions/chapters/highlights分类。summary为逐段 `{id,text}`；其他分类保留原字段、隐藏source_ids并增加稳定编辑id。Android按分区提供文字编辑、添加与删除；新条目id为 `new-UUID`，技术标识及依据不展示为可编辑文字。失败时优先返回同一版保留的编辑稿。
+
+`POST /v1/work-meetings/{id}/revise-summary`：`{request_id, base_report_id, document}`。请求ID幂等；基版已变化或整理中409，不覆盖其他更新。严格校验分类、条目ID、文字/数量及总长（最多90000字JSON，总结最多8000字）；客户端提交的引用不可信，服务端由基版恢复并为用户改动生成独立 `user-edit:` 依据。编辑稿和pending任务先持久保存；不重新上传/识别录音，不占用原语音业务锁进行模型网络请求。
+
+AI保留剩余条目顺序/数量，分析用户新增、修改、删除后的版本，同步修改未编辑字段中的人物、时间、任务、决策等关联表述。用户改过的字段及新增条目在服务端强制保留；删除项不可被模型恢复，空分类保持空；总结按段保护，允许用户全部清空。未改部分仍执行原有结构与引用校验；不将用户修正冒充录音发言或附上伪造音频时间。真实模型请求逐次计额度，结构不合法最多纠正一次，鉴权/限流/超时等不盲目重试。
+
+`revision_request` 包含id/base_report_id/document/created_at/status（pending/done/failed），失败另含固定error原因码。成功原子替换本场纪要和关联行动项，匹配的旧任务保持完成状态，独立手动任务保留；返回report含revision_id/revision_sources。失败保留上一版report和完整编辑稿，状态恢复到可查看/编辑，不发布规则摘录覆盖用户修改。已有用户修正的纪要拒绝旧retry-summary入口（409），防止旧客户端绕过编辑稿从原文覆盖修正。服务重启后正常读取恢复pending，清空/注销/撤回来源后迟到结果不能重新发布。Android编辑过程中还按服务/账号/会议/基版保存私有本地草稿，稍后继续可恢复，退出账号/清空时删除。
+
+### 前台位置记录（2026-10-18）
+
+`POST /v1/location-records` 接收 `{record_id, observed_at, trigger, longitude, latitude, accuracy, source, speed?}`。`record_id` 为16–64位字母、数字或连字符；`observed_at` 必须含时区，接受过去10分钟至未来2分钟，统一保存为UTC；`trigger` 仅 `app_open/page_return/interval`；坐标为手机系统 WGS-84，精度0–200米。响应 `{id, observed_at, trigger, longitude, latitude, accuracy, source, speed}`。同一编号和相同内容幂等返回；编号已存在但内容不同返回409。Android 进一步只接收60秒内、带精度的系统结果，每次等待最多25秒。
+
+记录按账号隔离持久保存，可通过上述GET读取并包含在v4导出中；清空业务数据/注销账号同时删除。它使用独立接口和手机网络线程，不等待语音业务锁，不调用地图或文字模型，不扣语音/业务请求额度。最新坐标可供后续请求使用；业务处理期间暂存，待原有业务释放锁后再更新上下文，不主动重算模式、路线、提醒或播报。手动定位仍走原 `/v1/location`。
+
+Android 在已登录且前台可见时，打开App、切换主页面、进入/退出会议详情即尝试获取位置，此后每180秒发起一次；同一轮未结束时合并重复触发。退到后台或锁屏停止监听、计时和未完成的上传，返回前台重新刷新；不启用后台常驻定位或新增后台定位权限。取得位置并收到保存成功回执后仅更新状态行，不再显示“定位已更新”浮层；失败也只更新状态文字。蓝牙连接成功的3秒浮层保留。
 
 ### 幂等、限流和失败语义
 
@@ -189,7 +230,7 @@ M1 Android 复用 HTTP 短语音，无新增实时接口。含异步停止尾帧
 
 问记忆检索当前账号的有界记忆、转写和行动项，返回引用与原文摘录。引用 ID 和摘录子串需通过校验，资料不足时 `insufficient=true`；不得补造事实或将记录内容当成系统指令。
 
-`GET /v1/export` 返回 v3 快照，当前没有导入接口。`DELETE /v1/data` 要求当前密码，删除业务数据及幂等结果、保留账号和设置；账号注销使用 `DELETE /auth/account`。删除在线数据不自动删除运维历史备份，备份规则见部署文档。
+`GET /v1/export` 返回 v4 快照，包含工作会议及位置记录，当前没有导入接口。`DELETE /v1/data` 要求当前密码，删除业务数据及幂等结果、保留账号和设置；账号注销使用 `DELETE /auth/account`。删除在线数据不自动删除运维历史备份，备份规则见部署文档。
 
 ## 当前范围
 
@@ -269,9 +310,10 @@ Android 实际播放排空后发送 `{"type":"playback.done","turn":N}`，后端
 `capabilities.work_asr` 表示该配置就绪，`work_asr_model` 返回模型名；工作模式客户端不再以通用 `asr` 能力判断是否可以开始。未配置返回 503，不自动回退旧模型。普通语音和实时通话保持各自原有接口。
 
 `POST /v1/work-meetings` 增加可选 `started_at`（带时区、距当前不超过一天）和
-`location: {longitude, latitude, accuracy, source: "gps"}`。Android 在开始时读取最多两分钟内的定位，必要时最多等待三秒新定位；无授权/无定位不阻塞会议。后端可用高德将坐标转换为地址，失败仍保留坐标。首次创建的时间地点不可被重试覆盖，也不使用会议结束时的位置替换。
+`location: {longitude, latitude, accuracy, source: "gps", observed_at?, cached?}`。`observed_at` 为实际定位获取时间（带时区，不能比服务器时间晚超过120秒）；`cached` 为严格布尔值，默认 false，true 时必须提供获取时间。旧客户端省略两字段时保留原响应结构。Android 从账号/服务隔离的本地缓存及手机系统缓存选择最近24小时内、精度不超过200米的位置；仅页面前台、屏幕亮且未锁定时，才会为超过两分钟或缺失的位置最多等待三秒新定位。熄屏/后台只读缓存，前台获取失败也回退缓存，保留原获取时间并标记 cached=true。无授权或无合格位置时不附位置，不阻塞会议。前台每180秒定位继续更新私有缓存，上传失败仍保留，不增加后台定位权限或持续定位。后端在响应发送后后台使用高德将保存的开始坐标转换为 `location.address`，每次转换最多12秒，不等待地址结果才开始录音。首次创建的时间地点不可被重试覆盖，也不使用会议结束时的位置替换。
 
-列表、详情均返回 `location` 对象；无位置为 `{}`。完成的 report 同样包含 `started_at`、`location`。
+列表、详情均返回 `location` 对象；无位置为 `{}`。完成的 report 同样包含 `started_at`、`location`。地址解析、重试、纪要重新生成与数据导出保留 `observed_at/cached`；Android 页面及纪要文件仍只展示地址，并对缓存标注“缓存定位”和原始获取时间。退出账号、清除数据、删除账号或切换服务会清除本机缓存。
+创建会议、读取 `/v1/state` 或会议列表/详情时，对缺失地址且尚未用尽次数的历史坐标安排补查。每场首次失败后，服务端每隔30秒重试一次，最多额外3次；间隔从上次请求失败返回起算，每次请求最多12秒。`address_attempts`（0–4）与 `address_retry_at`（Unix秒或null）持久保存，重启不会重置次数，重启后下一次鉴权读取恢复未到期/到期的任务。成功后停止并同步已有 report，重试用尽后停止。正常运行时重试不依赖页面轮询；同一账号会议去重，每次读取最多安排两条、全局最多八条待办和两条并发转换；未配置地图 Key 时不发请求、不消耗尝试。App 列表、详情和导出只展示地址，等待时显示待解析，重试用尽显示“地址暂未获取（已重试3次）”，不展示经纬度。仅使用会议开始时保存的坐标，不用后来的定位替代；没有开始坐标时无法反查。晚到地址仅可补入仍存在且开始坐标未改变的会议，不恢复已清空记录。
 每条 sources 保留原始 `text`，另有 `utterances: [{text,speaker_id,begin_time,end_time}]`。
 时间单位为片段内毫秒，speaker_id 仅在该片段内有效，不代表真实身份或跨片段稳定身份。
 
@@ -321,3 +363,18 @@ Android 实际播放排空后发送 `{"type":"playback.done","turn":N}`，后端
 - AI 纪要保留整场任务、人物观点、冲突、事件、议题、决策、待确认，并结合可选的 `chapters/highlights`；章节时间由服务端依据句子计算，非逐字摘录的重点丢弃。Android 全屏会议页及 Markdown 导出包含这些内容和对应时间引用。
 
 以上是本地源码/协议整合，真实服务配额、长会议、实体耳机和远端部署另行验收，见 [工作日志](work-log-2026-10-17.md)。
+
+
+## 2026-10-18 常用地址与主动通勤
+
+全部接口沿用 Bearer 账号鉴权，数据位于账号 SQLite，互不共享。
+
+- `GET /v1/saved-addresses` 返回 `{addresses:[...]}`；`PUT /v1/saved-addresses/{id}` 保存，`DELETE` 删除。地址字段为 `tag: home/work/school/custom`、`name/address/city`、有限且合法的 GCJ-02 `longitude/latitude`、可选六位 `adcode`。家/公司/学校各一个，自定义可多个，总数最多40。客户端先调用既有 geocode 或手机定位后的 reverse，再保存结果；CRUD、重新选用、仅改名称/标签都不调用地图服务。修改城市或地址后必须重新定位。既有 home/work 设置无查询迁入，常用地址成为对应设置的权威值。
+- `POST /v1/commute` 接收 `journey_id`（16–64位字母数字或连字符）、`origin_mode: gps/fixed`、`origin`（fixed必填、gps为空）、`destination`、`transport: driving/walking/transit/bicycling`。起终点均为上述地址字段，标签可省略。明确开始才建立 active 通勤并切换通勤模式；工作录音中拒绝。相同 ID/内容幂等，不同内容409；已结束的同 ID 不重新开始。开始另一通勤前需结束当前通勤。
+- `GET /v1/commute` 返回本账号最近一趟通勤或 `{}`。返回 `id/active/origin_mode/origin/destination/transport/started_at/route/error/updated_at` 等状态；route沿用地图路线协议，含耗时、距离、步骤与来源提示。保存地址后再修改/删除地址不会改写已开始旅程快照。
+- `POST /v1/commute/{id}/refresh` 接收唯一 `request_id`；gps模式同时提交 `location:{longitude,latitude,accuracy,source:'gps',observed_at}`，要求有时区、两分钟内、精度<=200米。fixed模式禁止提交手机位置，以已保存GCJ-02起点计算，公共交通使用保存城市，不重复坐标转换/城市反查。正常30秒最短间隔，进行中45秒租约，每次供应商调用最长35秒，计入账号每日查询额度。GPS坐标仍按原地图适配流程转换。网络失败保留上次路线并明确 error；停止、清空或新旅程后到达的旧结果不能覆盖当前状态。刷新不占用语音会话锁。
+- `DELETE /v1/commute/{id}` 结束，重复结束相同旅程安全；不存在404。切换到非通勤模式也结束。服务端不自行采集设备位置，Android在前台服务内每180秒提交。
+- `POST /v1/maps/weather-at?forecast=false` 接收已保存地址，优先复用adcode查询天气；历史地址无adcode时才按坐标反查。`GET /v1/drafts` 返回最近30条草稿；GPS通勤进入提醒时间范围时每趟生成一次到达草稿，仍需用户复制发送。fixed路线不据此推断实际到达。
+- 导出补充 `saved_addresses/commute`；清空业务数据删除旅程和位置记录，保留账号设置及常用地址；删除账号移除全部数据。手机断网结束时立即停止定位，私有队列在下次登录进入后补发结束，开始新旅程前先处理该队列。
+
+保存地址消除的是重复地址解析查询；实时路线、天气和周边查询仍需联网地图 API。公共交通数据为线路规划/计划时刻，不表示实时车辆位置。

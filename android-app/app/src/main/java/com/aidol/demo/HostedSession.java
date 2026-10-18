@@ -17,6 +17,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Predicate;
+import java.util.function.BooleanSupplier;
 import okhttp3.Call;
 import org.json.JSONObject;
 
@@ -127,7 +128,27 @@ public final class HostedSession {
     public void sendDuplexText(String value) {
         try { duplex.text(value); } catch (IOException error) { status(error.getMessage()); }
     }
+    private BooleanSupplier locationForeground = () -> false;
+    public HostedSession locationForeground(BooleanSupplier foreground) {
+        if (launched.get()) throw new IllegalStateException("会话已开始");
+        locationForeground = foreground; return this;
+    }
     private boolean workRecording;
+    private volatile String workAudioStatus = "正在准备工作录音";
+    public boolean recordsWorkCalls() { return workRecording && mode == AudioMode.RISE_SDK; }
+    public String workAudioStatus() { return workPaused() ? "已暂停 · 不记录、不上传" : workAudioStatus; }
+    private final Runnable workPhoneCheck = new Runnable() {
+        @Override public void run() {
+            if (!recordsWorkCalls() || cancelled.get() || !captureActive) return;
+            updateWorkPhoneState();
+            ui.postDelayed(this, 250);
+        }
+    };
+    private void updateWorkPhoneState() {
+        int value = audioManager.getMode();
+        capture.phoneAudioState(value == AudioManager.MODE_RINGTONE ? 1
+            : value == AudioManager.MODE_IN_CALL || value == AudioManager.MODE_IN_COMMUNICATION ? 2 : 0);
+    }
     private final AtomicBoolean workStopping = new AtomicBoolean();
     private WorkAudioBuffer workBuffer;
     private volatile boolean workMeetingStarted;
@@ -152,6 +173,7 @@ public final class HostedSession {
         try {
             long offset = buffer.pause();
             if (offset < 0) return false;
+            capture.paused(true);
             WorkLiveCaptions current = live; if (current != null) current.pause();
             postWorkEvent("pause", offset, "app");
             status("已暂停 · 不记录、不上传；点“继续”恢复");
@@ -161,6 +183,7 @@ public final class HostedSession {
     public boolean resumeWork() {
         WorkAudioBuffer buffer = workBuffer;
         if (!activeWorkCapture() || buffer == null) return false;
+        capture.paused(false);
         long offset = buffer.resume();
         if (offset < 0) return false;
         WorkLiveCaptions current = live; if (current != null) current.resume(offset);
@@ -343,7 +366,7 @@ public final class HostedSession {
                     : e instanceof IOException ? e.getMessage() : "连接失败，请检查设备和网络后重试");
             }
         } finally {
-            captureActive = false; clearCaptureTimers();
+            captureActive = false; clearCaptureTimers(); ui.removeCallbacks(workPhoneCheck);
             capture.close(); releaseCaptureFocus(); cancelPlayer();
             if (duplex != null) duplex.cancel();
             if (upload != null) upload.cancel();
@@ -434,7 +457,7 @@ public final class HostedSession {
         JSONObject startMetadata = new JSONObject().put("meeting_id", sessionId)
             .put("whole_audio", false)
             .put("started_at", java.time.Instant.now().toString());
-        JSONObject location = MeetingStartLocation.capture(context);
+        JSONObject location = MeetingStartLocation.capture(context, api, locationForeground);
         if (location != null) startMetadata.put("location", location);
         JSONObject started = new JSONObject(new String(request("/v1/work-meetings",
             startMetadata.toString().getBytes(StandardCharsets.UTF_8), "application/json"), StandardCharsets.UTF_8));
@@ -446,7 +469,7 @@ public final class HostedSession {
             captureWorkSegments();
             complete = true;
         } finally {
-            captureActive = false; capture.close(); releaseCaptureFocus();
+            captureActive = false; ui.removeCallbacks(workPhoneCheck); capture.close(); releaseCaptureFocus();
             liveWanted = false; ui.removeCallbacks(liveReconnect);
             WorkLiveCaptions current = live; if (current != null) current.close();
             // Let queued marks/pauses land before finish; the server rejects them afterwards.
@@ -479,11 +502,19 @@ public final class HostedSession {
             if (current == null || current.healthy() || workStopping.get() || failure != null) break;
             check(); end.await(50, TimeUnit.MILLISECONDS);
         }
-        captureActive = true; requestCaptureFocus();
+        // SDK microphone data is independent of Android media playback. Work capture must not own playback focus.
+        captureActive = true; updateWorkPhoneState(); ui.post(workPhoneCheck);
         if (workStopping.get()) { captureActive = false; workBuffer.finish(); return; }
         ui.postDelayed(startupTimeout, 12000);
         capture.start(new CaptureSource.Listener() {
-            public void status(String value) { if (captureActive) HostedSession.this.status(value); }
+            public void status(String value) {
+                workAudioStatus = value;
+                if (captureActive) HostedSession.this.status(workAudioStatus());
+            }
+            public void callRecording(boolean active) {
+                if (!cancelled.get() && workBuffer != null)
+                    postWorkEvent(active ? "call_start" : "call_end", workBuffer.offsetMs(), "headset");
+            }
             public void input(String value) { post(() -> listener.input(value)); }
             public void recording() {
                 ui.removeCallbacks(startupTimeout);

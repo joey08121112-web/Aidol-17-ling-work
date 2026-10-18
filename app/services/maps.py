@@ -24,7 +24,7 @@ class MapService:
     def _http(self):
         return self.config.http_pool.client("amap", timeout=10, proxy=self.config.proxy)
 
-    async def route(self, location, settings):
+    async def route(self, location, settings, *, origin_gcj=False, origin_city=""):
         if not self.config.amap_key:
             return {"available": False, "reason": "尚未配置高德 Key；不生成虚构的实时 ETA"}
         if settings.destination_lon is None or settings.destination_lat is None:
@@ -34,11 +34,11 @@ class MapService:
             raise ValueError("出行方式必须为 driving、walking、transit 或 bicycling")
         client = self._http()
         # navigator.geolocation gives WGS-84; AMap route APIs require GCJ-02.
-        origin = await self._convert(client, location)
+        origin = f"{location.longitude},{location.latitude}" if origin_gcj else await self._convert(client, location)
         params = {"origin": origin,
                   "destination": f"{settings.destination_lon},{settings.destination_lat}"}
         if transport == "transit":
-            city = await self._origin_city(client, origin)
+            city = origin_city or await self._origin_city(client, origin)
             if not city:
                 return {"available": False, "reason": "无法确定出发城市，请检查定位后重试"}
             destination_city = getattr(settings, "transit_city", "上海") or "上海"

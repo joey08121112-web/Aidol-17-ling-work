@@ -18,11 +18,19 @@ public final class VendorCaptureSource implements CaptureSource, AutoCloseable {
     private final long stopTimeoutMs;
     private final long durationLimitMs;
     private final int queueByteLimit;
-    private final ArrayDeque<byte[]> queue = new ArrayDeque<>();
+    private static final class Frame {
+        final byte[] bytes;
+        final Boolean call;
+        Frame(byte[] bytes, Boolean call) { this.bytes = bytes; this.call = call; }
+    }
+    private final ArrayDeque<Frame> queue = new ArrayDeque<>();
+    private final boolean workCalls;
+    private WorkCaptureRouter workRouter;
+    private int phoneState;
     private Listener listener;
     private StopCallback completion;
     private FusionDevice.Listener vendorListener;
-    private ScheduledFuture<?> stopTimeout, durationTimeout, startupTimeout;
+    private ScheduledFuture<?> stopTimeout, durationTimeout, startupTimeout, workTick;
     private long generation;
     private boolean active, stopping, idle, closed, recording;
     private int queuedBytes, pendingByte = -1;
@@ -34,15 +42,22 @@ public final class VendorCaptureSource implements CaptureSource, AutoCloseable {
     public VendorCaptureSource(HeadsetController controller, boolean continuous) {
         this((FusionDevice) controller, 2500, MAX_QUEUED_BYTES, continuous ? 0 : 60_000);
     }
+    public VendorCaptureSource(HeadsetController controller, boolean continuous, boolean workCalls) {
+        this((FusionDevice) controller, 2500, MAX_QUEUED_BYTES, continuous ? 0 : 60_000, workCalls);
+    }
     public VendorCaptureSource(FusionDevice device) { this(device, 2500, MAX_QUEUED_BYTES); }
     VendorCaptureSource(FusionDevice device, long stopTimeoutMs, int queueByteLimit) {
         this(device, stopTimeoutMs, queueByteLimit, 60_000);
     }
     VendorCaptureSource(FusionDevice device, long stopTimeoutMs, int queueByteLimit, long durationLimitMs) {
+        this(device, stopTimeoutMs, queueByteLimit, durationLimitMs, false);
+    }
+    VendorCaptureSource(FusionDevice device, long stopTimeoutMs, int queueByteLimit, long durationLimitMs, boolean workCalls) {
         this.device = device;
         this.stopTimeoutMs = stopTimeoutMs;
         this.queueByteLimit = queueByteLimit;
         this.durationLimitMs = durationLimitMs;
+        this.workCalls = workCalls;
         timer = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "rise-capture-deadline"); t.setDaemon(true); return t;
         });
@@ -56,6 +71,23 @@ public final class VendorCaptureSource implements CaptureSource, AutoCloseable {
             token = ++generation;
             listener = target; completion = null; active = true; stopping = false; idle = false;
             recording = false; pendingByte = -1; queuedBytes = 0; receivedBytes = 0; queue.clear();
+            if (workCalls) {
+                workRouter = new WorkCaptureRouter(new WorkCaptureRouter.Output() {
+                    public void pcm(byte[] bytes) { enqueue(token, bytes); }
+                    public void status(String message) { if (current(token)) target.status(message); }
+                    public void call(boolean active) {
+                        if (queue.size() >= MAX_FRAMES) throw new IllegalStateException("通话切换积压，记录已停止");
+                        queue.add(new Frame(null, active)); VendorCaptureSource.this.notifyAll();
+                    }
+                });
+                workRouter.phone(phoneState, now());
+                workTick = timer.scheduleWithFixedDelay(() -> {
+                    synchronized (VendorCaptureSource.this) {
+                        if (current(token) && !idle) try { workRouter.tick(now()); }
+                        catch (RuntimeException error) { fail(token, error.getMessage(), true); }
+                    }
+                }, 50, 50, TimeUnit.MILLISECONDS);
+            }
             vendorListener = new FusionDevice.Listener() {
                 @Override public boolean startIfCurrent(Runnable startCommand) {
                     synchronized (VendorCaptureSource.this) {
@@ -64,9 +96,19 @@ public final class VendorCaptureSource implements CaptureSource, AutoCloseable {
                         return true;
                     }
                 }
-                @Override public void state(String state, int scene) { onState(token, state, scene); }
+                @Override public void state(String state, int scene) {
+                    try { onState(token, state, scene); }
+                    catch (RuntimeException error) { fail(token, error.getMessage(), true); }
+                }
                 @Override public void pcm(int channel, byte[] bytes) { onPcm(token, channel, bytes); }
                 @Override public void error(String message) { fail(token, message, true); }
+                @Override public boolean recordsPhoneCalls() { return workCalls; }
+                @Override public void phoneCall(boolean active) {
+                    synchronized (VendorCaptureSource.this) {
+                        if (current(token) && !idle && workRouter != null) try { workRouter.dialog(active, now()); }
+                        catch (RuntimeException error) { fail(token, error.getMessage(), true); }
+                    }
+                }
             };
             callbacks = vendorListener;
             consumer = new Thread(() -> consume(token), "rise-pcm-" + token);
@@ -83,14 +125,18 @@ public final class VendorCaptureSource implements CaptureSource, AutoCloseable {
         boolean unexpected = false;
         synchronized (this) {
             if (!current(token)) return;
-            // A phone call must never become an AI recording.
-            if (scene == 0) { unexpected = true; }
+            // Only an explicitly started work recording may accept the phone-call scene.
+            if (scene == 0 && !workCalls) { unexpected = true; }
             else if ("recording".equals(state) && !recording && !stopping) {
                 announceRecording(token);
             } else if ("idle".equals(state)) {
                 if (!stopping) unexpected = true;
-                else { idle = true; notifyAll(); }
+                else {
+                    if (workRouter != null) workRouter.finish(now());
+                    idle = true; notifyAll();
+                }
             }
+            if (workRouter != null && !idle && !"idle".equals(state)) workRouter.scene(scene, now());
         }
         if (unexpected) { fail(token, scene == 0 ? "通话期间已停止耳机录音" : "耳机录音意外结束，请重新连接", true); return; }
     }
@@ -114,7 +160,13 @@ public final class VendorCaptureSource implements CaptureSource, AutoCloseable {
     private void onPcm(long token, int channel, byte[] bytes) {
         String failure = null;
         synchronized (this) {
-            if (!current(token) || idle || channel != 2 || bytes == null || bytes.length == 0) return;
+            if (!current(token) || idle || bytes == null || bytes.length == 0) return;
+            if (workRouter != null) {
+                try { workRouter.pcm(channel, bytes, now()); }
+                catch (RuntimeException error) { fail(token, error.getMessage(), true); }
+                return;
+            }
+            if (channel != 2) return;
             if (durationLimitMs > 0 && bytes.length > MAX_BYTES - receivedBytes) failure = "耳机录音超过 60 秒音频上限，已丢弃本段";
             else if (queue.size() >= MAX_FRAMES || bytes.length > queueByteLimit - queuedBytes)
                 failure = "耳机音频处理队列已满，已丢弃本段，请重试";
@@ -124,11 +176,33 @@ public final class VendorCaptureSource implements CaptureSource, AutoCloseable {
                     announceRecording(token);
                     if (!current(token)) return;
                 }
-                queue.add(Arrays.copyOf(bytes, bytes.length));
+                queue.add(new Frame(Arrays.copyOf(bytes, bytes.length), null));
                 queuedBytes += bytes.length; receivedBytes += bytes.length; notifyAll();
             }
         }
         if (failure != null) fail(token, failure, true);
+    }
+
+    private void enqueue(long token, byte[] bytes) {
+        if (!current(token)) return;
+        if (queue.size() >= MAX_FRAMES || bytes.length > queueByteLimit - queuedBytes)
+            throw new IllegalStateException("耳机音频处理队列已满，请检查网络后重试");
+        if (!recording && !stopping) announceRecording(token);
+        if (!current(token)) return;
+        queue.add(new Frame(Arrays.copyOf(bytes, bytes.length), null));
+        queuedBytes += bytes.length; receivedBytes += bytes.length; notifyAll();
+    }
+    private static long now() { return System.nanoTime() / 1_000_000L; }
+    @Override public synchronized void phoneAudioState(int state) {
+        phoneState = state;
+        if (active && !idle && workRouter != null) try { workRouter.phone(state, now()); }
+        catch (RuntimeException error) { fail(generation, error.getMessage(), true); }
+    }
+    @Override public synchronized void paused(boolean paused) {
+        if (workRouter != null) {
+            workRouter.pause(paused);
+            queue.removeIf(frame -> frame.call == null); queuedBytes = 0; pendingByte = -1;
+        }
     }
 
     private void consume(long token) {
@@ -147,7 +221,14 @@ public final class VendorCaptureSource implements CaptureSource, AutoCloseable {
                         }
                         bytes = null;
                     } else {
-                        bytes = queue.remove(); queuedBytes -= bytes.length;
+                        Frame frame = queue.remove();
+                        if (frame.call != null) {
+                            // Scene boundaries cannot splice a half microphone sample into call PCM.
+                            pendingByte = -1;
+                            listener.callRecording(frame.call);
+                            continue;
+                        }
+                        bytes = frame.bytes; queuedBytes -= bytes.length;
                     }
                 }
                 if (partial) { fail(token, "耳机音频以半个采样结束，已丢弃本段", true); return; }
@@ -223,6 +304,7 @@ public final class VendorCaptureSource implements CaptureSource, AutoCloseable {
         if (startupTimeout != null) startupTimeout.cancel(false);
         if (stopTimeout != null) stopTimeout.cancel(false);
         if (durationTimeout != null) durationTimeout.cancel(false);
+        if (workTick != null) workTick.cancel(false);
     }
     public synchronized String diagnostics() {
         return "generation=" + generation + " bytes=" + receivedBytes + " queue_bytes=" + queuedBytes

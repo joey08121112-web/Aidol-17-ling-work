@@ -1,5 +1,7 @@
 """Analyze the entire meeting once after recording ends, without chunk summaries."""
 import json
+import logging
+from copy import deepcopy
 import re
 import httpx
 from .insights import _validate, _rules, _string, _citations, _person_label
@@ -25,6 +27,7 @@ summary 使用“• ”开头的分点，每点独立换行，概括整场结�
 不要加“标题：”、引号或无意义的日期前缀；信息不足时用“会议记录”。
 所有条目须引用支持它的原文 ID，冲突应同时引用相互冲突的说法和后续澄清（如有）。
 owner、person、due、time、location 只能原样摘自所引用原文，未知留空，不换算相对日期。
+时间必须逐字保留原文的数字、汉字和措辞，例如不能把“十二点前”改写为“12点之前”；无法逐字引用就留空。
 人物观点可以使用文稿中的整场“说话人N / 发言人 N”标签；第一人称明确承诺的任务也可使用该标签作为负责人。
 用户、现场发言、我等泛称不能作为身份；不要把文稿之外的编号编造成人物。
 额外输出 chapters（最多12条 {"title":"不超过30字", "summary":"不超过200字", "source_ids":["ID"]}）与
@@ -76,6 +79,59 @@ def attach_times(report, meeting):
     return report
 
 
+def _checked_task(item, rows):
+    owner = item.get('owner', '') if isinstance(item, dict) else ''
+    scoped_owner = owner and any(
+        row.get('speaker_scope') == 'meeting' and row.get('speaker') == owner
+        and re.fullmatch(r'(?:发言人 ?|说话人 ?)\d+', owner) and row['id'] in item.get('source_ids', [])
+        and re.search(r'我(?:来|会|负责|保证)', row['text']) for row in rows)
+    checked_item = {**item, 'owner': ''} if scoped_owner else item
+    checked = _validate({'summary': '', 'tasks': [checked_item], 'decisions': []}, rows)['tasks'][0]
+    if scoped_owner:
+        checked['owner'] = owner
+    return checked
+
+
+def _metadata_supported(field, value, ids, by_id):
+    scoped_person = field == 'person' and re.fullmatch(r'(?:发言人 ?|说话人 ?)\d+', value) and any(
+        by_id[source_id].get('speaker_scope') == 'meeting' and by_id[source_id]['speaker'] == value for source_id in ids)
+    if scoped_person:
+        return True
+    return any(value in by_id[source_id]['text'] for source_id in ids) and (field != 'person' or _person_label(value))
+
+
+def _clear_unsupported_task_metadata(parsed, rows):
+    """Unknown ownership/deadlines stay blank; all content/citation validation still applies."""
+    value = deepcopy(parsed)
+    omitted = set()
+    if not isinstance(value, dict) or not isinstance(value.get('tasks'), list):
+        raise ValueError('Invalid minutes schema')
+    for item in value['tasks']:
+        for _ in range(2):
+            try:
+                _checked_task(item, rows)
+                break
+            except ValueError as error:
+                field = {'Unsupported task owner': 'owner', 'Unsupported task deadline': 'due'}.get(str(error))
+                if field is None:
+                    raise
+                item[field] = ''
+                omitted.add('task_owner' if field == 'owner' else 'task_deadline')
+    by_id = {row['id']: row for row in rows}
+    for category, fields in [('viewpoints', ['person']), ('events', ['time', 'location'])]:
+        for item in value.get(category, []):
+            ids = _citations(item['source_ids'], by_id)
+            for field in fields:
+                text = _string(item[field], 1500, empty=True)
+                if text and not _metadata_supported(field, text, ids, by_id):
+                    item[field] = ''
+                    omitted.add(('viewpoint_' if category == 'viewpoints' else 'event_') + field)
+    result = _validate_minutes(value, rows)
+    if omitted:
+        result['metadata_omissions'] = sorted(omitted)
+    return result
+
+
 def _validate_minutes(parsed, rows):
     by_id = {row['id']: row for row in rows}
     keys = {'title', 'summary', 'tasks', 'viewpoints', 'conflicts', 'events', 'topics', 'decisions', 'open_questions'}
@@ -94,18 +150,11 @@ def _validate_minutes(parsed, rows):
         result[key] = []
         for item in parsed[key]:
             if key in ('tasks', 'decisions'):
-                owner = item.get('owner', '') if isinstance(item, dict) else ''
-                scoped_owner = key == 'tasks' and owner and any(
-                    row.get('speaker_scope') == 'meeting' and row.get('speaker') == owner
-                    and re.fullmatch(r'(?:发言人 ?|说话人 ?)\d+', owner) and row['id'] in item.get('source_ids', [])
-                    and re.search(r'我(?:来|会|负责|保证)', row['text']) for row in rows)
-                checked_item = {**item, 'owner': ''} if scoped_owner else item
                 # Reuse evidence validation without imposing the legacy twenty-item ceiling.
-                checked = _validate({'summary': '', 'tasks': [checked_item] if key == 'tasks' else [],
-                                     'decisions': [item] if key == 'decisions' else []}, rows)
-                if scoped_owner:
-                    checked['tasks'][0]['owner'] = owner
-                result[key].extend(checked[key])
+                if key == 'tasks':
+                    result[key].append(_checked_task(item, rows))
+                else:
+                    result[key].extend(_validate({'summary': '', 'tasks': [], 'decisions': [item]}, rows)[key])
                 continue
             if not isinstance(item, dict) or set(item) != fields.get(key, {'text', 'source_ids'}):
                 raise ValueError('Invalid minutes item')
@@ -114,12 +163,8 @@ def _validate_minutes(parsed, rows):
             for field in set(item) - {'source_ids'}:
                 value = _string(item[field], 1500, empty=field in {'person', 'time', 'location', 'task'})
                 if field in {'person', 'time', 'location'} and value:
-                    scoped_person = field == 'person' and re.fullmatch(r'(?:发言人 ?|说话人 ?)\d+', value) and any(
-                        by_id[source_id].get('speaker_scope') == 'meeting' and by_id[source_id]['speaker'] == value for source_id in ids)
-                    if not scoped_person and not any(value in by_id[source_id]['text'] for source_id in ids):
+                    if not _metadata_supported(field, value, ids, by_id):
                         raise ValueError('Unsupported meeting person/time/location')
-                    if field == 'person' and not scoped_person and not _person_label(value):
-                        raise ValueError('Unidentified meeting person')
                 entry[field] = value
             result[key].append(entry)
     chapters, highlights = parsed.get('chapters', []), parsed.get('highlights', [])
@@ -130,37 +175,92 @@ def _validate_minutes(parsed, rows):
     return result
 
 
+class MinutesFailure(ValueError):
+    """Public failure category without upstream payloads, credentials or meeting text."""
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__(reason)
+
+
+FAILURE_NOTICES = {
+    'no_sources': '没有可总结的会议原文',
+    'not_configured': '服务器尚未配置文字总结模型',
+    'quota_exceeded': '今日 AI 使用额度已用完',
+    'authentication': '文字模型鉴权失败，请检查后端配置',
+    'rate_limited': '文字模型请求过于频繁，请稍后重试',
+    'timeout': '文字模型响应超时，请稍后重试',
+    'network': '暂时无法连接文字模型，请检查后端网络',
+    'provider_error': '文字模型服务请求失败，请检查后端模型配置或稍后重试',
+    'output_truncated': '模型输出超出长度限制，整场总结未完成',
+    'content_filtered': '文字模型未能处理这次会议内容',
+    'invalid_output': '模型结果纠正后仍未通过格式或原文依据校验',
+}
+
+
 class WorkMeetingMinutes:
     def __init__(self, config, charge=lambda: True):
         self.config, self.charge = config, charge
 
     async def _analyze(self, content, rows):
-        if not self.charge():
-            raise ValueError('Meeting analysis quota reached')
+        messages = [{'role': 'system', 'content': MINUTES_PROMPT},
+                    {'role': 'user', 'content': json.dumps(content, ensure_ascii=False)}]
         client = self.config.http_pool.client('text', timeout=120, proxy=self.config.proxy)
-        response = await client.post(self.config.text_url.rstrip('/') + '/chat/completions',
-            headers={'Authorization': 'Bearer ' + self.config.text_key},
-            json={'model': self.config.text_model, 'temperature': 0.1, 'max_tokens': 16000,
-                  'thinking': {'type': 'disabled'}, 'response_format': {'type': 'json_object'},
-                  'messages': [{'role': 'system', 'content': MINUTES_PROMPT},
-                               {'role': 'user', 'content': json.dumps(content, ensure_ascii=False)}]},
-            timeout=120)
-        response.raise_for_status()
-        choice = response.json()['choices'][0]
-        if choice.get('finish_reason') in {'length', 'content_filter'}:
-            raise ValueError('Incomplete meeting output')
-        raw = choice['message']['content']
-        if not isinstance(raw, str) or len(raw) > 180000:
-            raise ValueError('Invalid minutes size')
-        return _validate_minutes(json.loads(raw), rows)
+        # Correct one invalid structured response without relaxing evidence checks.
+        for attempt in range(2):
+            if not self.charge():
+                raise MinutesFailure('quota_exceeded')
+            try:
+                response = await client.post(self.config.text_url.rstrip('/') + '/chat/completions',
+                    headers={'Authorization': 'Bearer ' + self.config.text_key},
+                    json={'model': self.config.text_model, 'temperature': 0.1, 'max_tokens': 16000,
+                          'thinking': {'type': 'disabled'}, 'response_format': {'type': 'json_object'},
+                          'messages': list(messages)})
+                response.raise_for_status()
+            except httpx.HTTPStatusError as error:
+                status = error.response.status_code
+                raise MinutesFailure('authentication' if status in (401, 403) else
+                                     'rate_limited' if status == 429 else 'provider_error') from None
+            except httpx.TimeoutException:
+                raise MinutesFailure('timeout') from None
+            except httpx.RequestError:
+                raise MinutesFailure('network') from None
+            try:
+                choice = response.json()['choices'][0]
+                if choice.get('finish_reason') in {'length', 'content_filter'}:
+                    raise MinutesFailure('output_truncated' if choice['finish_reason'] == 'length' else 'content_filtered')
+                raw = choice['message']['content']
+                if not isinstance(raw, str) or len(raw) > 180000:
+                    raise MinutesFailure('invalid_output')
+            except (ValueError, KeyError, TypeError, IndexError, AttributeError) as error:
+                if isinstance(error, MinutesFailure):
+                    raise
+                raise MinutesFailure('invalid_output') from None
+            try:
+                return _validate_minutes(json.loads(raw), rows)
+            except (ValueError, KeyError, TypeError, IndexError, AttributeError):
+                if attempt:
+                    try:
+                        return _clear_unsupported_task_metadata(json.loads(raw), rows)
+                    except (ValueError, KeyError, TypeError, IndexError, AttributeError):
+                        raise MinutesFailure('invalid_output') from None
+                logging.getLogger('uvicorn.error.aidol.minutes').info('work_minutes validation=failed correction=1')
+                messages.extend([
+                    {'role': 'assistant', 'content': raw},
+                    {'role': 'user', 'content': '上次 JSON 未通过格式或原文依据校验。请重新逐项核对并返回完整 JSON：'
+                     '所有 source_ids 必须是 document 中已有的原文 ID；owner、person、due、time、location '
+                     '必须逐字出现在各自引用的原文中，不得改写汉字数字、时间措辞、推断日期或人物。'
+                     '整场说话人标签仅用于有依据的观点或第一人称承诺。无法逐字支持的负责人、时间、地点留空字符串；'
+                     '不能支持的条目删除。保留整场总结和有依据的其他内容；所有必需分类均保留，无内容用空数组。'}])
 
     async def generate(self, rows, progress=lambda stage, done, total: None):
         source_ids = [row['id'] for row in rows]
         fallback = {**_rules(rows), 'title': '会议记录', 'topics': [], 'open_questions': [],
                     'viewpoints': [], 'conflicts': [], 'events': [], 'chapters': [], 'highlights': [],
                     'source_ids': source_ids, 'extraction': 'rules_fallback',
-                    'notice': '整场总结未完成（模型不可用、内容超限或结果不完整）；下面仅为原文摘录。完整原文已保存，可重试。'}
+                    'notice': ''}
         if not rows or not self.config.text_key or not self.config.text_model:
+            reason = 'no_sources' if not rows else 'not_configured'
+            fallback.update(failure_reason=reason, notice=FAILURE_NOTICES[reason] + '；下面仅为原文摘录，完整原文已保存。')
             return fallback
         try:
             document = '\n\n'.join('【原文依据 ' + row['id'] + '】\n' +
@@ -169,6 +269,10 @@ class WorkMeetingMinutes:
             report = await self._analyze({'document': document}, rows)
             progress('synthesizing', 1, 1)
             return {**report, 'source_ids': source_ids, 'extraction': 'llm',
-                    'notice': '基于整场已保存原文生成；身份、事件时间地点不明确时标为未明确，请结合原文核对。'}
-        except (httpx.HTTPError, ValueError, KeyError, TypeError, IndexError, AttributeError):
+                    'notice': '基于整场已保存原文生成；身份、事件时间地点不明确时标为未明确，请结合原文核对。'
+                              + ('部分负责人、人物、时间或地点缺少逐字原文依据，已留空，请核对。' if report.get('metadata_omissions') else '')}
+        except (httpx.HTTPError, ValueError, KeyError, TypeError, IndexError, AttributeError) as error:
+            reason = error.reason if isinstance(error, MinutesFailure) else 'invalid_output'
+            logging.getLogger('uvicorn.error.aidol.minutes').warning('work_minutes failure=%s', reason)
+            fallback.update(failure_reason=reason, notice=FAILURE_NOTICES[reason] + '；下面仅为原文摘录。完整原文已保存，可重试。')
             return fallback

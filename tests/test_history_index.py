@@ -17,7 +17,7 @@ def test_old_memory_survives_thousands_of_recent_records_and_tasks(store):
                        (str(index), 'fact', '今天购买面包', 'user', '2099-01-01'))
             db.execute('INSERT INTO transcripts (id,speaker,text,mode,source,created_at) VALUES(?,?,?,?,?,?)',
                        (str(index), '用户', '下午去散步', 'life', 'asr', '2099-01-01'))
-            db.execute('INSERT INTO action_tasks VALUES(?,?,?,?,?,?,?,?)',
+            db.execute('INSERT INTO action_tasks(id,report_id,content,owner,due,source_ids,status,created_at) VALUES(?,?,?,?,?,?,?,?)',
                        (str(index), 'report', '准备文档', '', '', '[]', 'open', '2099-01-01'))
     memories, transcripts = store.recall_records('和姐姐去的白桦咖啡馆叫什么？')
     assert old['id'] in {row['id'] for row in memories}

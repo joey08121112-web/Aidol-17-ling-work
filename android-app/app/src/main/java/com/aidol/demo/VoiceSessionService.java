@@ -31,10 +31,12 @@ public final class VoiceSessionService extends Service {
             }
             int mode = getSystemService(android.media.AudioManager.class).getMode();
             boolean ownsCommunication = session != null && session.usesSystemCommunicationRoute();
-            if (mode == android.media.AudioManager.MODE_IN_CALL || mode == android.media.AudioManager.MODE_IN_COMMUNICATION && !ownsCommunication
-                    || mode == android.media.AudioManager.MODE_RINGTONE) {
+            boolean work = session != null && session.recordsWorkCalls();
+            if (!work && (mode == android.media.AudioManager.MODE_IN_CALL || mode == android.media.AudioManager.MODE_IN_COMMUNICATION && !ownsCommunication
+                    || mode == android.media.AudioManager.MODE_RINGTONE)) {
                 stopSession("检测到来电或通话，耳机会话已停止；结束后请手动开启"); return;
             }
+            if (work) updateNotification(session.workSaving() ? "正在保存工作记录…" : session.workAudioStatus());
             handler.postDelayed(this, 1000);
         }
     };
@@ -42,6 +44,8 @@ public final class VoiceSessionService extends Service {
     private java.util.function.Consumer<String> stopped;
     private PowerManager.WakeLock wakeLock;
     private boolean enabled;
+    private Notification.Builder notification;
+    private String notificationText = "";
 
     public final class LocalBinder extends Binder {
         VoiceSessionService service() { return VoiceSessionService.this; }
@@ -55,16 +59,16 @@ public final class VoiceSessionService extends Service {
         PendingIntent content = PendingIntent.getActivity(this, 0, open, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         PendingIntent stop = PendingIntent.getService(this, 1, new Intent(this, VoiceSessionService.class).setAction(STOP),
             PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-        Notification notification = new Notification.Builder(this, CHANNEL)
+        notification = new Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_launcher).setContentTitle("Aidol 耳机会话已开启")
             .setContentText("AI 通话可锁屏继续；点击停止即可挂断")
             .setContentIntent(content).setOngoing(true).setCategory(Notification.CATEGORY_SERVICE)
             .setVisibility(Notification.VISIBILITY_PRIVATE)
-            .addAction(new Notification.Action.Builder(null, "停止会话", stop).build()).build();
-        if (Build.VERSION.SDK_INT >= 30) startForeground(NOTIFICATION, notification,
+            .addAction(new Notification.Action.Builder(null, "停止会话", stop).build()).setOnlyAlertOnce(true);
+        if (Build.VERSION.SDK_INT >= 30) startForeground(NOTIFICATION, notification.build(),
             ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE | ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
-        else if (Build.VERSION.SDK_INT >= 29) startForeground(NOTIFICATION, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
-        else startForeground(NOTIFICATION, notification);
+        else if (Build.VERSION.SDK_INT >= 29) startForeground(NOTIFICATION, notification.build(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+        else startForeground(NOTIFICATION, notification.build());
         wakeLock = getSystemService(PowerManager.class).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Aidol:VoiceTurn");
         wakeLock.setReferenceCounted(false);
         enabled = true;
@@ -73,8 +77,18 @@ public final class VoiceSessionService extends Service {
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent == null || STOP.equals(intent.getAction())) stopSession("已从通知停止耳机会话；已提交内容请查看历史");
+        if (intent == null || STOP.equals(intent.getAction())) {
+            if (intent != null && session != null && session.recordsWorkCalls()) {
+                session.stopRecording(); updateNotification("正在结束并保存工作记录…");
+            } else stopSession("已从通知停止耳机会话；已提交内容请查看历史");
+        }
         return START_NOT_STICKY;
+    }
+    private void updateNotification(String text) {
+        if (!enabled || text.equals(notificationText)) return;
+        notificationText = text;
+        getSystemService(NotificationManager.class).notify(NOTIFICATION,
+            notification.setContentTitle("Aidol 工作记录进行中").setContentText(text).build());
     }
     @Override public IBinder onBind(Intent intent) { return binder; }
     boolean enabled() { return enabled; }
@@ -97,6 +111,11 @@ public final class VoiceSessionService extends Service {
     void release(HostedSession completed, boolean continuingCall) {
         if (session != completed) return;
         session = null;
+        if (enabled && completed != null && completed.recordsWorkCalls()) {
+            notificationText = "";
+            getSystemService(NotificationManager.class).notify(NOTIFICATION,
+                notification.setContentTitle("Aidol 耳机会话已开启").setContentText("AI 通话可锁屏继续；点击停止即可挂断").build());
+        }
         if (!continuingCall && wakeLock.isHeld()) wakeLock.release();
         if (!continuingCall && enabled) handler.postDelayed(expiry, 60 * 60 * 1000L);
     }

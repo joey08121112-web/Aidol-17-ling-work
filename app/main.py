@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException, Request, Query, WebSocket, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .config import Config
-from .domain import Settings, LocationInput, MemoryInput, SpeechInput, NearbyInput
+from .domain import Settings, Mode, LocationInput, MemoryInput, SpeechInput, NearbyInput
 from .domain import MeetingRequest, RecallRequest, TaskStatusInput, MemoryUpdate
 from .providers.volc_speech import VolcSpeechProvider, SpeechProviderError, pcm_to_wav
 from .providers.qwen_realtime import QwenRealtimeProvider
@@ -22,6 +22,9 @@ from .providers.qwen_work_asr import QwenWorkAsrProvider
 from .providers.qwen_meeting_asr import QwenMeetingAsrProvider, MeetingTaskFailed
 from .services.insights import MeetingInsights, meeting_coverage
 from .services.work_meetings import WorkMeetingMinutes, attach_times
+from .services.meeting_addresses import MeetingAddresses
+from .services.meeting_revisions import MeetingRevisions, editable_document, validate_document
+from .services.work_meetings import MinutesFailure
 from .services.work_live import live_captions
 from .services.recall import RecallService
 from .services.voice_stream import CompletionBarrier, transcribe_live, reply_live
@@ -29,6 +32,8 @@ from .services.qwen_voice import reply_qwen, realtime_instructions
 from .services.duplex_voice import duplex_call
 from .services.assistant_tools import AssistantTools
 from .services.commute import ROUTE_FIELDS, commute_destination
+from .services.commute_journeys import PlacePoint, SavedAddressInput, CommuteStart, CommuteRefresh, refresh_journey
+from .services.maps import MapService
 from .providers.bocha import BochaSearch
 
 
@@ -40,7 +45,7 @@ def create_hosted_app(config=None, data_directory=None):
     from contextlib import asynccontextmanager
     from fastapi import Depends
     from fastapi.exceptions import RequestValidationError
-    from pydantic import BaseModel, Field, field_validator
+    from pydantic import BaseModel, Field, field_validator, model_validator
     from starlette.concurrency import run_in_threadpool
     from .storage import AccountStore, Store
     from .services.accounts import digest, password_hash, password_matches, DUMMY_PASSWORD
@@ -50,8 +55,15 @@ def create_hosted_app(config=None, data_directory=None):
     directory = Path(data_directory or os.getenv('AIDOL_DATA_DIR', 'data/hosted'))
     accounts = AccountStore(str(directory / 'accounts.sqlite3'))
     runtimes = MobileRuntimes(config, directory / 'users')
+    meeting_addresses = MeetingAddresses(config)
     speech = VolcSpeechProvider(config.speech)
-    api = FastAPI(title='Aidol Android API', version='0.2.0', docs_url=None, redoc_url=None, openapi_url=None)
+    @asynccontextmanager
+    async def lifespan(app):
+        try:
+            yield
+        finally:
+            await meeting_addresses.close()
+    api = FastAPI(title='Aidol Android API', version='0.2.0', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     api.state.accounts, api.state.runtimes, api.state.speech = accounts, runtimes, speech
     api.state.qwen = QwenRealtimeProvider(config.qwen)
     api.state.work_asr = QwenWorkAsrProvider(config.work_asr)
@@ -110,10 +122,27 @@ def create_hosted_app(config=None, data_directory=None):
         request_id: str = Field(pattern=r'^[a-zA-Z0-9-]{16,64}$')
         interaction_source: str = Field(default='ambient_capture', pattern=r'^(direct_question|ambient_capture|continuous_call)$')
 
+    class MeetingLocationInput(LocationInput):
+        observed_at: datetime | None = None
+        cached: bool = Field(default=False, strict=True)
+
+        @field_validator('observed_at')
+        @classmethod
+        def aware_observation(cls, value):
+            if value is not None and (value.tzinfo is None or (value - datetime.now(timezone.utc)).total_seconds() > 120):
+                raise ValueError('定位获取时间需包含时区且不能晚于当前时间')
+            return value
+
+        @model_validator(mode='after')
+        def cached_time(self):
+            if self.cached and self.observed_at is None:
+                raise ValueError('缓存定位需包含实际获取时间')
+            return self
+
     class WorkMeetingStart(BaseModel):
         meeting_id: str = Field(pattern=r'^[a-zA-Z0-9-]{16,64}$')
         started_at: datetime | None = None
-        location: LocationInput | None = None
+        location: MeetingLocationInput | None = None
         whole_audio: bool = False
 
         @field_validator('started_at')
@@ -123,13 +152,84 @@ def create_hosted_app(config=None, data_directory=None):
                 raise ValueError('会议开始时间需包含时区且在一天内')
             return value
 
+    class MeetingRevisionInput(BaseModel):
+        request_id: str = Field(pattern=r'^[a-zA-Z0-9-]{16,64}$')
+        base_report_id: str = Field(min_length=1, max_length=64)
+        document: dict
+
+    class MeetingPin(BaseModel):
+        pinned: bool = Field(strict=True)
+
+    class CustomTask(BaseModel):
+        task_id: str = Field(pattern=r'^[a-zA-Z0-9-]{16,64}$')
+        content: str = Field(min_length=1, max_length=500)
+        owner: str = Field(default='', max_length=100)
+        due_at: datetime
+        reminder_hours: int = Field(default=1)
+
+        @field_validator('content')
+        @classmethod
+        def nonempty(cls, value):
+            if not value.strip():
+                raise ValueError('请输入待办内容')
+            return value.strip()
+
+        @field_validator('due_at')
+        @classmethod
+        def future_due(cls, value):
+            if value.tzinfo is None or value <= datetime.now(timezone.utc):
+                raise ValueError('请选择未来的截止时间')
+            return value
+
+        @field_validator('reminder_hours')
+        @classmethod
+        def reminder_choice(cls, value):
+            if value not in (0, 1, 6, 24):
+                raise ValueError('提醒提前量仅支持不提醒、1小时、6小时、1天')
+            return value
+
+    class TaskEdit(BaseModel):
+        content: str = Field(min_length=1, max_length=500)
+        owner: str = Field(default='', max_length=100)
+        due: str = Field(default='', max_length=500)
+        due_at: datetime | None = None
+        reminder_hours: int = 0
+
+        @model_validator(mode='after')
+        def valid_edit(self):
+            self.content = self.content.strip()
+            self.owner = self.owner.strip()
+            self.due = self.due.strip()
+            if not self.content:
+                raise ValueError('请输入待办内容')
+            if self.due_at is not None and self.due_at.tzinfo is None:
+                raise ValueError('截止时间需包含时区')
+            if self.reminder_hours not in (0, 1, 6, 24):
+                raise ValueError('提醒提前量仅支持不提醒、1小时、6小时、1天')
+            if self.reminder_hours and self.due_at is None:
+                raise ValueError('开启提醒前请选择具体截止时间')
+            return self
+
+    class LocationRecord(LocationInput):
+        accuracy: float = Field(default=0, ge=0, le=200)
+        record_id: str = Field(pattern=r'^[a-zA-Z0-9-]{16,64}$')
+        observed_at: datetime
+        trigger: str = Field(pattern=r'^(app_open|page_return|interval)$')
+
+        @field_validator('observed_at')
+        @classmethod
+        def fresh_observation(cls, value):
+            if value.tzinfo is None or not -120 <= (datetime.now(timezone.utc) - value).total_seconds() <= 600:
+                raise ValueError('定位时间必须是近期带时区的时间')
+            return value
+
     class WorkMeetingFinish(BaseModel):
         segment_count: int = Field(ge=0, le=100000)
         complete: bool = True
 
     class WorkMeetingEvent(BaseModel):
         event_id: str = Field(pattern=r'^[a-zA-Z0-9-]{16,64}$')
-        kind: str = Field(pattern=r'^(pause|resume|mark)$')
+        kind: str = Field(pattern=r'^(pause|resume|mark|call_start|call_end)$')
         offset_ms: int = Field(ge=0, le=86_400_000)
         origin: str = Field(default='app', pattern=r'^(app|headset)$')
 
@@ -239,6 +339,11 @@ def create_hosted_app(config=None, data_directory=None):
 
     @api.post('/auth/logout')
     def logout(request: Request, current=Depends(user)):
+        store = read_work_store(current)
+        if store:
+            journey = store.commute_journey()
+            if journey.get('active'):
+                store.stop_commute(journey['id'])
         accounts.logout(digest(token(request)))
         return {'ok': True}
 
@@ -292,6 +397,7 @@ def create_hosted_app(config=None, data_directory=None):
             await rt.agent.decide()
             meetings = rt.store.work_meetings()
             resume_work_summaries(background, current, meetings)
+            meeting_addresses.schedule(background, rt.store, meetings)
             return {'user': current, 'settings': rt.store.settings().model_dump(),
                     'capabilities': config.capabilities(), 'agent': rt.agent.snapshot(),
                     'transcripts': list(reversed(rt.store.list('transcripts', 100))),
@@ -310,6 +416,10 @@ def create_hosted_app(config=None, data_directory=None):
             if any(getattr(old, key) != getattr(value, key) for key in ROUTE_FIELDS):
                 rt.agent.route, rt.agent.commute, rt.agent.last_route, rt.agent.last_notice = None, None, 0, 0
             rt.store.save_settings(value)
+            if value.mode != 'commute':
+                journey = rt.store.commute_journey()
+                if journey.get('active'):
+                    rt.store.stop_commute(journey['id'])
             rt.store.purge_work_audio()
             await rt.agent.decide()
             return value
@@ -805,6 +915,85 @@ def create_hosted_app(config=None, data_directory=None):
         async with runtime(current, request, True) as rt:
             return await rt.agent.update_location(value)
 
+    @api.post('/v1/location-records')
+    async def record_location(value: LocationRecord, current=Depends(user)):
+        # Passive maintenance never acquires the voice lock, invokes a provider,
+        # changes modes/routes, or consumes the voice/business request quota.
+        store = read_work_store(current) or Store(str(directory / 'users' / (current['id'] + '.sqlite3')))
+        point = value.model_dump(exclude={'record_id', 'observed_at'})
+        observed_at = value.observed_at.astimezone(timezone.utc).isoformat()
+        try:
+            record = store.save_location_record(value.record_id, observed_at, point)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+        existing = runtimes.items.get(current['id'])
+        if existing is not None:
+            existing.record_passive_location({**value.model_dump(include={'longitude', 'latitude', 'accuracy', 'source', 'speed'}), 'observed_at': observed_at})
+        return record
+
+    @api.get('/v1/location-records')
+    async def recorded_locations(limit: int = Query(default=100, ge=1, le=1000), current=Depends(user)):
+        store = read_work_store(current)
+        return {'records': store.location_records(limit) if store else []}
+
+    def commute_store(current):
+        return read_work_store(current) or Store(str(directory / 'users' / (current['id'] + '.sqlite3')))
+
+    @api.get('/v1/saved-addresses')
+    async def address_book(current=Depends(user)):
+        return {'addresses': commute_store(current).saved_addresses()}
+
+    @api.put('/v1/saved-addresses/{address_id}')
+    async def save_address(address_id: str, value: SavedAddressInput, current=Depends(user)):
+        if not re.fullmatch(r'[a-zA-Z0-9-]{1,64}', address_id):
+            raise HTTPException(422, '地址标识无效')
+        try:
+            return commute_store(current).save_address(address_id, value.model_dump())
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+
+    @api.delete('/v1/saved-addresses/{address_id}')
+    async def delete_address(address_id: str, current=Depends(user)):
+        if not commute_store(current).delete_address(address_id):
+            raise HTTPException(404, '地址不存在')
+        return {'ok': True}
+
+    @api.get('/v1/commute')
+    async def current_commute(current=Depends(user)):
+        return commute_store(current).commute_journey()
+
+    @api.post('/v1/commute')
+    async def start_commute(value: CommuteStart, request: Request, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            try:
+                payload = value.model_dump(exclude={'journey_id'})
+                journey = rt.store.start_commute({'id': value.journey_id, **payload})
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from None
+            if journey.get('active'):
+                settings = rt.store.settings()
+                settings.mode, settings.auto_mode = Mode.commute, False
+                rt.store.save_settings(settings)
+                await rt.agent.decide()
+            return journey
+
+    @api.post('/v1/commute/{journey_id}/refresh')
+    async def update_commute(journey_id: str, value: CommuteRefresh, current=Depends(user)):
+        try:
+            return await refresh_journey(commute_store(current), MapService(config), journey_id, value,
+                lambda: accounts.consume('usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400))
+        except LookupError:
+            raise HTTPException(404, '通勤已结束或不存在') from None
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+
+    @api.delete('/v1/commute/{journey_id}')
+    async def end_commute(journey_id: str, current=Depends(user)):
+        result = commute_store(current).stop_commute(journey_id)
+        if result is None:
+            raise HTTPException(404, '通勤不存在')
+        return result
+
     @api.post('/v1/maps/nearby')
     async def mobile_nearby(value: NearbyInput, request: Request, current=Depends(user)):
         async with runtime(current, request, True) as rt:
@@ -812,6 +1001,16 @@ def create_hosted_app(config=None, data_directory=None):
                 return await rt.agent.maps.nearby(value, value.keyword, value.radius, value.metro_only)
             except Exception:
                 raise HTTPException(502, '周边查询暂不可用，请稍后再试')
+
+    @api.post('/v1/maps/weather-at')
+    async def weather_at_address(value: PlacePoint, request: Request, forecast: bool = False, current=Depends(user)):
+        async with runtime(current, request, True) as rt:
+            try:
+                if value.adcode:
+                    return await rt.agent.maps.weather(value.adcode, forecast)
+                return await rt.agent.maps.weather_at(value.longitude, value.latitude, forecast)
+            except Exception:
+                raise HTTPException(502, '天气暂不可用，请稍后重试') from None
 
     @api.get('/v1/maps/weather')
     async def mobile_weather(request: Request, city: str = Query(default='', pattern=r'^([0-9]{6})?$'), forecast: bool = False, current=Depends(user)):
@@ -827,6 +1026,10 @@ def create_hosted_app(config=None, data_directory=None):
                 return await rt.agent.maps.weather_at(destination['longitude'], destination['latitude'], forecast)
             except Exception:
                 raise HTTPException(502, '天气查询暂不可用，请稍后再试')
+
+    @api.get('/v1/drafts')
+    async def current_drafts(current=Depends(user)):
+        return {'drafts': commute_store(current).list('drafts', 30)}
 
     @api.post('/v1/drafts/{draft_id}/{action}')
     async def mobile_draft(draft_id: str, action: str, request: Request, current=Depends(user)):
@@ -855,6 +1058,27 @@ def create_hosted_app(config=None, data_directory=None):
                     meeting = store.work_meeting(meeting_id)
                     if meeting is None or meeting['summary_status'] != 'pending':
                         return
+                revision = meeting['revision_request']
+                if revision.get('status') == 'pending':
+                    store.work_summary_progress(meeting_id, 'analyzing', 0, 1)
+                    charge = lambda: accounts.consume('usage:' + current['id'], int(os.getenv('AIDOL_DAILY_REQUESTS', '300')), 86400)
+                    try:
+                        report = await MeetingRevisions(config, charge).generate(meeting['report'], revision['document'],
+                            revision['id'], store.work_meeting_evidence(meeting))
+                    except MinutesFailure as exc:
+                        if accounts.user(current['username']) is not None and Path(store.path).exists():
+                            store.fail_work_revision(meeting_id, exc.reason)
+                        return
+                    found = accounts.user(current['username'])
+                    if found is None or found['id'] != current['id']:
+                        return
+                    async with runtimes.use(current['id'], wait_seconds=10) as rt:
+                        attach_times(report, meeting)
+                        report.update(meeting_id=meeting_id, started_at=meeting['started_at'], location=meeting['location'],
+                                      capture_status=meeting['status'], includes_demo=False)
+                        if not rt.store.finish_work_revision(meeting_id, revision['id'], report, [r['id'] for r in meeting['sources']]):
+                            rt.store.fail_work_summary(meeting_id)
+                    return
                 if meeting['transcription_status'] == 'pending':
                     # Whole-meeting diarization from the saved audio: one speaker namespace for the meeting.
                     import tempfile
@@ -931,28 +1155,25 @@ def create_hosted_app(config=None, data_directory=None):
         return Store(str(path)) if path.exists() else None
 
     @api.post('/v1/work-meetings')
-    async def start_work_meeting(value: WorkMeetingStart, request: Request, current=Depends(user)):
+    async def start_work_meeting(value: WorkMeetingStart, request: Request, background: BackgroundTasks, current=Depends(user)):
         async with runtime(current, request) as rt:
             if rt.store.settings().mode != 'work':
                 raise HTTPException(409, '请先切换到工作模式')
             existing = rt.store.work_meeting(value.meeting_id)
             if existing and bool(existing['whole_audio']) != value.whole_audio:
                 raise HTTPException(409, '会议录音方式不一致，请开始新的会议')
-            location = value.location.model_dump() if value.location else {}
-            if not existing and value.location and value.location.source == 'gps':
-                from .services.maps import MapService
-                try:
-                    async with asyncio.timeout(3):
-                        place = await MapService(config).reverse(value.location)
-                    if place.get('available'):
-                        location['address'] = place['address']
-                except Exception:
-                    pass  # Coordinates remain usable when address lookup is unavailable.
-            meeting = rt.store.start_work_meeting(value.meeting_id,
-                value.started_at.isoformat() if value.started_at else None,
-                location, value.whole_audio)
+            location = value.location.model_dump(exclude={'observed_at', 'cached'}) if value.location else {}
+            if value.location and value.location.observed_at is not None:
+                location.update(observed_at=value.location.observed_at.isoformat(), cached=value.location.cached)
+            try:
+                meeting = rt.store.start_work_meeting(value.meeting_id,
+                    value.started_at.isoformat() if value.started_at else None,
+                    location, value.whole_audio)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from None
             if meeting['status'] != 'recording':
                 raise HTTPException(409, '这场会议已结束，请开始新的会议')
+            meeting_addresses.schedule(background, rt.store, [meeting])
             return meeting
 
     @api.post('/v1/work-meetings/{meeting_id}/audio')
@@ -983,6 +1204,7 @@ def create_hosted_app(config=None, data_directory=None):
             store.purge_work_audio()
         meetings = store.work_meetings() if store else []
         resume_work_summaries(background, current, meetings)
+        meeting_addresses.schedule(background, store, meetings)
         return {'meetings': meetings}
 
     @api.get('/v1/work-meetings/{meeting_id}')
@@ -994,7 +1216,28 @@ def create_hosted_app(config=None, data_directory=None):
         if meeting is None:
             raise HTTPException(404, '会议记录不存在')
         resume_work_summaries(background, current, [meeting])
+        meeting_addresses.schedule(background, store, [meeting])
         return meeting
+
+    @api.patch('/v1/work-meetings/{meeting_id}')
+    async def pin_work_meeting(meeting_id: str, value: MeetingPin, request: Request, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            if not rt.store.pin_work_meeting(meeting_id, value.pinned):
+                raise HTTPException(404, '会议记录不存在')
+            return {'meeting_id': meeting_id, 'pinned': value.pinned, 'meetings': rt.store.work_meetings()}
+
+    @api.delete('/v1/work-meetings/{meeting_id}')
+    async def delete_work_meeting(meeting_id: str, request: Request, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            try:
+                removed = rt.store.delete_work_meeting(meeting_id)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from None
+            if removed is None:
+                raise HTTPException(404, '会议记录不存在')
+            return {'ok': True, 'deleted_task_ids': removed, 'meetings': rt.store.work_meetings(),
+                    'meeting_report': rt.store.meeting_report(), 'tasks': rt.store.list('action_tasks', 10000),
+                    'transcripts': list(reversed(rt.store.list('transcripts', 100)))}
 
     @api.post('/v1/work-meetings/{meeting_id}/events')
     async def work_meeting_event(meeting_id: str, value: WorkMeetingEvent, current=Depends(user)):
@@ -1071,6 +1314,44 @@ def create_hosted_app(config=None, data_directory=None):
             resume_work_summaries(background, current, [meeting])
             return meeting
 
+    @api.get('/v1/work-meetings/{meeting_id}/revision')
+    async def get_revision(meeting_id: str, current=Depends(user)):
+        store = read_work_store(current)
+        meeting = store.work_meeting(meeting_id) if store else None
+        if meeting is None:
+            raise HTTPException(404, '会议记录不存在')
+        if not meeting['report'] or meeting['summary_status'] == 'pending' or meeting['status'] == 'recording':
+            raise HTTPException(409, '请等待本场纪要整理完成')
+        draft = meeting['revision_request']
+        document = draft.get('document') if draft.get('status') == 'failed' and draft.get('base_report_id') == meeting['report_id'] else None
+        return {'base_report_id': meeting['report_id'], 'document': document or editable_document(meeting['report'])}
+
+    @api.post('/v1/work-meetings/{meeting_id}/revise-summary')
+    async def revise_summary(meeting_id: str, value: MeetingRevisionInput, request: Request, background: BackgroundTasks, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            meeting = rt.store.work_meeting(meeting_id)
+            if meeting is None:
+                raise HTTPException(404, '会议记录不存在')
+            old = meeting['revision_request']
+            if old.get('id') == value.request_id:
+                if old.get('base_report_id') != value.base_report_id or old.get('document') != value.document:
+                    raise HTTPException(409, '修正请求编号已使用')
+                resume_work_summaries(background, current, [meeting])
+                return meeting
+            if not meeting['report'] or meeting['report_id'] != value.base_report_id:
+                raise HTTPException(409, '纪要已有更新，请重新打开编辑页面')
+            try:
+                doc = validate_document(value.document, editable_document(meeting['report']))
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from None
+            revision = {'id': value.request_id, 'base_report_id': value.base_report_id, 'document': doc,
+                        'status': 'pending', 'created_at': datetime.now(timezone.utc).isoformat()}
+            if not rt.store.queue_work_revision(meeting_id, value.base_report_id, revision):
+                raise HTTPException(409, '纪要正在处理，请稍后重试')
+            meeting = rt.store.work_meeting(meeting_id)
+            resume_work_summaries(background, current, [meeting])
+            return meeting
+
     @api.post('/v1/work-meetings/{meeting_id}/retry-summary')
     async def retry_work_meeting(meeting_id: str, request: Request, background: BackgroundTasks, current=Depends(user)):
         async with runtime(current, request) as rt:
@@ -1079,6 +1360,8 @@ def create_hosted_app(config=None, data_directory=None):
                 raise HTTPException(404, '会议记录不存在')
             if (not meeting['sources'] and meeting['transcription_status'] not in ('pending', 'failed')) or meeting['status'] == 'recording':
                 raise HTTPException(409, '请先结束会议并保存原文')
+            if (meeting['report'] or {}).get('revision_id'):
+                raise HTTPException(409, '这份纪要已有用户修正，请使用修正并重新生成入口')
             if (current['id'], meeting_id) in work_summaries_running:
                 return meeting
             rt.store.retry_work_summary(meeting_id)
@@ -1103,6 +1386,36 @@ def create_hosted_app(config=None, data_directory=None):
                           coverage=meeting_coverage(rows, report.get('source_ids', [])), hours=value.hours, includes_demo=False)
             return rt.store.save_meeting_report(signature, report)
 
+    @api.get('/v1/tasks')
+    async def all_tasks(current=Depends(user)):
+        store = read_work_store(current)
+        return {'tasks': store.list('action_tasks', 10000) if store else []}
+
+    @api.post('/v1/tasks')
+    async def create_task(value: CustomTask, request: Request, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            try:
+                return rt.store.create_action_task(value.task_id, value.content, value.owner.strip(),
+                    value.due_at.astimezone(timezone.utc).isoformat(), value.reminder_hours)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from None
+
+    @api.put('/v1/tasks/{task_id}')
+    async def edit_task(task_id: str, value: TaskEdit, request: Request, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            task = rt.store.edit_action_task(task_id, value.content, value.owner, value.due,
+                value.due_at.astimezone(timezone.utc).isoformat() if value.due_at is not None else '', value.reminder_hours)
+            if task is None:
+                raise HTTPException(404, '待办不存在')
+            return task
+
+    @api.delete('/v1/tasks/{task_id}')
+    async def delete_task(task_id: str, request: Request, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            if not rt.store.delete_action_task(task_id):
+                raise HTTPException(404, '待办不存在')
+            return {'ok': True}
+
     @api.patch('/v1/tasks/{task_id}')
     async def mobile_task(task_id: str, value: TaskStatusInput, request: Request, current=Depends(user)):
         async with runtime(current, request) as rt:
@@ -1115,6 +1428,8 @@ def create_hosted_app(config=None, data_directory=None):
         async with runtime(current, request) as rt:
             return {'user': current, 'settings': rt.store.settings().model_dump(), 'memories': rt.store.list('memories', 10000),
                     'version': 4, 'drafts': rt.store.list('drafts', 10000),
+                    'saved_addresses': rt.store.saved_addresses(), 'commute': rt.store.commute_journey(),
+                    'location_records': rt.store.location_records(10000),
                     'transcripts': rt.store.list('transcripts', 10000), 'reports': rt.store.all_meeting_reports(), 'tasks': rt.store.list('action_tasks', 10000),
                     'work_meetings': [rt.store.work_meeting(row['id']) for row in rt.store.work_meetings(10000)]}
 
@@ -1129,6 +1444,7 @@ def create_hosted_app(config=None, data_directory=None):
             rt.agent.conversation.history = []
             rt.agent.memory_interaction.reset()
             rt.agent.location, rt.agent.route, rt.agent.commute = None, None, None
+            rt.pending_location = None
             return {'ok': True}
 
     return api
