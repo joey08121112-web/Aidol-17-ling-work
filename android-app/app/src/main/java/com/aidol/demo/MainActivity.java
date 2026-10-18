@@ -436,10 +436,10 @@ public final class MainActivity extends Activity {
         root.addView(head);
         LinearLayout wordmark = column(); head.addView(wordmark, new LinearLayout.LayoutParams(0, -2, 1));
         ImageView logo = new ImageView(this);
-        logo.setImageResource(R.drawable.aidol_wordmark_speed);
+        logo.setImageResource(R.drawable.viaim_wordmark_chrome);
         logo.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        logo.setContentDescription("Aidol");
-        wordmark.addView(logo, new LinearLayout.LayoutParams(dp(124), dp(32)));
+        logo.setContentDescription("viaim");
+        wordmark.addView(logo, new LinearLayout.LayoutParams(dp(128), dp(38)));
         TextView refresh = action(head, "↻", () -> { if (canAct()) { lastNotice = ""; refresh(); } }); refresh.setTextSize(25); refresh.setContentDescription("刷新服务器数据");
         TextView avatar = action(head, api.vault.username().isEmpty() ? "A" : api.vault.username().substring(0, 1).toUpperCase(Locale.ROOT), () -> switchTab(4));
         avatar.setBackground(ripple(SOFT, 24, LINE)); avatar.setTextColor(ACCENT); avatar.setContentDescription("打开我的空间");
@@ -3048,14 +3048,7 @@ public final class MainActivity extends Activity {
             session != null && sessionUsesCapture && session.workCapturing());
     }
     private void handleHeadsetControl(HeadsetController.ControlEvent event) {
-        HeadsetInteractionPolicy.Gesture gesture;
-        switch (event.kind) {
-            case TAP: case PRESS_SINGLE: gesture = HeadsetInteractionPolicy.Gesture.TOGGLE; break;
-            case DOUBLE_TAP: case PRESS_DOUBLE: gesture = HeadsetInteractionPolicy.Gesture.NEXT_MODE; break;
-            case TRIPLE_TAP: case PRESS_TRIPLE: gesture = HeadsetInteractionPolicy.Gesture.DISCARD_COMBINATION; break;
-            case LONG_PRESS: case PRESS_LONG: gesture = HeadsetInteractionPolicy.Gesture.CANCEL; break;
-            default: gesture = HeadsetInteractionPolicy.Gesture.IGNORE; break;
-        }
+        HeadsetInteractionPolicy.Gesture gesture = HeadsetInteractionPolicy.gesture(event.kind);
         long now = android.os.SystemClock.elapsedRealtime();
         applyHeadsetDecision(headsetPolicy.event(gesture, event.sequence, event.receivedAtMillis, now, headsetInteractionContext()));
         handler.removeCallbacks(settleHeadsetGesture);
@@ -3065,6 +3058,8 @@ public final class MainActivity extends Activity {
         if (!decision.message.isEmpty()) headsetNotice(decision.message);
         for (HeadsetInteractionPolicy.Action action : decision.actions) {
             switch (action) {
+                case VOLUME_UP: adjustHeadsetMediaVolume(true); break;
+                case VOLUME_DOWN: adjustHeadsetMediaVolume(false); break;
                 case CANCEL:
                     endVoice();
                     break;
@@ -3093,6 +3088,21 @@ public final class MainActivity extends Activity {
                     else if (repeatArmed) { handler.removeCallbacks(repeatTick); repeatAt = 0; handler.post(repeatTick); }
                     break;
             }
+        }
+    }
+    private void adjustHeadsetMediaVolume(boolean raise) {
+        android.media.AudioManager audio = (android.media.AudioManager) getSystemService(AUDIO_SERVICE);
+        if (audio == null || audio.isVolumeFixed()) {
+            headsetNotice("当前设备不支持调节媒体音量");
+            return;
+        }
+        try {
+            // One platform step, no focus request, route change, or audible feedback.
+            audio.adjustStreamVolume(android.media.AudioManager.STREAM_MUSIC,
+                raise ? android.media.AudioManager.ADJUST_RAISE : android.media.AudioManager.ADJUST_LOWER,
+                android.media.AudioManager.FLAG_SHOW_UI);
+        } catch (SecurityException error) {
+            headsetNotice("系统暂不允许调节媒体音量，请使用手机音量键");
         }
     }
     private void clearHeadsetGesture() { headsetPolicy.clearPending(); handler.removeCallbacks(settleHeadsetGesture); }
@@ -3273,8 +3283,8 @@ public final class MainActivity extends Activity {
                 clearHeadsetGesture(); syncHeadsetControls();
                 feedback(checked ? "已申请触控联动；请看设备状态并实际测试手势" : "触控联动已关闭", checked ? LocalCue.TOUCH : LocalCue.UNTOUCH);
             });
-            label(body, "单击 / 单捏：待机时开始；聆听、思考或播报时均结束整场会话。工作录音停止后提交并保存。\n双击 / 双捏：生活 → 工作 → 通勤 → 生活；先结束当前会话，工作先保存，AI 停止播报；目标模式保持待机。\n长按 / 长捏：结束当前会话；工作录音停止后提交并保存。已提交内容可查看历史。\n\n单击、双击等待 400 毫秒组合判定；三击只撤销尚在判定的动作。短按、释放、滑动不绑定操作。\n\n仅响应 SDK 实际上报的事件，不修改耳机系统手势或固件。开启成功不等于所有手势已经实测。", 11, MUTED);
-            label(body, "单击开始或结束；双击按生活、工作、通勤循环切换。工作记录先提交再切换。断连、摘下或来电后不会自动开麦。", 11, MUTED);
+            label(body, "单击 / 单捏：待机时开始；聆听、思考或播报时均结束整场会话。工作录音停止后提交并保存。\n双击 / 双捏：生活 → 工作 → 通勤 → 生活；工作会议录音中为标记重点，其他状态切换后保持待机。\n耳机柄滑动：调节媒体音量，每次一档。\n长按 Logo 触控区：结束当前会话；工作录音停止后保存。\n长捏耳机柄：不结束会话。降噪 / 通透由耳机固件处理，当前 SDK 不支持 App 设置或确认切换。\n\n单击、双击等待 400 毫秒组合判定；三击只撤销尚在判定的动作。短按、释放不绑定操作。\n\n仅响应 SDK 实际上报的事件，不修改耳机系统手势或固件。开启成功不等于所有手势已经实测。", 11, MUTED);
+            label(body, "单击开始或结束；双击循环切换模式，工作会议录音中双击标记重点。滑动不打断录音或播放。", 11, MUTED);
         } else label(body, "当前使用 " + audioModeLabel() + "。Rise 接入在开发设置中选择，实物验收后再调整发布策略。", 12, MUTED);
         button(body, "打开系统蓝牙设置", false, () -> startActivity(new Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS)));
         ScrollView container = new ScrollView(this); container.addView(body);
