@@ -819,4 +819,5 @@ Android `testDebugUnitTest lintDebug assembleDebug` 成功：159项单测，零�
 - 先加回归再修复，旧实现实际失败：`Ordinary reply dismissed the call settings dialog`。修复后在独立 API 36 模拟器及 `com.aidol.app.review` 合成夹具中通过：持续会话对象存在时连续两个普通结果保留设置，来源弹窗失效不关闭设置；返回、完成、重复打开、账号页面重建和 Activity 销毁清理正常。原生活页流式更新、草稿、未保存记录、键盘及结束按钮检查一并通过。
 - 检查返回／Activity 销毁时，首次夹具把异步窗口清理当成同步动作而过早断言；保留失败日志，改为有界等待真实 dismiss 回调后通过，未删除原断言。沿用已记录的未登录夹具空账号 latch 处理，不修改正式账号逻辑。
 - 软件验证：JBR 21.0.11／SDK 35 执行 Android `testDebugUnitTest lintDebug assembleDebug` 成功，283 项单测通过，Lint 0 errors／28 warnings；Python 离线 623 passed／1 warning，compileall 通过。证据及候选 APK 在忽略目录 `artifacts/life-settings-fix/`：`baseline-regression.log`、`fixed-regression-final.log`、`android-checks.log`、`pytest.log` 与 `screenshots/`。
+- 合并前同步 `origin/main` 的工作／通勤更新 `9b4cc80`，保留双方交接文档后在组合版本复验：Android 296 项单测、Lint 0 errors／31 warnings、debug 构建通过；Python 641 passed／1 warning、compileall 通过；同一生活原生 UI 回归再次通过（`merged-regression.log`、`merged-screenshots/`）。本次修复相对于该主分支仍仅改两个 Android 文件及两份文档。
 - 本轮仅离线结果注入及模拟器 UI；没有模型、录音或供应商 API 请求，没有安装至 USB 真机、更新公网 APK 或部署服务，Rise 听音／锁屏等硬件验收仍待实机完成。
