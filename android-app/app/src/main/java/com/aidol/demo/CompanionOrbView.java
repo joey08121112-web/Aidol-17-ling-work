@@ -22,11 +22,14 @@ final class CompanionOrbView extends View {
     float level;
     private float drawnLevel = Float.MIN_VALUE;
     private long levelMovedAt;
+    private boolean conversationStyle;
 
     CompanionOrbView(Context context) {
         super(context);
         setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
     }
+
+    void conversationStyle() { conversationStyle = true; }
 
     /** Full rate while reacting to a recent level change, coarse once idle. */
     static long frameDelayMillis(long sinceLevelChangeMillis) {
@@ -39,7 +42,8 @@ final class CompanionOrbView extends View {
         halo = new RadialGradient(cx, cy, radius * 1.65f,
             new int[]{0x286e9edc, 0x0c96b8e8, 0x0096b8e8}, null, Shader.TileMode.CLAMP);
         sphere = new RadialGradient(cx - radius * .35f, cy - radius * .45f, radius * 1.65f,
-            new int[]{0xffffffff, 0xffeef2f8, 0xffb9c9df, 0xff637f9e},
+            conversationStyle ? new int[]{0xff2459e8, 0xff4c7bf2, 0xffdbe6ff, 0xff91b1f5}
+                : new int[]{0xffffffff, 0xffeef2f8, 0xffb9c9df, 0xff637f9e},
             new float[]{0, .35f, .72f, 1}, Shader.TileMode.CLAMP);
     }
 
