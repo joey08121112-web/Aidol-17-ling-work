@@ -16,6 +16,7 @@
 | `GET /v1/work-meetings/{id}/audio?start_ms=0&duration_ms=600000` | 返回本场录音时间轴 `[start_ms, start_ms+duration_ms)` 的 16 kHz 单声道 WAV，单次最多 10 分钟，裁到最后一段已存音频；缺失片段补静音。无录音、已过期或已删除返回404。 |
 | `DELETE /v1/work-meetings/{id}/audio` | 只删除本场录音文件，保留原文、句子与纪要；录音中返回409。返回会议详情。 |
 | `PATCH /v1/work-meetings/{id}` | `{pinned:true/false}`（严格布尔值）；返回`{meeting_id,pinned,meetings}`。重复设置幂等，未找到/跨账号404；不改原开始时间、状态或纪要。 |
+| `PUT /v1/work-meetings/{id}/speakers` | `{"label":"说话人N","name":"张三"}`；`name` 合并空白后最多20字，空字符串清除该名称，不能是另一个“说话人N/发言人N”编号或含控制字符（422）。返回完整会议，其中 `speaker_names` 为 `{label: name}`，只含本场仍存在的标签。录音中或整场识别 pending 时返回409；会议不存在或本场没有该标签返回404。仅改显示：原文句子、`speakers`、纪要和任务仍保存标签，客户端在文字记录、纪要和导出中把标签替换为名称，无需重新生成纪要。整场说话人识别写入新结果时清空本场 `speaker_names`。会议列表也返回 `speaker_names`。 |
 | `DELETE /v1/work-meetings/{id}` | 删除已结束会议；录音中409，未知/跨账号404。成功返回`{ok,deleted_task_ids,meetings,meeting_report,tasks,transcripts}`，后四项为删除后的当前账号快照；同账号已删除ID重复请求返回相同删除回执，不恢复会议。 |
 | `POST /v1/work-meetings/{id}/retry-summary` | 只重新处理已保存的文字，不重新 ASR 或上传音频；并发轮询不重复启动后台任务。替换同场旧纪要和待办，保留相同待办的完成状态。 |
 

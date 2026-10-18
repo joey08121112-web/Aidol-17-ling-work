@@ -171,6 +171,20 @@ def create_hosted_app(config=None, data_directory=None):
     class MeetingPin(BaseModel):
         pinned: bool = Field(strict=True)
 
+    class SpeakerName(BaseModel):
+        label: str = Field(pattern=r'^说话人\d{1,3}$')
+        name: str = Field(default='', max_length=40)
+
+        @field_validator('name')
+        @classmethod
+        def readable_name(cls, value):
+            value = ' '.join(value.split())
+            if len(value) > 20 or any(not char.isprintable() for char in value):
+                raise ValueError('说话人名称最多20个字')
+            if re.fullmatch(r'(?:说话人|发言人) ?\d+', value):
+                raise ValueError('请填写姓名或角色，不要使用其他说话人编号')
+            return value
+
     class CustomTask(BaseModel):
         task_id: str = Field(pattern=r'^[a-zA-Z0-9-]{16,64}$')
         content: str = Field(min_length=1, max_length=500)
@@ -251,6 +265,8 @@ def create_hosted_app(config=None, data_directory=None):
             message = '请检查输入：账号为 1–64 位可见字符，不能全为空格；密码为 1–128 位；找回账号时请填写完整恢复码'
         elif request.url.path == '/v1/maps/weather':
             message = '请先选择目的地，或填写 6 位城市行政区代码'
+        elif request.url.path.startswith('/v1/work-meetings/') and request.url.path.endswith('/speakers'):
+            message = '说话人名称最多20个字；请填写姓名或角色，不要使用其他说话人编号'
         return JSONResponse({'detail': message}, 422)
 
     @api.middleware('http')
@@ -1293,6 +1309,19 @@ def create_hosted_app(config=None, data_directory=None):
             if not rt.store.pin_work_meeting(meeting_id, value.pinned):
                 raise HTTPException(404, '会议记录不存在')
             return {'meeting_id': meeting_id, 'pinned': value.pinned, 'meetings': rt.store.work_meetings()}
+
+    @api.put('/v1/work-meetings/{meeting_id}/speakers')
+    async def name_work_speaker(meeting_id: str, value: SpeakerName, request: Request, current=Depends(user)):
+        async with runtime(current, request) as rt:
+            try:
+                meeting = rt.store.name_work_speaker(meeting_id, value.label, value.name)
+            except LookupError as exc:
+                raise HTTPException(404, str(exc)) from None
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from None
+            if meeting is None:
+                raise HTTPException(404, '会议记录不存在')
+            return meeting
 
     @api.delete('/v1/work-meetings/{meeting_id}')
     async def delete_work_meeting(meeting_id: str, request: Request, current=Depends(user)):
