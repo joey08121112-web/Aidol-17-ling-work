@@ -206,7 +206,7 @@ public final class MainActivity extends Activity {
     private String memoryFilter = "", lastNotice = "", lastAnswer = "", lastUser = "";
     private JSONArray lastCitations = new JSONArray(), lastTools = new JSONArray();
     private LinearLayout turnDetails;
-    private AlertDialog sourceDialog;
+    private AlertDialog sourceDialog, lifeCallSettingsDialog;
     private LinearLayout workMeetingList, workMeetingDetail;
     private String openWorkMeetingId = "", workMeetingDetailSnapshot = "", workMeetingJumpId = "";
     private boolean workMeetingSyncError, workMeetingAudioPlayable, meetingSeeking;
@@ -319,6 +319,7 @@ public final class MainActivity extends Activity {
     }
 
     private void base() {
+        if (lifeCallSettingsDialog != null) lifeCallSettingsDialog.dismiss();
         bottomNavigation = null;
         lifeOptions = null;
         maintenanceStatus = null;
@@ -759,6 +760,7 @@ public final class MainActivity extends Activity {
     }
 
     private void showLifeCallSettings() {
+        if (lifeCallSettingsDialog != null && lifeCallSettingsDialog.isShowing()) return;
         LinearLayout body = dialogBody();
         button(body, "耳机详情", false, this::showDeviceDetails);
         label(body, "接通后持续聆听，停顿后自动回答。说“小万”可打断当前回复；点黑色结束按钮挂断。", 14, MUTED);
@@ -773,7 +775,19 @@ public final class MainActivity extends Activity {
             diagnosticsView = label(diagnosticCard, "", 12, MUTED); diagnosticsView.setTextIsSelectable(true);
             renderDiagnostics(); button(diagnosticCard, "连接设置", false, this::showDevelopmentSettings);
         }
-        scrollDialog("通话设置", body);
+        // Answer sources are dismissed on every result; call settings belong to the user.
+        ScrollView viewport = new ScrollView(this); viewport.addView(body);
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("通话设置").setView(viewport)
+            .setPositiveButton("完成", null).create();
+        lifeCallSettingsDialog = dialog;
+        TextView settingsHint = voiceHint;
+        Button settingsLockButton = lockScreenButton;
+        dialog.setOnDismissListener(ignored -> {
+            if (lifeCallSettingsDialog == dialog) lifeCallSettingsDialog = null;
+            if (voiceHint == settingsHint) voiceHint = null;
+            if (lockScreenButton == settingsLockButton) lockScreenButton = null;
+        });
+        dialog.show();
     }
 
     private void voiceButtonText(String text) {
@@ -2885,7 +2899,7 @@ public final class MainActivity extends Activity {
         else if (listenMode != VoiceInteraction.CALL && session != null && sessionUsesCapture && !session.recordsWorkCalls()) endVoice();
         stopLocation(); super.onPause();
     }
-    @Override protected void onDestroy() { if (commutePanel != null) commutePanel.close(); if (meetingDeleteDialog != null) meetingDeleteDialog.dismiss(); if (workOptionsDialog != null) workOptionsDialog.dismiss(); if (taskBoard != null) taskBoard.close(); if (locationMonitor != null) locationMonitor.close(); if (statusPopup != null) statusPopup.dismiss(); handler.removeCallbacks(automaticHeadsetTick); if (quickFeedback != null) quickFeedback.close(); if (modeCuePlayer != null) modeCuePlayer.close(); if (meetingPlayback != null) meetingPlayback.close(); handler.removeCallbacks(workMeetingPlaybackTick); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } if (meetingPage != null) meetingPage.dismiss(); stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); ioPool.shutdownNow(); super.onDestroy(); }
+    @Override protected void onDestroy() { if (lifeCallSettingsDialog != null) lifeCallSettingsDialog.dismiss(); if (commutePanel != null) commutePanel.close(); if (meetingDeleteDialog != null) meetingDeleteDialog.dismiss(); if (workOptionsDialog != null) workOptionsDialog.dismiss(); if (taskBoard != null) taskBoard.close(); if (locationMonitor != null) locationMonitor.close(); if (statusPopup != null) statusPopup.dismiss(); handler.removeCallbacks(automaticHeadsetTick); if (quickFeedback != null) quickFeedback.close(); if (modeCuePlayer != null) modeCuePlayer.close(); if (meetingPlayback != null) meetingPlayback.close(); handler.removeCallbacks(workMeetingPlaybackTick); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } if (meetingPage != null) meetingPage.dismiss(); stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); ioPool.shutdownNow(); super.onDestroy(); }
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent); setIntent(intent);
         if (intent.getBooleanExtra("open_commute", false) && api != null && !api.vault.token().isEmpty()) switchTab(3);

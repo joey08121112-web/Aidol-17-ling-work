@@ -1,5 +1,7 @@
 # Aidol Android 使用与交接
 
+2026-10-18 通话设置窗口修复：设置与回答来源独立管理，AI 普通回复及来源失效不再关闭设置；完成／返回、账号页面重建和退出 App 时按对应生命周期关闭并释放引用。验证边界见 [验收记录](acceptance.md)。
+
 2026-10-18 高德导航入口：点击“开始通勤”后显示“高德导航 · 出行方式”，待通勤前台服务就绪、地址有效且当前没有其他忙碌操作时可点击；暂停状态先点“继续通勤”。入口直接读取当前账号活动行程的起点、目的地和出行方式，不使用未确认的表单内容。打开高德不会结束通勤或切换模式，原锁屏每180秒定位与路线更新继续；返回Aidol仍显示本次行程，结束通勤后隐藏导航入口。
 
 GPS起点驾车使用 `androidamap://navi` 从高德取得的实时位置直接导航；GPS起点步行、骑行在高德8.26.0及以上使用 `amapuri://openFeature` 的 `OnFootNavi` / `OnRideNavi`。公共交通、固定起点，以及无法确认支持直接步行/骑行导航的版本使用 `amapuri://route/plan/`，带入已选地址和方式后由用户在高德确认路线。固定起点保留其规划含义，实际导航仍由高德根据当前位置执行。其他偏好沿用高德本地设置，不传额外避堵、收费、高速或途经点选项；高德自行规划，路线不承诺与Aidol预览完全相同。[驾车导航](https://lbs.amap.com/api/amap-mobile/guide/android/navigation)、[步行导航](https://lbs.amap.com/api/amap-mobile/guide/android/walk-navi)、[骑行导航](https://lbs.amap.com/api/amap-mobile/guide/android/ride-navi)、[路径规划](https://lbs.amap.com/api/amap-mobile/guide/android/route)。

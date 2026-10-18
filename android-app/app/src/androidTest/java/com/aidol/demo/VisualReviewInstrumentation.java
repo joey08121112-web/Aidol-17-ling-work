@@ -54,7 +54,7 @@ public final class VisualReviewInstrumentation extends Instrumentation {
             if ("life".equals(prefix)) {
                 reviewLifeConversation();
                 runOnMainSync(() -> activity.finish());
-                result.putString("stream", "PASS: life transcript alignment, pinned modes/orb/controls, streaming replacement, unsaved turns, draft across tabs/modes, keyboard, settings and end button. Offline UI fixtures only. Screenshots: " + output);
+                result.putString("stream", "PASS: life transcript alignment, pinned modes/orb/controls, streaming replacement, unsaved turns, draft across tabs/modes, keyboard, settings remain open across replies, source invalidation, dialog cleanup and end button. Offline UI fixtures only. Screenshots: " + output);
                 finish(android.app.Activity.RESULT_OK, result);
                 return;
             }
@@ -84,7 +84,7 @@ public final class VisualReviewInstrumentation extends Instrumentation {
                 invoke("showLifeCallSettings", new Class<?>[]{});
                 TextView manual = (TextView) get("voiceHint");
                 if (manual == null || !manual.isShown()) throw new AssertionError("Listening options cannot be opened");
-                ((android.app.AlertDialog) get("sourceDialog")).dismiss();
+                ((android.app.AlertDialog) get("lifeCallSettingsDialog")).dismiss();
                 if (manual.isShown()) throw new AssertionError("Listening options cannot be closed");
             });
             String[] pages = {"conversation", "memories", "work", "commute", "profile"};
@@ -253,12 +253,37 @@ public final class VisualReviewInstrumentation extends Instrumentation {
         onMain(() -> {
             if (findText(activity.getWindow().getDecorView(), "你的随身 AI 伙伴") != null)
                 throw new AssertionError("Legacy hero still occupies the life transcript");
+            invoke("newSession", new Class<?>[]{}); // Allocate only; no capture or provider request.
             invoke("showLifeCallSettings", new Class<?>[]{});
         });
         capture("01-settings");
-        getUiAutomation().performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK);
-        waitForIdleSync();
         onMain(() -> {
+            TextView hint = (TextView) get("voiceHint");
+            invoke("acceptBusinessResult", new Class<?>[]{JSONObject.class}, new JSONObject().put("text", "你好").put("response", "我在听。"));
+            if (!hint.isShown()) throw new AssertionError("Ordinary reply dismissed the call settings dialog");
+            // Source dialogs must still be invalidated without closing the settings behind them.
+            invoke("showToolResults", new Class<?>[]{});
+            android.app.AlertDialog sources = (android.app.AlertDialog) get("sourceDialog");
+            invoke("acceptBusinessResult", new Class<?>[]{JSONObject.class}, new JSONObject().put("text", "继续聊").put("response", "好的。"));
+            if (sources.isShowing()) throw new AssertionError("Ordinary reply retained stale answer sources");
+            if (!hint.isShown()) throw new AssertionError("Source invalidation dismissed the call settings");
+            invoke("cancelSession", new Class<?>[]{String.class}, "");
+        });
+        capture("01b-settings-after-replies");
+        getUiAutomation().performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK);
+        awaitSettingsDismissed("Back");
+        onMain(() -> {
+            invoke("showLifeCallSettings", new Class<?>[]{});
+            android.app.AlertDialog settings = (android.app.AlertDialog) get("lifeCallSettingsDialog");
+            invoke("showLifeCallSettings", new Class<?>[]{});
+            if (settings != get("lifeCallSettingsDialog")) throw new AssertionError("Repeated opening stacked settings dialogs");
+            settings.getButton(android.content.DialogInterface.BUTTON_POSITIVE).performClick();
+        });
+        awaitSettingsDismissed("Done");
+        onMain(() -> {
+            if (get("lifeCallSettingsDialog") != null) throw new AssertionError("Done retained the settings dialog");
+            invoke("showLifeCallSettings", new Class<?>[]{});
+            android.app.AlertDialog settings = (android.app.AlertDialog) get("lifeCallSettingsDialog");
             JSONObject fixture = (JSONObject) get("state");
             org.json.JSONArray history = new org.json.JSONArray();
             history.put(new JSONObject().put("speaker", "user").put("text", "今天想慢下来，去附近走走。"));
@@ -266,6 +291,7 @@ public final class VisualReviewInstrumentation extends Instrumentation {
             history.put(new JSONObject().put("speaker", "user").put("text", "去公园吧，想晒晒太阳。"));
             history.put(new JSONObject().put("speaker", "assistant").put("text", "好啊，走一走，也让脑子休息一下。"));
             fixture.put("transcripts", history); invoke("showApp", new Class<?>[]{});
+            if (settings.isShowing()) throw new AssertionError("Rebuilding the account scaffold retained settings");
         });
         capture("02-conversation");
         onMain(() -> {
@@ -336,9 +362,24 @@ public final class VisualReviewInstrumentation extends Instrumentation {
             }
             invoke("hideKeyboard", new Class<?>[]{});
         });
+        onMain(() -> invoke("showLifeCallSettings", new Class<?>[]{}));
+        android.app.AlertDialog settings = (android.app.AlertDialog) get("lifeCallSettingsDialog");
+        onMain(() -> activity.finish());
+        awaitSettingsDismissed("Activity destruction");
+        if (settings.isShowing()) throw new AssertionError("Activity destruction retained the settings window");
     }
     private int screenX(View view) { int[] p = new int[2]; view.getLocationOnScreen(p); return p[0]; }
     private int screenY(View view) { int[] p = new int[2]; view.getLocationOnScreen(p); return p[1]; }
+    private void awaitSettingsDismissed(String action) throws Exception {
+        long deadline = SystemClock.uptimeMillis() + 3000;
+        while (SystemClock.uptimeMillis() < deadline) {
+            boolean[] dismissed = {false};
+            onMain(() -> dismissed[0] = get("lifeCallSettingsDialog") == null);
+            if (dismissed[0]) return;
+            SystemClock.sleep(50); // Back animation and the dismiss listener run asynchronously.
+        }
+        throw new AssertionError(action + " retained the settings dialog");
+    }
 
     private void onMain(Checked operation) throws Exception {
         Throwable[] failure = {null};
