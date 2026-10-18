@@ -76,9 +76,9 @@ async def refresh_journey(store, maps, journey_id, value, charge):
             point = journey['origin'] if journey['origin_mode'] == 'fixed' else fix
             origin = LocationInput(longitude=point['longitude'], latitude=point['latitude'], accuracy=point.get('accuracy', 0))
             if journey['origin_mode'] == 'fixed':
-                route = await asyncio.wait_for(maps.route(origin, settings, origin_gcj=True, origin_city=point['city']), 35)
+                route = await asyncio.wait_for(maps.route(origin, settings, origin_gcj=True, origin_city=point['city'], prefer_shorter=True), 35)
             else:
-                route = await asyncio.wait_for(maps.route(origin, settings), 35)
+                route = await asyncio.wait_for(maps.route(origin, settings, prefer_shorter=True), 35)
     except asyncio.CancelledError:
         store.finish_commute_refresh(journey_id, value.request_id, {'available': False, 'reason': '路线更新已中断'})
         raise

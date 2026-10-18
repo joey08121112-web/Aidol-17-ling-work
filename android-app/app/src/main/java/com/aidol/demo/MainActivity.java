@@ -27,6 +27,7 @@ import android.view.inputmethod.InputMethodManager;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.RadioButton;
 import android.widget.RadioGroup;
@@ -62,6 +63,10 @@ public final class MainActivity extends Activity {
     private ActionTaskBoard taskBoard;
     private TextView workRetentionAction, historyRangeAction;
     private LinearLayout historyReportBox;
+    private LinearLayout workSectionTabs;
+    private final LinearLayout[] workSections = new LinearLayout[3];
+    private final int[] workSectionScroll = {-1, -1, -1};
+    private int workSection;
     private RoundedChoiceDialog workOptionsDialog;
     private LinearLayout lastRenderedMeetingList;
     private String lastRenderedMeetingSnapshot = "";
@@ -202,6 +207,8 @@ public final class MainActivity extends Activity {
     // re-running the builder; markTabsDirty() forces a rebuild of stale content on next visit.
     private final LinearLayout[] tabViews = new LinearLayout[5];
     private final boolean[] tabDirty = {true, true, true, true, true};
+    private final int[] tabScrollY = new int[5];
+    private int attachedTab = -1;
     private LinearLayout activeCallRow;
     private final IconView[] navIcons = new IconView[5];
     private final TextView[] navNames = new TextView[5];
@@ -209,7 +216,7 @@ public final class MainActivity extends Activity {
     private String memoryFilter = "", lastNotice = "", lastAnswer = "", lastUser = "";
     private JSONArray lastCitations = new JSONArray(), lastTools = new JSONArray();
     private LinearLayout turnDetails;
-    private AlertDialog sourceDialog;
+    private AlertDialog sourceDialog, lifeCallSettingsDialog;
     private LinearLayout workMeetingList, workMeetingDetail;
     private String openWorkMeetingId = "", workMeetingDetailSnapshot = "", workMeetingJumpId = "";
     private boolean workMeetingSyncError, workMeetingAudioPlayable, meetingSeeking;
@@ -317,11 +324,12 @@ public final class MainActivity extends Activity {
             },
             () -> { startupLocationAttempted = false; handler.post(startupLocationTick); }, () -> scroll);
         if (getIntent().getBooleanExtra("open_commute", false)) tab = 3;
-        if (getIntent().getBooleanExtra("open_work_tasks", false)) tab = 2;
+        if (getIntent().getBooleanExtra("open_work_tasks", false)) { tab = 2; workSection = 2; }
         if (api.vault.token().isEmpty()) showAuth(0); else { showApp(); refresh(); }
     }
 
     private void base() {
+        if (lifeCallSettingsDialog != null) lifeCallSettingsDialog.dismiss();
         hideAvatars();
         workAvatar = null;
         bottomNavigation = null;
@@ -430,11 +438,17 @@ public final class MainActivity extends Activity {
         authError = null;
         java.util.Arrays.fill(tabViews, null);
         java.util.Arrays.fill(tabDirty, true);
+        java.util.Arrays.fill(tabScrollY, 0);
+        attachedTab = -1;
         base();
         LinearLayout head = row(); head.setGravity(Gravity.CENTER_VERTICAL); head.setPadding(dp(24), dp(8), dp(24), dp(4));
         root.addView(head);
         LinearLayout wordmark = column(); head.addView(wordmark, new LinearLayout.LayoutParams(0, -2, 1));
-        TextView logo = label(wordmark, "aidol", 25, INK); logo.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL)); logo.setLetterSpacing(-.04f);
+        ImageView logo = new ImageView(this);
+        logo.setImageResource(R.drawable.aidol_wordmark_speed);
+        logo.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        logo.setContentDescription("Aidol");
+        wordmark.addView(logo, new LinearLayout.LayoutParams(dp(124), dp(32)));
         TextView refresh = action(head, "↻", () -> { if (canAct()) { lastNotice = ""; refresh(); } }); refresh.setTextSize(25); refresh.setContentDescription("刷新服务器数据");
         TextView avatar = action(head, api.vault.username().isEmpty() ? "A" : api.vault.username().substring(0, 1).toUpperCase(Locale.ROOT), () -> switchTab(4));
         avatar.setBackground(ripple(SOFT, 24, LINE)); avatar.setTextColor(ACCENT); avatar.setContentDescription("打开我的空间");
@@ -480,6 +494,7 @@ public final class MainActivity extends Activity {
 
     /** Rebuilds only the current tab's content (when stale) and reattaches it; never touches the scaffold. */
     private void renderTab() {
+        if (attachedTab >= 0 && scroll.getChildCount() > 0) tabScrollY[attachedTab] = scroll.getScrollY();
         boolean restoreComposerFocus = tab == 0 && chatInput != null && chatInput.hasFocus();
         int draftSelection = chatInput == null ? 0 : chatInput.getSelectionStart();
         if (tab == 0 && chatInput != null) chatDraft = chatInput.getText().toString();
@@ -494,6 +509,9 @@ public final class MainActivity extends Activity {
         if (scroll.getChildCount() == 0 || scroll.getChildAt(0) != tabViews[tab]) {
             scroll.removeAllViews();
             scroll.addView(tabViews[tab]);
+            attachedTab = tab;
+            if (tab != 0 || (!conversationScrollQueued && !(session != null && followingConversation)))
+                restoreWorkScroll(scroll, tabScrollY[tab]);
             if (tab == 0 && session != null) followConversation();
         }
         composer.setVisibility(tab == 0 ? View.VISIBLE : View.GONE);
@@ -530,6 +548,8 @@ public final class MainActivity extends Activity {
             if (workAvatar != null) workAvatar.setHostVisible(false);
             workAvatar = null;
             workClock = null; workMeetingList = null; workCaptionBox = null; workCaptionViews.box = null;
+            workSectionTabs = null; java.util.Arrays.fill(workSections, null);
+            workRetentionAction = null; historyRangeAction = null; historyReportBox = null;
         } else if (which == 4) {
             profileHeadsetStatus = null; developmentSummary = null;
         }
@@ -548,6 +568,7 @@ public final class MainActivity extends Activity {
     private void switchTab(int next) {
         if (tab == next) return;
         clearHeadsetGesture();
+        if (commutePanel != null) commutePanel.pauseMap();
         boolean keepCall = sessionUsesCapture && session != null || repeatArmed;
         if (session != null && !keepCall) cancelSession("已结束当前操作");
         if (!keepCall) stopRepeat(); tab = next; if (next == 0) followingConversation = true; hideKeyboard(); renderTab();
@@ -761,6 +782,7 @@ public final class MainActivity extends Activity {
     }
 
     private void showLifeCallSettings() {
+        if (lifeCallSettingsDialog != null && lifeCallSettingsDialog.isShowing()) return;
         LinearLayout body = dialogBody();
         button(body, "耳机详情", false, this::showDeviceDetails);
         label(body, "接通后持续聆听，停顿后自动回答。说“小万”可打断当前回复；点黑色结束按钮挂断。", 14, MUTED);
@@ -775,7 +797,21 @@ public final class MainActivity extends Activity {
             diagnosticsView = label(diagnosticCard, "", 12, MUTED); diagnosticsView.setTextIsSelectable(true);
             renderDiagnostics(); button(diagnosticCard, "连接设置", false, this::showDevelopmentSettings);
         }
-        scrollDialog("通话设置", body);
+        // Answer sources are dismissed on every result; call settings belong to the user.
+        ScrollView viewport = new ScrollView(this); viewport.addView(body);
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("通话设置").setView(viewport)
+            .setPositiveButton("完成", null).create();
+        lifeCallSettingsDialog = dialog;
+        TextView settingsHint = voiceHint;
+        Button settingsLockButton = lockScreenButton;
+        dialog.setOnDismissListener(ignored -> {
+            if (lifeCallSettingsDialog == dialog) lifeCallSettingsDialog = null;
+            if (voiceHint == settingsHint) voiceHint = null;
+            if (lockScreenButton == settingsLockButton) lockScreenButton = null;
+            renderAvatars();
+        });
+        dialog.show();
+        hideAvatars();
     }
 
     private void voiceButtonText(String text) {
@@ -1187,10 +1223,15 @@ public final class MainActivity extends Activity {
     }
     private void restoreWorkScroll(ScrollView viewport, int y) {
         if (viewport == null) return;
+        final LinearLayout expectedPage = page;
+        final int expectedTab = tab, expectedWorkSection = workSection;
         viewport.getViewTreeObserver().addOnPreDrawListener(new android.view.ViewTreeObserver.OnPreDrawListener() {
             public boolean onPreDraw() {
                 if (viewport.getViewTreeObserver().isAlive()) viewport.getViewTreeObserver().removeOnPreDrawListener(this);
-                if (viewport == scroll) viewport.scrollTo(0, y); return true;
+                if (viewport == scroll && tab == expectedTab && page == expectedPage
+                        && viewport.getChildCount() > 0 && viewport.getChildAt(0) == expectedPage
+                        && (expectedTab != 2 || workSection == expectedWorkSection)) viewport.scrollTo(0, y);
+                return true;
             }
         }); viewport.invalidate();
     }
@@ -1874,13 +1915,14 @@ public final class MainActivity extends Activity {
     }
     /** The reader came back to the top: grow the window by one page and keep their reading position. */
     private void loadEarlierCaptions() {
-        if (conversationCaptionViews.box == null || !conversationCaptionList.hasEarlier()) return;
+        if (tab != 0 || conversationCaptionViews.box == null || !conversationCaptionViews.box.isShown() || !conversationCaptionList.hasEarlier()) return;
         ScrollView scroller = scroll;
         LinearLayout box = conversationCaptionViews.box;
         int previousHeight = box.getHeight(), previousScroll = scroller == null ? 0 : scroller.getScrollY();
         applyCaptionDiff(conversationCaptionViews, conversationCaptionList, conversationCaptionList.loadEarlier());
         if (scroller != null) box.post(() -> {
-            if (scroll == scroller) scroller.scrollTo(0, Math.max(0, previousScroll + box.getHeight() - previousHeight));
+            if (tab == 0 && scroll == scroller && box == conversationCaptionViews.box && box.isAttachedToWindow() && box.isShown())
+                scroller.scrollTo(0, Math.max(0, previousScroll + box.getHeight() - previousHeight));
         });
     }
     /** View bookkeeping for one caption box: paragraph views plus placeholder, history hint and interim line. */
@@ -1955,15 +1997,55 @@ public final class MainActivity extends Activity {
             renderCaptionSnapshot(workCaptionViews, workCaptionList, workCaptionBox);
         } else workCaptionBox = null;
         label(intro, "结束后自动保存原文，再由 AI 整理摘要、决策与待办", 11, MUTED).setGravity(Gravity.CENTER);
+        workSectionTabs = row();
+        workSectionTabs.setPadding(dp(4), dp(4), dp(4), dp(4));
+        workSectionTabs.setBackground(shape(CARD, 24, CARD));
+        page.addView(workSectionTabs);
+        String[] sections = {"会议纪要", "历史整理", "行动清单"};
+        for (int i = 0; i < sections.length; i++) {
+            final int index = i;
+            segment(workSectionTabs, sections[i], workSection == i, () -> selectWorkSection(index));
+            workSections[i] = column();
+        }
+        for (int i = 0; i < workSections.length; i++) {
+            page.addView(workSections[i]); workSections[i].setVisibility(workSection == i ? View.VISIBLE : View.GONE);
+        }
+        LinearLayout meetings = workSections[0], history = workSections[1], tasks = workSections[2];
         int retention = settings().optInt("work_audio_retention_days", 30);
-        workRetentionAction = sectionHeader(page, "会议记录", "每次录音独立保存 · 处理进度自动更新",
+        workRetentionAction = sectionHeader(meetings, "会议记录", "每次录音独立保存 · 处理进度自动更新",
             retention == 0 ? "录音：不保存" : "录音保存 " + retention + " 天", this::showRecordingRetentionOptions);
-        label(page, "录音按账号保存在服务器，到期自动删除；缩短期限会立即删除超期录音。文字原文与纪要不受影响。", 11, MUTED);
-        workMeetingList = column(); page.addView(workMeetingList); renderWorkMeetings();
-        historyRangeAction = sectionHeader(page, "历史记录整理", "按时间范围整理较早的工作记录", "选择范围", this::showHistoryRangeOptions);
-        historyReportBox = column(); page.addView(historyReportBox); renderHistoryReport();
-        taskBoard.render(page, array(state, "tasks"), scroll);
+        label(meetings, "录音按账号保存在服务器，到期自动删除；文字原文与纪要保留。", 11, MUTED);
+        workMeetingList = column(); meetings.addView(workMeetingList); renderWorkMeetings();
+        historyRangeAction = sectionHeader(history, "历史记录整理", "按时间范围整理较早的工作记录", "选择范围", this::showHistoryRangeOptions);
+        historyReportBox = column(); history.addView(historyReportBox); renderHistoryReport();
+        taskBoard.render(tasks, array(state, "tasks"), scroll);
+        styleWorkSections();
     }
+    private void styleWorkSections() {
+        if (workSectionTabs == null) return;
+        String[] names = {"会议纪要", "历史整理", "行动清单"};
+        for (int i = 0; i < workSections.length; i++) {
+            TextView choice = (TextView) workSectionTabs.getChildAt(i);
+            styleSegment(choice, workSection == i);
+            choice.setSelected(workSection == i);
+            choice.setContentDescription(names[i] + (workSection == i ? "，已选中" : ""));
+        }
+    }
+    private void selectWorkSection(int next) {
+        if (next == workSection || tab != 2 || workSectionTabs == null) return;
+        ScrollView viewport = scroll; int y = viewport.getScrollY();
+        workSectionScroll[workSection] = y;
+        workSection = next;
+        for (int i = 0; i < workSections.length; i++) {
+            workSections[i].animate().cancel();
+            workSections[i].setAlpha(1f); workSections[i].setVisibility(i == next ? View.VISIBLE : View.GONE);
+        }
+        styleWorkSections();
+        workSections[next].setAlpha(.4f); workSections[next].animate().alpha(1f).setDuration(160).start();
+        int target = workSectionScroll[next] >= 0 ? workSectionScroll[next] : Math.min(y, workSectionTabs.getTop());
+        viewport.clearFocus(); restoreWorkScroll(viewport, target);
+    }
+
     private void showRecordingRetentionOptions() {
         if (!canAct()) return;
         int current = settings().optInt("work_audio_retention_days", 30);
@@ -2868,11 +2950,13 @@ public final class MainActivity extends Activity {
         else if (listenMode != VoiceInteraction.CALL && session != null && sessionUsesCapture && !session.recordsWorkCalls()) endVoice();
         stopLocation(); super.onPause();
     }
-    @Override protected void onDestroy() { if (commutePanel != null) commutePanel.close(); if (meetingDeleteDialog != null) meetingDeleteDialog.dismiss(); if (workOptionsDialog != null) workOptionsDialog.dismiss(); if (taskBoard != null) taskBoard.close(); if (locationMonitor != null) locationMonitor.close(); if (statusPopup != null) statusPopup.dismiss(); handler.removeCallbacks(automaticHeadsetTick); if (quickFeedback != null) quickFeedback.close(); if (modeCuePlayer != null) modeCuePlayer.close(); if (meetingPlayback != null) meetingPlayback.close(); handler.removeCallbacks(workMeetingPlaybackTick); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } if (meetingPage != null) meetingPage.dismiss(); stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); ioPool.shutdownNow(); super.onDestroy(); }
+    @Override protected void onDestroy() { visible = false; hideAvatars(); if (lifeCallSettingsDialog != null) lifeCallSettingsDialog.dismiss(); if (commutePanel != null) commutePanel.close(); if (meetingDeleteDialog != null) meetingDeleteDialog.dismiss(); if (workOptionsDialog != null) workOptionsDialog.dismiss(); if (taskBoard != null) taskBoard.close(); if (locationMonitor != null) locationMonitor.close(); if (statusPopup != null) statusPopup.dismiss(); handler.removeCallbacks(automaticHeadsetTick); if (quickFeedback != null) quickFeedback.close(); if (modeCuePlayer != null) modeCuePlayer.close(); if (meetingPlayback != null) meetingPlayback.close(); handler.removeCallbacks(workMeetingPlaybackTick); if (sourceDialog != null) { sourceDialog.dismiss(); sourceDialog = null; } if (meetingPage != null) meetingPage.dismiss(); stopLockScreenSession(); cancelSession(""); if (headset != null) { headset.removeListener(headsetListener); headset.removeControlListener(headsetControlListener); headset.close(); } worker.shutdownNow(); ioPool.shutdownNow(); super.onDestroy(); }
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent); setIntent(intent);
         if (intent.getBooleanExtra("open_commute", false) && api != null && !api.vault.token().isEmpty()) switchTab(3);
-        if (intent.getBooleanExtra("open_work_tasks", false) && api != null && !api.vault.token().isEmpty()) switchTab(2);
+        if (intent.getBooleanExtra("open_work_tasks", false) && api != null && !api.vault.token().isEmpty()) {
+            switchTab(2); selectWorkSection(2);
+        }
     }
     @Override public void onBackPressed() { if (session != null) { endVoice(); return; } if (!api.vault.token().isEmpty() && tab != 0) { switchTab(0); return; } if (api.vault.token().isEmpty() && authMode != 0) { showAuth(0); return; } super.onBackPressed(); }
 
@@ -2996,7 +3080,8 @@ public final class MainActivity extends Activity {
     }
     private void renderAvatars() {
         syncAvatarMode();
-        boolean uncovered = meetingPage == null || !meetingPage.isShowing();
+        boolean uncovered = (meetingPage == null || !meetingPage.isShowing())
+            && (lifeCallSettingsDialog == null || !lifeCallSettingsDialog.isShowing());
         if (orb != null) {
             orb.show(avatarMode, avatarPhase, avatarPhaseStartedAt);
             orb.setHostVisible(visible && tab == 0 && uncovered);
@@ -3052,7 +3137,8 @@ public final class MainActivity extends Activity {
 
     private void renderModeSelection() {
         renderAvatars();
-        if (tab == 0 && modeChoices != null && lifeConversationLayout != !"work".equals(mode())) {
+        if (tab != 0) { tabDirty[0] = true; return; }
+        if (modeChoices != null && lifeConversationLayout != !"work".equals(mode())) {
             tabDirty[0] = true; renderTab(); return;
         }
         if (tab != 0 || modeChoices == null) return;

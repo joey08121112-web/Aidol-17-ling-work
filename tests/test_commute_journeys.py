@@ -107,8 +107,8 @@ def test_refresh_coordinate_system_throttle_failure_and_restart(client, runtime,
     result = client.post(url, json=body).json()
     assert result['route']['eta_seconds'] == 600
     assert len(calls) == 1
-    if fixed: assert calls[0][2] == {'origin_gcj': True, 'origin_city': '北京'}
-    else: assert calls[0][2] == {} and datetime.fromisoformat(result['location']['observed_at']) == datetime.fromisoformat(body['location']['observed_at'])
+    if fixed: assert calls[0][2] == {'origin_gcj': True, 'origin_city': '北京', 'prefer_shorter': True}
+    else: assert calls[0][2] == {'prefer_shorter': True} and datetime.fromisoformat(result['location']['observed_at']) == datetime.fromisoformat(body['location']['observed_at'])
     assert client.post(url, json=body).status_code == 200
     assert client.post(url, json=refresh_body(fixed)).status_code == 200
     assert len(calls) == 1
