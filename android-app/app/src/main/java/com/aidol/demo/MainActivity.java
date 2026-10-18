@@ -373,36 +373,27 @@ public final class MainActivity extends Activity {
     private void showAuth(int mode) {
         chatDraft = "";
         authMode = mode; status = null; voiceButton = null; cancelButton = null; content = null; base();
+        // Monochrome, centred and quiet: wordmark, the fields, one primary action, text links.
+        root.setBackgroundColor(AUTH_BG);
         ScrollView sc = new ScrollView(this); sc.setFillViewport(true);
         root.addView(sc, new LinearLayout.LayoutParams(-1, -1));
-        LinearLayout body = column(); body.setPadding(dp(28), dp(24), dp(28), dp(30)); sc.addView(body);
-        TextView brand = label(body, "aidol", 25, INK); brand.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL)); brand.setLetterSpacing(-.04f);
-        if (mode == 0) {
-            CompanionOrbView mark = new CompanionOrbView(this); body.addView(mark, new LinearLayout.LayoutParams(-1, dp(160)));
-        }
-        gap(body, 12);
-        label(body, mode == 1 ? "创建你的空间。" : mode == 2 ? "找回账号。" : "好好说话。\n慢慢了解你。", 32, INK).setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        if (mode != 2) label(body, mode == 1 ? "从一次对话，开始彼此了解。" : "登录 Aidol，让每一次对话都有回响。", 14, MUTED);
-        if (mode == 2) label(body, "使用恢复码重设密码。", 14, MUTED);
-        if (BuildConfig.DEBUG) label(body, development.localBackend() ? "本地账号 · USB" : "远端账号", 12, ACCENT);
-        gap(body, 18);
-        if (mode != 2) {
-            LinearLayout tabs = row(); body.addView(tabs);
-            segment(tabs, "登录", mode == 0, () -> { if (!busy) showAuth(0); });
-            segment(tabs, "创建账号", mode == 1, () -> { if (!busy) showAuth(1); });
-            gap(body, 12);
-        }
-        EditText username = field(body, mode == 1 ? "账号（英文不区分大小写）" : "账号", "起个好记的名字，中文也可以", false, 128);
-        username.setInputType(InputType.TYPE_CLASS_TEXT);
-        username.setSingleLine(true);
-        EditText password = field(body, mode == 2 ? "新密码" : "密码", "填一个好记的密码即可", true, 128);
-        EditText confirm = mode == 0 ? null : field(body, "确认密码", "再输入一次密码", true, 128);
-        EditText recovery = mode == 2 ? field(body, "账号恢复码", "粘贴之前保存的恢复码", false, 128) : null;
-        CheckBox consent = new CheckBox(this); consent.setTextColor(MUTED); consent.setTextSize(12);
-        consent.setButtonTintList(android.content.res.ColorStateList.valueOf(ACCENT));
+        LinearLayout body = column(); body.setPadding(dp(28), dp(24), dp(28), dp(20)); sc.addView(body);
+        body.addView(new View(this), new LinearLayout.LayoutParams(1, 0, 1));
+        TextView brand = label(body, "aidol", 46, AUTH_INK); brand.setGravity(Gravity.CENTER);
+        brand.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL)); brand.setLetterSpacing(-.04f);
+        TextView tagline = label(body, mode == 1 ? "创建你的空间" : mode == 2 ? "用恢复码重设密码" : "好好说话，慢慢了解你。", 15, AUTH_MUTED);
+        tagline.setGravity(Gravity.CENTER); tagline.setPadding(0, dp(6), 0, 0);
+        gap(body, 44);
+        EditText username = authField(body, mode == 1 ? "账号（英文不区分大小写）" : "账号", false);
+        EditText password = authField(body, mode == 2 ? "新密码" : "密码", true);
+        EditText confirm = mode == 0 ? null : authField(body, "确认密码", true);
+        EditText recovery = mode == 2 ? authField(body, "账号恢复码", false) : null;
+        CheckBox consent = new CheckBox(this); consent.setTextColor(AUTH_MUTED); consent.setTextSize(12);
+        consent.setButtonTintList(android.content.res.ColorStateList.valueOf(AUTH_INK));
         consent.setText("我已了解：录音和文字会发送到服务器及 AI 服务处理；账号数据可导出、清空或删除。");
         if (mode == 1) body.addView(consent);
-        authError = label(body, "", 13, RED); authError.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        authError = label(body, "", 13, AUTH_ERROR); authError.setGravity(Gravity.CENTER); authError.setPadding(0, dp(4), 0, dp(4));
+        authError.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         // A validation message must not outlive the input it describes.
         TextView shownError = authError;
         consent.setOnCheckedChangeListener((box, checked) -> { if (checked && !busy) shownError.setText(""); });
@@ -432,10 +423,38 @@ public final class MainActivity extends Activity {
                 refresh();
             });
         });
+        submit.setTextColor(Color.WHITE); submit.setTextSize(16);
+        submit.setBackground(new RippleDrawable(ColorStateList.valueOf(0x33ffffff), shape(AUTH_INK, 27, AUTH_INK), shape(AUTH_INK, 27, AUTH_INK)));
+        submit.setMinHeight(dp(54)); submit.setMinimumHeight(dp(54));
         submit.setEnabled(!busy);
-        button(body, mode == 0 ? "忘记密码" : "返回登录", false, () -> { if (!busy) showAuth(mode == 0 ? 2 : 0); });
-        gap(body, 8);
-        developmentEntry(body);
+        LinearLayout links = row(); links.setGravity(Gravity.CENTER); links.setPadding(0, dp(6), 0, 0); body.addView(links);
+        if (mode == 0) {
+            authLink(links, "创建账号", () -> showAuth(1));
+            label(links, "·", 14, AUTH_MUTED).setPadding(dp(4), 0, dp(4), 0);
+            authLink(links, "忘记密码", () -> showAuth(2));
+        } else authLink(links, mode == 1 ? "已有账号？登录" : "返回登录", () -> showAuth(0));
+        body.addView(new View(this), new LinearLayout.LayoutParams(1, 0, 1));
+        TextView connection = label(body, "连接设置" + (BuildConfig.DEBUG ? (development.localBackend() ? " · 本地账号 USB" : " · 远端账号") : ""), 12, AUTH_MUTED);
+        connection.setGravity(Gravity.CENTER); connection.setMinHeight(dp(48)); connection.setContentDescription("连接设置");
+        connection.setOnClickListener(v -> { if (!busy) showDevelopmentSettings(); });
+    }
+    private static final int AUTH_BG = 0xffffffff, AUTH_INK = 0xff0b0b0c, AUTH_FIELD = 0xfff4f5f7, AUTH_LINE = 0xffe6e8ec,
+        AUTH_MUTED = 0xff697381, AUTH_FAINT = 0xff8d939c, AUTH_ERROR = RED;
+    /** Sign-in field: the hint is the label, read aloud through its description. */
+    private EditText authField(LinearLayout parent, String hint, boolean password) {
+        EditText view = input(hint, password, 128);
+        view.setTextColor(AUTH_INK); view.setHintTextColor(AUTH_FAINT); view.setTextSize(16); view.setSingleLine(true);
+        if (password) view.setTransformationMethod(android.text.method.PasswordTransformationMethod.getInstance());
+        else view.setInputType(InputType.TYPE_CLASS_TEXT);
+        view.setMinHeight(dp(54)); view.setPadding(dp(18), dp(14), dp(18), dp(14));
+        view.setBackground(shape(AUTH_FIELD, 14, AUTH_LINE));
+        view.setOnFocusChangeListener((v, focused) -> v.setBackground(shape(focused ? AUTH_BG : AUTH_FIELD, 14, focused ? AUTH_INK : AUTH_LINE)));
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, -2); p.bottomMargin = dp(12); parent.addView(view, p); return view;
+    }
+    private void authLink(LinearLayout parent, String text, Runnable action) {
+        TextView link = label(parent, text, 14, AUTH_INK); link.setGravity(Gravity.CENTER);
+        link.setMinHeight(dp(48)); link.setPadding(dp(10), 0, dp(10), 0);
+        link.setOnClickListener(v -> { if (!busy) action.run(); });
     }
 
     private void recoveryDialog(String code) {
